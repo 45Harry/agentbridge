@@ -1,4 +1,6 @@
-# agentbridge
+<p align="center">
+  <img src="assets/logo-wordmark.svg" width="480" alt="agentbridge">
+</p>
 
 Local-first CLI + MCP server that bridges session context across AI coding
 agents (Claude Code, Codex CLI, OpenCode, Antigravity CLI, ...) running on the

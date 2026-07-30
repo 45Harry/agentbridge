@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 160" width="640" height="160" role="img" aria-label="agentbridge">
+  <title>agentbridge</title>
+  <defs>
+    <linearGradient id="wm-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0f1530"/>
+      <stop offset="1" stop-color="#141a3d"/>
+    </linearGradient>
+    <linearGradient id="wm-arc" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#2dd4bf"/>
+      <stop offset="1" stop-color="#818cf8"/>
+    </linearGradient>
+    <linearGradient id="wm-text" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#e5e7ff"/>
+      <stop offset="1" stop-color="#c7ccff"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="0" y="0" width="160" height="160" rx="34" fill="url(#wm-bg)"/>
+
+  <path d="M 42 95 Q 80 16 118 95" fill="none" stroke="url(#wm-arc)" stroke-width="5" stroke-linecap="round"/>
+  <circle cx="61" cy="65" r="4" fill="#2dd4bf"/>
+  <circle cx="80" cy="55.5" r="4.4" fill="#a5b4fc"/>
+  <circle cx="99" cy="65" r="4" fill="#818cf8"/>
+
+  <rect x="21" y="95" width="42" height="32" rx="6" fill="#1c2450" stroke="#3b4280" stroke-width="1.2"/>
+  <circle cx="28.5" cy="101.5" r="1.8" fill="#2dd4bf"/>
+  <circle cx="35" cy="101.5" r="1.8" fill="#818cf8"/>
+  <line x1="27" y1="111" x2="56" y2="111" stroke="#5b63a8" stroke-width="2" stroke-linecap="round"/>
+  <line x1="27" y1="117.5" x2="47" y2="117.5" stroke="#3b4280" stroke-width="2" stroke-linecap="round"/>
+
+  <rect x="97" y="95" width="42" height="32" rx="6" fill="#1c2450" stroke="#3b4280" stroke-width="1.2"/>
+  <circle cx="104.5" cy="101.5" r="1.8" fill="#2dd4bf"/>
+  <circle cx="111" cy="101.5" r="1.8" fill="#818cf8"/>
+  <line x1="103" y1="111" x2="132" y2="111" stroke="#5b63a8" stroke-width="2" stroke-linecap="round"/>
+  <line x1="103" y1="117.5" x2="123" y2="117.5" stroke="#3b4280" stroke-width="2" stroke-linecap="round"/>
+
+  <text x="188" y="98" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="52" font-weight="600" fill="url(#wm-text)">agentbridge</text>
+  <text x="190" y="126" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="16" letter-spacing="1.5" fill="#7d84c2">CROSS-TOOL SESSION &amp; MEMORY BRIDGE</text>
+</svg>

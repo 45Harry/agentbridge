@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200" role="img" aria-label="agentbridge logo">
+  <title>agentbridge</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0f1530"/>
+      <stop offset="1" stop-color="#141a3d"/>
+    </linearGradient>
+    <linearGradient id="arc" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#2dd4bf"/>
+      <stop offset="1" stop-color="#818cf8"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="0" y="0" width="200" height="200" rx="44" fill="url(#bg)"/>
+
+  <!-- bridge arc connecting the two agent windows -->
+  <path d="M 52 118 Q 100 20 148 118" fill="none" stroke="url(#arc)" stroke-width="6" stroke-linecap="round"/>
+  <circle cx="76" cy="81.25" r="5" fill="#2dd4bf"/>
+  <circle cx="100" cy="69" r="5.5" fill="#a5b4fc"/>
+  <circle cx="124" cy="81.25" r="5" fill="#818cf8"/>
+
+  <!-- left agent window -->
+  <rect x="26" y="118" width="52" height="40" rx="7" fill="#1c2450" stroke="#3b4280" stroke-width="1.5"/>
+  <circle cx="35" cy="126" r="2.2" fill="#2dd4bf"/>
+  <circle cx="43" cy="126" r="2.2" fill="#818cf8"/>
+  <line x1="33" y1="138" x2="70" y2="138" stroke="#5b63a8" stroke-width="2.5" stroke-linecap="round"/>
+  <line x1="33" y1="146" x2="58" y2="146" stroke="#3b4280" stroke-width="2.5" stroke-linecap="round"/>
+
+  <!-- right agent window -->
+  <rect x="122" y="118" width="52" height="40" rx="7" fill="#1c2450" stroke="#3b4280" stroke-width="1.5"/>
+  <circle cx="131" cy="126" r="2.2" fill="#2dd4bf"/>
+  <circle cx="139" cy="126" r="2.2" fill="#818cf8"/>
+  <line x1="129" y1="138" x2="166" y2="138" stroke="#5b63a8" stroke-width="2.5" stroke-linecap="round"/>
+  <line x1="129" y1="146" x2="154" y2="146" stroke="#3b4280" stroke-width="2.5" stroke-linecap="round"/>
+</svg>
