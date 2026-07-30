@@ -34,10 +34,12 @@ TypeScript/Node.
 
 ## Documentation
 
+- `HANDOFF.md` — **read this first if picking up the project fresh** (new
+  machine, new session): current status, what's blocking, next steps.
 - `SPEC.md` — the original build spec, verbatim.
 - `DECISIONS.md` — language choice and every significant tradeoff, dated.
-- `CONNECTORS.md` — per-provider on-disk format, as reverse-engineered (added
-  as connectors land).
+- `CONNECTORS.md` — per-provider on-disk format, as reverse-engineered, plus
+  empirical cross-tool resume interoperability testing.
 - `SECURITY.md` — redaction model and known limits (added in M1).
 
 ## License

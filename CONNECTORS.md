@@ -1,0 +1,183 @@
+# CONNECTORS.md
+
+Per-provider on-disk formats, as reverse-engineered by direct inspection. These
+formats are undocumented by the vendors and **will drift** — every section
+below carries a "last verified" line; treat anything older than a few months
+as suspect and re-verify before relying on it.
+
+This file also tracks empirical cross-tool interoperability testing (§5),
+since that directly informs the scope of M4/M5.
+
+---
+
+## 1. Claude Code
+
+**Last verified:** against `2.1.220 (Claude Code)`, on 2026-07-30, macOS.
+
+- **Storage root:** `~/.claude/projects/` (override: `CLAUDE_CONFIG_DIR`, unverified — inferred from spec, not yet tested).
+- **Layout:** one directory per project, named by encoding the absolute cwd
+  (non-alphanumerics → `-`), e.g. `/Users/harry/Documents` →
+  `-Users-harry-Documents`. Inside: one `<session-uuid>.jsonl` file per
+  session.
+- **Confirmed lossy encoding:** `/Users/harry/Documents` and a hypothetical
+  `/Users/harry-Documents` would encode identically — confirms the spec's hard
+  constraint that the project path must be read from *inside* the record
+  (a `cwd` field on transcript entries), never reconstructed from the
+  directory name.
+- **Session ID format:** standard UUID v4-shaped string, used directly as the
+  filename stem.
+- **Resume:** `claude --resume <uuid>` (or `-r`), `--continue`/`-c` for most
+  recent in cwd. `--resume` **validates the ID against its own local index
+  before doing anything else** — fed it real session IDs belonging to Codex
+  and OpenCode and got an immediate, clean rejection in both cases:
+  `No conversation found with session ID: <id>` (non-UUID-shaped foreign IDs
+  get a slightly different pre-check error, see §5).
+- **`--fork-session`, `--session-id <uuid>`** exist alongside resume — worth
+  revisiting for M5's copy-based shim (target session may need a fresh ID to
+  avoid colliding with the original).
+
+## 2. Codex CLI
+
+**Last verified:** against `codex-cli 0.146.0`, on 2026-07-30, macOS.
+
+- **Storage root:** `~/.codex/` (override: `CODEX_HOME`, unverified — inferred
+  from spec).
+- **Layout:** date-partitioned: `~/.codex/sessions/YYYY/MM/DD/rollout-<ISO
+  timestamp with `:`→`-`>-<uuid>.jsonl`, e.g.
+  `sessions/2026/07/29/rollout-2026-07-29T15-04-08-019fad2b-ae9f-7350-b403-176a6ac0f1af.jsonl`.
+  Filename embeds both a start timestamp and a UUID — cheap metadata (M1's
+  `RawSession`) can be derived from the filename alone without opening the
+  file, an optimization worth taking in the connector.
+- Other files of note in `~/.codex/`: `history.jsonl` (separate from
+  per-session rollouts — appears to be a flat cross-session command/prompt
+  log, not yet characterized), `logs_2.sqlite` (14MB+, purpose unconfirmed),
+  `goals_1.sqlite`, `auth.json`, `config.toml`. Needs a follow-up pass before
+  M1 parses anything beyond the `sessions/` rollouts.
+- **Resume, two paths:**
+  - `codex resume [SESSION_ID] [PROMPT]` — interactive TUI. In a non-TTY
+    environment this refuses immediately with `Error: stdin is not a
+    terminal`, *before* any ID validation is observable — could not determine
+    validation order for the TUI path.
+  - `codex exec resume [SESSION_ID] [PROMPT]` — the headless/scriptable path.
+    **Does not appear to validate the session ID up front.** Given a
+    deliberately-invalid all-zero UUID with no prompt, it proceeded straight
+    to `Reading prompt from stdin... No prompt provided via stdin.` rather
+    than rejecting the ID. Whether an invalid ID is caught later (once a real
+    prompt is supplied and the session is actually loaded) is **untested** —
+    testing further requires sending a real prompt, which risks a live model
+    call; deferred until M1 needs the answer, and then only test against a
+    local/oss provider (`--oss`/`--local-provider`) to avoid API cost.
+- `--all` on `resume`/`exec resume` disables cwd filtering — Codex already
+  supports the cross-directory resume Claude Code lacks (per spec §1.3).
+
+## 3. OpenCode
+
+**Last verified:** against `1.17.15`, on 2026-07-30, macOS.
+
+- **Storage root:** `~/.local/share/opencode/` (data) and `~/.config/opencode/`
+  (config) — XDG-style split, unlike the other three which keep everything
+  under one dir.
+- **Format: SQLite**, not JSONL — `opencode.db` (278MB observed on a real
+  machine after months of use; WAL mode, `opencode.db-wal`/`-shm` present).
+  This is the one provider where the connector reads a real relational schema
+  instead of parsing a transcript format by hand.
+- **Relevant tables** (from `.tables`, read-only immutable connection):
+  `session`, `project`, `project_directory`, `message`, `part`, `todo`,
+  `permission`, `account`, `workspace`, `event`, `session_message`,
+  `session_input`, `session_share`, `session_context_epoch`, plus a
+  `__drizzle_migrations` table confirming the app uses the Drizzle ORM's own
+  forward-migration system — useful reference point for our own migration
+  approach (`DECISIONS.md`).
+- **`session` schema** (columns of note): `id` (text PK, format `ses_<...>` —
+  **not a UUID**, opaque alphanumeric), `project_id` (FK → `project`),
+  `parent_id` (session forking/threading — maps to our `Session`/`Fact`
+  parent-link concept), `directory` (**plain absolute path, stored verbatim,
+  not encoded** — e.g. `/Users/harry/Documents/bankNotes-OCR` — no lossy
+  encoding problem here, unlike Claude Code), `title`, `time_created`/
+  `time_updated`/`time_compacting`/`time_archived` (epoch millis — confirms
+  spec's "true in-file/in-db event time, not mtime" ordering rule maps
+  directly to `time_updated`), `agent`, `model`, `cost`, `tokens_input`/
+  `tokens_output`/`tokens_reasoning`/`tokens_cache_read`/`tokens_cache_write`
+  (a full token/cost breakdown available for free — richer than what Claude
+  Code or Codex expose in-band).
+- **Resume:** `opencode run --session <id> "<prompt>"` (also
+  `-s`/`--session`/`--continue` flags documented on the base command).
+  **Validates immediately** — fed it real Claude Code and Codex session IDs,
+  got a clean `Error: Session not found` both times, no side effects.
+- `opencode session list` / `opencode session delete <id>` exist as first-class
+  subcommands — no need to hit the SQLite file directly for the connector's
+  `scan()`, though `load()` may still want direct DB access for full
+  `message`/`part` bodies if the CLI's own output is lossy.
+
+## 4. Antigravity CLI (`agy`)
+
+**Last verified:** against `agy 1.1.8`, on 2026-07-30, macOS. **Storage
+location not yet confirmed — connector build blocked on this.**
+
+- `agy` is a separate Go binary (`~/.local/bin/agy`, ships its own bubbletea
+  TUI) from the Antigravity IDE app (`~/.antigravity`,
+  `~/Library/Application Support/Antigravity` — a full VS Code–style Electron
+  app with its own `workspaceStorage`/`state.vscdb` layout). They are
+  related but **not confirmed to share a session store** — do not assume the
+  IDE's `workspaceStorage` is where `agy` CLI conversations live without
+  verifying first.
+- Flag surface is nearly a 1:1 match with Claude Code's:
+  `--dangerously-skip-permissions`, `--effort <low|medium|high>`,
+  `--mode <accept-edits|plan>`, `--output-format <text|json|stream-json>`,
+  `-p/--print`, `-c/--continue`. Strongly suggests both are built on a common
+  underlying agent-CLI framework/SDK, not independent implementations —
+  worth keeping in mind if a shared parser can cover both, though the actual
+  transcript format is still unverified for `agy`.
+- Binary strings reference `antigravity.google/docs/cli/reference`, an
+  internal `agentapi` CLI, and conversation-migration keys
+  (`no_conversations_to_migrate`, `persist_destination_project`,
+  `root_assigned_to_standalone`) — implies standalone CLI conversations can
+  be adopted into an IDE-tracked project, which is a different mental model
+  than the other three providers' flat local session stores. **M2 needs a
+  dedicated research spike** (per `DECISIONS.md`) before writing a parser:
+  either inspect a real conversation's storage location directly (`fs_usage`/
+  `dtruss`-style tracing while a real `agy -p` run is active, or ask Google's
+  published docs at the URL above) rather than guessing further.
+- **Resume flag:** `--conversation <id>`. Observed behavior, not yet fully
+  characterized:
+  - No prompt supplied → does not appear to validate the ID before attempting
+    to open its interactive TUI (failed only on `bubbletea: could not open
+    TTY` in this headless environment, regardless of whether the ID was a
+    deliberately-invalid all-zero UUID).
+  - Prompt supplied (`-p "hi"`) with the same invalid ID → **hung for the
+    entire 8s test timeout and had to be force-killed**, rather than failing
+    fast the way Claude Code and OpenCode do. No corresponding log activity
+    was found afterward in the Antigravity app's log directory, so it likely
+    did not complete a real model call, but this was **not** confirmed with
+    certainty. **Do not probe `agy --conversation` with real prompt content
+    during connector development without a local/offline model configured
+    (if one exists) — treat it as potentially cost-incurring until proven
+    otherwise.**
+
+## 5. Cross-tool resume interoperability (tested 2026-07-30)
+
+Direct question: can tool B resume a session created by tool A? Tested with
+real session IDs pulled from each provider's own storage on one machine with
+all four installed.
+
+| Feed → into ↓ | Claude Code | Codex CLI | OpenCode |
+| --- | --- | --- | --- |
+| **Claude Code's real ID** | (self) | not tested (Codex resume needs TTY / risk-gated) | `Error: Session not found` — clean, immediate |
+| **Codex's real ID** | `No conversation found with session ID: ...` — clean, immediate | (self) | `Error: Session not found` — clean, immediate |
+| **OpenCode's real ID** (`ses_...`, non-UUID) | `Error: --resume requires a valid session ID or session title ... is not a UUID and does not match any session title.` — clean, immediate, different message because the format itself is rejected pre-lookup | not tested | (self) |
+
+**Conclusion: none of the four tools can resume a session started by a
+different tool.** This is structural, not a missing feature — each tool's
+resume is a lookup into its own local storage with its own ID format/schema
+(see §1–4); there is no shared namespace to look something up in. Claude Code
+and OpenCode both fail this cleanly and immediately with no side effects.
+Codex's headless `exec resume` and `agy`'s `--conversation` do not visibly
+validate the ID up front, which is a liveness/safety concern for M2/M5
+(probing them with a foreign ID is not provably side-effect-free) but does not
+change the structural conclusion.
+
+This confirms the project's premise (`SPEC.md` §1.3, §6 M4/M5): cross-tool
+continuity has to go through a distilled brief (M4), not literal session
+hand-off. M5's cross-directory *resume shim* stays scoped to Claude Code
+resuming its own sessions across directories — never to resuming a foreign
+tool's session.
