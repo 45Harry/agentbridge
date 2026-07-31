@@ -55,7 +55,7 @@ impl OpenCodeConnector {
     }
 }
 
-fn default_db_path() -> PathBuf {
+pub fn default_db_path() -> PathBuf {
     if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
         return PathBuf::from(xdg).join("opencode").join("opencode.db");
     }

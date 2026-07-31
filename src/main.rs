@@ -450,8 +450,22 @@ fn cmd_resume(
             converter.convert(&session, target_dir)
         }
         "opencode" => {
-            let converter = agentbridge::convert::OpenCodeConverter::new();
-            converter.convert(&session, target_dir)
+            let db = target_dir.join("opencode.db");
+            match agentbridge::opencode_write::ensure_safe_to_write() {
+                Err(e) => Err(e.to_string()),
+                Ok(()) => {
+                    let backed = agentbridge::opencode_write::backup(&db);
+                    if let Err(e) = backed {
+                        Err(format!("opencode backup failed: {}", e))
+                    } else {
+                        let dir = session.project_path().unwrap_or_default();
+                        match agentbridge::opencode_write::write_session(&db, &session, &dir) {
+                            Ok(id) => Ok(PathBuf::from(id)),
+                            Err(e) => Err(e.to_string()),
+                        }
+                    }
+                }
+            }
         }
         _ => unreachable!(),
     };
@@ -466,7 +480,12 @@ fn cmd_resume(
             let cmd = match target {
                 "claude-code" => ClaudeCodeConverter::new().resume_cmd(&path),
                 "codex-cli" => CodexCliConverter::new().resume_cmd(&path),
-                "opencode" => agentbridge::convert::OpenCodeConverter::new().resume_cmd(&path),
+                "opencode" => vec![
+                    "opencode".to_string(),
+                    "run".to_string(),
+                    "--session".to_string(),
+                    path.to_string_lossy().to_string(),
+                ],
                 _ => vec![],
             };
             if let Some(cwd) = session.project_path() {

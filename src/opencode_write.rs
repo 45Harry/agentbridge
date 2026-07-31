@@ -178,47 +178,156 @@ pub fn write_session(
     )
     .map_err(|e| WriteError::Sql(e.to_string()))?;
 
-    for (i, m) in session.messages.iter().enumerate() {
-        let msg_id = format!("{}_m{:06}", id, i);
-        let role = match m.role {
-            Role::User => "user",
-            Role::System => "system",
-            _ => "assistant",
-        };
-        let ts = m.timestamp.map(|t| t.timestamp_millis()).unwrap_or(created);
+    // OpenCode's message ids encode a time-ordered counter and its session
+    // loop picks the "latest" message by comparing id strings. Foreign ids
+    // must sort below anything OpenCode generates (`msg_f…`), so the
+    // `msg_0` prefix is what keeps continuation working.
+    let ns = uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_URL,
+        format!("{}:{}", session.provider, session.id).as_bytes(),
+    );
+    let id_hex: String = ns.simple().to_string();
 
+    let mut idx: usize = 0;
+    let mut prev_msg_id: Option<String> = None;
+    let mut last_ts = created - 1;
+
+    let mut insert_msg = |tx: &rusqlite::Transaction,
+                          role: &str,
+                          data: serde_json::Value,
+                          ts: i64,
+                          idx: usize|
+     -> Result<String, WriteError> {
+        let msg_id = format!("msg_0{}_m{:06}", id_hex, idx);
         tx.execute(
             "INSERT INTO message (id, session_id, time_created, time_updated, data) \
              VALUES (?1,?2,?3,?4,?5)",
-            params![
-                msg_id,
-                id,
-                ts,
-                ts,
-                json!({ "role": role, "time": { "created": ts } }).to_string()
-            ],
+            params![msg_id, id, ts, ts, data.to_string()],
         )
         .map_err(|e| WriteError::Sql(e.to_string()))?;
+        Ok(msg_id)
+    };
 
-        let part = if let Some(tool) = &m.tool_name {
-            json!({ "type": "tool", "tool": tool, "state": m.tool_input.clone() })
-        } else {
-            json!({ "type": "text", "text": m.text.clone().unwrap_or_default() })
-        };
-
+    let mut insert_part = |tx: &rusqlite::Transaction,
+                           msg_id: &str,
+                           data: serde_json::Value,
+                           ts: i64,
+                           idx: usize|
+     -> Result<(), WriteError> {
         tx.execute(
             "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) \
              VALUES (?1,?2,?3,?4,?5,?6)",
             params![
-                format!("{}_p0", msg_id),
+                format!("prt_0{}_m{:06}_p0", id_hex, idx),
                 msg_id,
                 id,
                 ts,
                 ts,
-                part.to_string()
+                data.to_string()
             ],
         )
         .map_err(|e| WriteError::Sql(e.to_string()))?;
+        Ok(())
+    };
+
+    for m in &session.messages {
+        if m.role == Role::System {
+            continue;
+        }
+        let text = m.text.clone().unwrap_or_default();
+        if text.trim().is_empty() {
+            continue;
+        }
+        // Timestamps must be strictly increasing so the message stream is in
+        // conversation order; tie-broken rows would be scrambled by id.
+        let real_ts = m.timestamp.map(|t| t.timestamp_millis()).unwrap_or(created);
+        let ts = real_ts.max(last_ts + 1);
+        last_ts = ts;
+
+        // The model API rejects histories that start with an assistant turn;
+        // insert a placeholder user turn when the first real message isn't one.
+        if prev_msg_id.is_none() && m.role != Role::User {
+            let msg_id = insert_msg(
+                &tx,
+                "user",
+                json!({
+                    "role": "user",
+                    "time": { "created": ts },
+                    "agent": "build",
+                    "model": {
+                        "providerID": "opencode",
+                        "modelID": "deepseek-v4-flash-free",
+                        "variant": "max"
+                    },
+                    "summary": { "diffs": [] }
+                }),
+                ts,
+                idx,
+            )?;
+            insert_part(
+                &tx,
+                &msg_id,
+                json!({
+                    "type": "text",
+                    "text": "(agentbridge: continuing a previous conversation)"
+                }),
+                ts,
+                idx,
+            )?;
+            idx += 1;
+            prev_msg_id = Some(msg_id);
+        }
+
+        let msg_id = match m.role {
+            Role::User => insert_msg(
+                &tx,
+                "user",
+                json!({
+                    "role": "user",
+                    "time": { "created": ts },
+                    "agent": "build",
+                    "model": {
+                        "providerID": "opencode",
+                        "modelID": "deepseek-v4-flash-free",
+                        "variant": "max"
+                    },
+                    "summary": { "diffs": [] }
+                }),
+                ts,
+                idx,
+            )?,
+            _ => {
+                let mut data = json!({
+                    "role": "assistant",
+                    "mode": "build",
+                    "agent": "build",
+                    "variant": "max",
+                    "path": { "cwd": directory, "root": directory },
+                    "cost": 0,
+                    "tokens": {
+                        "total": 0, "input": 0, "output": 0, "reasoning": 0,
+                        "cache": { "write": 0, "read": 0 }
+                    },
+                    "modelID": "deepseek-v4-flash-free",
+                    "providerID": "opencode",
+                    "time": { "created": ts, "completed": ts },
+                    "finish": "end-turn"
+                });
+                if let Some(pid) = &prev_msg_id {
+                    data.as_object_mut().unwrap().insert("parentID".to_string(), json!(pid));
+                }
+                insert_msg(&tx, "assistant", data, ts, idx)?
+            }
+        };
+
+        let part = if let Some(tool) = &m.tool_name {
+            json!({ "type": "tool", "tool": tool, "state": m.tool_input.clone() })
+        } else {
+            json!({ "type": "text", "text": text })
+        };
+        insert_part(&tx, &msg_id, part, ts, idx)?;
+        idx += 1;
+        prev_msg_id = Some(msg_id);
     }
 
     tx.commit().map_err(|e| WriteError::Sql(e.to_string()))?;
@@ -417,5 +526,130 @@ mod tests {
         assert!(sql[0].contains("INSERT"));
         assert!(sql[0].contains(MARKER));
         assert_eq!(count_written(&db), before, "dry run must not write");
+    }
+
+    /// End-to-end: a session born in another tool (Codex) must surface in
+    /// OpenCode's own picker and be continuable there.
+    ///
+    /// Ignored by default because it shells out to the real `opencode` CLI
+    /// (requires a network model provider) and writes to a throwaway
+    /// XDG_DATA_HOME sandbox, never to the live database.
+    #[test]
+    #[ignore = "requires the opencode CLI and a live model provider"]
+    fn test_codex_session_is_visible_and_continuable_in_opencode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let xdg = tmp.path().join("data");
+        let data_dir = xdg.join("opencode");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let db = data_dir.join("opencode.db");
+
+        // Use the real database's schema (the CLI runs its own migrations and
+        // will choke on a hand-rolled approximation); the sandbox copy keeps
+        // the live database untouched. Auth/storage are copied too so the CLI
+        // can reach the model provider.
+        let live = crate::connectors::opencode::default_db_path();
+        assert!(live.exists(), "no real opencode.db to copy: {}", live.display());
+        fn copy_tree(src: &Path, dst: &Path) {
+            if src.is_dir() {
+                std::fs::create_dir_all(dst).unwrap();
+                for entry in std::fs::read_dir(src).unwrap() {
+                    let entry = entry.unwrap();
+                    copy_tree(&entry.path(), &dst.join(entry.file_name()));
+                }
+            } else {
+                std::fs::copy(src, dst).unwrap();
+            }
+        }
+        for entry in std::fs::read_dir(live.parent().unwrap()).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name == "opencode.db" || name.starts_with("opencode.db-") {
+                continue;
+            }
+            copy_tree(&entry.path(), &data_dir.join(&name));
+        }
+        std::fs::copy(&live, &db).unwrap();
+
+        // A session authored by Codex (a real Codex rollout transcript).
+        let codex_session = Session {
+            id: "7adbc643-e0bd-4c49-8432-6ef37c9001fd".into(),
+            provider: "codex-cli".into(),
+            project_id: "/home/harry/Documents/agentbridge".into(),
+            started_at: Utc.timestamp_millis_opt(1_784_315_929_000).single(),
+            last_event_at: Utc.timestamp_millis_opt(1_784_316_034_000).single(),
+            model: Some("gpt-5.2-codex".into()),
+            title: Some("Codex session".into()),
+            token_totals: TokenTotals::default(),
+            source_path: PathBuf::new(),
+            raw_payload: serde_json::Value::Null,
+            body_available: true,
+            messages: vec![
+                Message {
+                    session_id: "s".into(), ordinal: 0, role: Role::User,
+                    timestamp: Utc.timestamp_millis_opt(1_784_315_929_000).single(),
+                    text: Some("Hi there".into()),
+                    tool_name: None, tool_input: None, tool_result: None, parent_ordinal: None,
+                },
+                Message {
+                    session_id: "s".into(), ordinal: 1, role: Role::Assistant,
+                    timestamp: Utc.timestamp_millis_opt(1_784_315_930_000).single(),
+                    text: Some("Hello! How can I help?".into()),
+                    tool_name: None, tool_input: None, tool_result: None, parent_ordinal: None,
+                },
+            ],
+            artifacts: vec![],
+        };
+
+        let id = write_session(&db, &codex_session, "/home/harry/Documents/agentbridge").unwrap();
+
+        // 1. It must appear in OpenCode's own picker.
+        let bin = std::env::var("OPENCODE_BIN").unwrap_or_else(|_| "opencode".to_string());
+        eprintln!("[e2e] session id: {}", id);
+        let list = std::process::Command::new(&bin)
+            .arg("session")
+            .arg("list")
+            .current_dir("/home/harry/Documents/agentbridge")
+            .env("XDG_DATA_HOME", &xdg)
+            .output()
+            .expect("opencode session list");
+        assert!(
+            list.status.success(),
+            "session list failed: {}",
+            String::from_utf8_lossy(&list.stderr)
+        );
+        let out = String::from_utf8_lossy(&list.stdout).to_string();
+        assert!(
+            out.contains(&id),
+            "session {} not listed; got: {}",
+            id,
+            out
+        );
+
+        // 2. It must be continuable: the model must answer the new prompt
+        //    with the marker and show it remembers the earlier turn.
+        let prompt = "Reply with exactly: CONTINUED-OK";
+        let run = std::process::Command::new(&bin)
+            .args(["run", "--session", &id, prompt])
+            .current_dir("/home/harry/Documents/agentbridge")
+            .env("XDG_DATA_HOME", &xdg)
+            .output()
+            .expect("opencode run");
+        let out = String::from_utf8_lossy(&run.stdout).to_string();
+        assert!(
+            out.contains("CONTINUED-OK"),
+            "continuation failed; stderr: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+
+        // 3. The new turn must be persisted back into the row we inserted.
+        let conn = Connection::open(&db).unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM message WHERE session_id=?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(n >= 3, "expected the new user turn to be persisted, got {}", n);
     }
 }
