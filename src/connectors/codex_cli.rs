@@ -384,6 +384,14 @@ fn extract_cx_content_flexible(val: &Value) -> Option<String> {
     val.get("content").and_then(|v| v.as_str()).map(|s| s.to_string())
 }
 
+/// Test-only shim so converter tests can verify that files we *write* are
+/// readable by the connector that *reads* the real format. Guards against the
+/// converter drifting into a private format again (CONNECTORS.md §6).
+#[cfg(test)]
+pub(crate) fn load_for_testing(path: &Path, id: &str) -> ConnectorResult<Session> {
+    load_from_path(path, id)
+}
+
 fn load_from_path(path: &Path, id: &str) -> ConnectorResult<Session> {
     let file = fs::File::open(path).map_err(|e| ConnectorError::Io {
         path: path.to_path_buf(),

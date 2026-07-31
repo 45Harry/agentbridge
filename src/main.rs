@@ -296,17 +296,33 @@ fn cmd_resume(
     registry: &agentbridge::connector::Registry,
     session_id: &str,
     target: &str,
-    _project: Option<&str>,
+    project: Option<&str>,
     dry_run: bool,
 ) {
     let source_session = find_session(registry, session_id);
-    let session = match source_session {
+    let mut session = match source_session {
         Some(s) => s,
         None => {
             eprintln!("Session '{}' not found in any provider.", session_id);
             return;
         }
     };
+
+    // `--project` re-homes the session into another working directory. Both
+    // Claude Code and Codex scope resume to the cwd you launch them from, so
+    // without this you can only resume a session from the directory it was
+    // originally created in.
+    if let Some(p) = project {
+        match std::fs::canonicalize(p) {
+            Ok(abs) => {
+                session.project_id = abs.to_string_lossy().to_string();
+            }
+            Err(e) => {
+                eprintln!("--project '{}' could not be resolved: {}", p, e);
+                return;
+            }
+        }
+    }
 
     println!("Resuming session {} from {} into {}...", session.id, session.provider, target);
 
@@ -369,12 +385,20 @@ fn cmd_resume(
             let prev_provider = &session.provider;
             println!("✓ Session '{}' (from {}) copied to {} format", session.id, prev_provider, target);
             println!("  → {}", path.display());
-            println!("  Run: {}", match target {
-                "claude-code" => format!("claude --resume {}", session.id),
-                "codex-cli" => format!("codex resume {}", session.id),
-                "opencode" => format!("opencode run --session {}", session.id),
-                _ => String::new(),
-            });
+            // Derive the command from the file actually written — the target
+            // id can differ from the source id (non-UUID ids get a fresh one).
+            let cmd = match target {
+                "claude-code" => ClaudeCodeConverter::new().resume_cmd(&path),
+                "codex-cli" => CodexCliConverter::new().resume_cmd(&path),
+                "opencode" => agentbridge::convert::OpenCodeConverter::new().resume_cmd(&path),
+                _ => vec![],
+            };
+            if let Some(cwd) = session.project_path() {
+                println!("  Run from {}:", cwd);
+                println!("    {}", cmd.join(" "));
+            } else {
+                println!("  Run: {}", cmd.join(" "));
+            }
         }
         Err(e) => {
             eprintln!("Failed to convert/resume session: {}", e);

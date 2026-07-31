@@ -4,8 +4,8 @@
 
 use crate::connector::{Connector, Registry};
 
-mod claude_code;
-mod codex_cli;
+pub(crate) mod claude_code;
+pub(crate) mod codex_cli;
 
 pub fn all() -> Registry {
     let connectors: Vec<Box<dyn Connector>> = vec![
