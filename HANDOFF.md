@@ -11,7 +11,7 @@ conversation. Read this, then `DESIGN.md` (architecture and why), then
 ```bash
 git clone git@github.com:45Harry/agentbridge.git
 cd agentbridge
-cargo build && cargo test      # 42 tests, all pass
+cargo build && cargo test      # 57 tests, all pass
 cargo run -- init              # read-only: what's on this machine
 ```
 
@@ -27,10 +27,57 @@ agentbridge makes all of it visible in every tool's *own* picker.
 The goal in the operator's words: start a "python programming" session in
 Claude, open Codex anywhere on the box, continue where Claude left off.
 
-## 2. Where things stand
+## 2. ⛔ FAILED TEST — read this first (2026-07-31)
 
-**Working and verified end to end against the real binaries** (Claude Code ↔
-Codex CLI):
+**The picker does not list synced sessions in Codex.** The operator ran the
+real verification and it failed. Everything below about "working" is scoped
+by this.
+
+What was run: `agentbridge sync` in `~`, then `codex` → `/resume`.
+What happened: the picker showed **1** session, not 164.
+
+Root cause, since found and confirmed:
+
+**Codex lists sessions from a SQLite index, not from the rollout files.**
+`~/.codex/state_5.sqlite` → table `threads` (columns `id`, `rollout_path`,
+`cwd`, `title`, `first_user_message`, …). Measured right after a sync:
+`threads` had **11** rows (the operator's genuine sessions) while
+`~/.codex/sessions/` had **175** `.jsonl` files. Nothing inserts a `threads`
+row, so a dropped rollout is invisible to the picker.
+
+Note what *does* work, and why the failure went unnoticed for so long: a
+generated rollout **is** resolvable by id — `codex resume <id>` and
+`codex delete <id>` both find it (verified against the real binary). That is
+what earlier testing checked, and it passed. Listing and resolving are
+different code paths in Codex, and only listing was ever the operator's
+requirement.
+
+**The fix**: Codex needs the same treatment as OpenCode — insert a `threads`
+row with `rollout_path` pointing at the generated file, behind the same
+backup / marker / not-running guard. Before building that, check the
+`backfill_state` table in the same database: Codex may rebuild `threads`
+from disk on start, in which case letting it discover the files is safer
+than inserting rows.
+
+**Still unverified, do not assume either way:**
+
+- Claude Code's `/resume` picker — never checked by anyone. Claude Code's
+  project *directory* is its index, so it may well work, but it may also
+  keep a separate index the way Codex does. **Check this first**; it is one
+  command and it decides whether the file-based approach survives at all.
+- OpenCode's `/session` — writes were refused during the whole test because
+  OpenCode was running, so nothing was ever inserted. The write path has unit
+  tests but has never run against the real database.
+
+**Operator's machine was left synced** (~164 generated rollouts in
+`~/.codex/sessions`, ~161 files in `~/.claude/projects/-Users-harry/`,
+~164 MB in `~/.agentbridge`). `agentbridge unsync` reverses all of it; the
+genuine 11 Codex rollouts and the real Claude sessions are untouched.
+
+## 3. Where things stand
+
+**Verified against the real binaries** (Claude Code ↔ Codex CLI) — note this
+is resume-*by-id*, not picker listing (see §2):
 
 - Discovery, sync, write-back, unsync, status.
 - A Codex session resuming inside Claude Code and vice versa.
@@ -38,11 +85,11 @@ Codex CLI):
 - Continue a synced session in Claude Code → `sync` → the turn appears in the
   Codex copy → `unsync` leaves the original untouched.
 
-**Not done:** OpenCode / agy / Kilo connectors, redaction, and proof that the
-tools' *interactive* pickers list synced sessions (resume-by-id is proven;
-driving a TTY picker isn't automated).
+**Not done:** picker listing for any tool (§2 — the blocking issue), agy /
+Kilo connectors, redaction, and a real-database run of the OpenCode write
+path.
 
-## 3. Architecture in one page
+## 4. Architecture in one page
 
 Full detail in `DESIGN.md`; the three rules that matter:
 
@@ -69,7 +116,7 @@ src/
   connector.rs  the Connector trait every provider implements
 ```
 
-## 4. Hard-won lessons — read before changing anything
+## 5. Hard-won lessons — read before changing anything
 
 **Unit tests passing means nothing here.** Three separate times a feature was
 "verified" by green tests and was completely broken against the real binaries.
@@ -123,7 +170,12 @@ no cost):
 - Wrap CLI probes in a timeout; macOS has no GNU `timeout`, and `agy` once
   hung for 8s on an invalid id.
 
-## 5. Next steps, in order
+## 6. Next steps, in order
+
+0. **Fix picker listing — this is the whole product.** Check Claude Code's
+   picker first (one command), then implement Codex `threads` insertion per
+   §2, then actually run the OpenCode write path with OpenCode quit. Until a
+   picker lists a foreign session, nothing else matters.
 
 1. **Durable marker in generated files** so orphans can never be mistaken for
    real sessions (see the footgun above).
@@ -140,7 +192,7 @@ no cost):
 6. Topic threading — grouping sessions across tools by subject rather than
    project path (`DESIGN.md` §10).
 
-## 6. Repo hygiene
+## 7. Repo hygiene
 
 - Public: `https://github.com/45Harry/agentbridge`, branch `master`.
 - Keep tests green; add a regression test for every bug, and verify format

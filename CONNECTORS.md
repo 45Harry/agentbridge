@@ -70,6 +70,36 @@ since that directly informs the scope of M4/M5.
 - `--all` on `resume`/`exec resume` disables cwd filtering — Codex already
   supports the cross-directory resume Claude Code lacks (per spec §1.3).
 
+### ⛔ The rollout files are NOT the index (discovered 2026-07-31)
+
+**Codex lists sessions from a SQLite index, not by scanning `sessions/`.**
+This invalidates the assumption the whole file-copy approach rested on for
+Codex, and it was only caught by the operator actually opening `/resume`.
+
+- Index: `~/.codex/state_5.sqlite`, table **`threads`** (sqlx-migrated;
+  siblings `logs_2.sqlite`, `memories_1.sqlite`, `goals_1.sqlite`).
+- Columns of note: `id`, **`rollout_path`** (pointer to the `.jsonl`), `cwd`,
+  `title`, `first_user_message`, `preview`, `created_at_ms`, `updated_at_ms`,
+  `recency_at_ms`, `archived`, `is_pinned`, `git_branch`, `cli_version`.
+- Measured on a real machine after syncing: `threads` held **11** rows — the
+  operator's genuine sessions — while `~/.codex/sessions/` held **175**
+  `.jsonl` files. `/resume` listed exactly one session for that cwd.
+
+So writing a well-formed rollout into `sessions/` makes the session
+*resumable by id* (`codex resume <id>` and `codex delete <id>` both resolve
+it — verified) but **invisible in the picker**, because nothing inserted a
+`threads` row.
+
+To make a session appear in Codex's list, agentbridge must additionally
+`INSERT` into `threads` with `rollout_path` pointing at the generated file —
+i.e. Codex needs the same treatment as OpenCode (write into a live database,
+with backup / marker / not-running guard), not a plain file drop.
+
+**Open question before implementing:** whether Codex rebuilds or prunes
+`threads` from disk at startup (there is a `backfill_state` table, which
+hints at exactly that). If it backfills, a simpler and safer route may be to
+let Codex discover the rollouts itself rather than inserting rows.
+
 ## 3. OpenCode
 
 **Last verified:** against `1.17.15`, on 2026-07-30, macOS.

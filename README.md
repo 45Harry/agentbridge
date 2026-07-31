@@ -6,9 +6,12 @@ One session layer for every AI coding agent on your machine. Start a
 conversation in Claude Code, keep going in Codex — from any directory, using
 each tool's own session picker. No new UI to learn.
 
-**Status:** working for Claude Code, Codex CLI and OpenCode, verified against
-the real binaries. agy and Kilo Code are not connected yet. See
-[Current state](#current-state) for exactly what is and isn't proven.
+**Status: not working end to end yet.** Sessions are indexed, converted and
+placed correctly, and are resumable *by id* across tools — but they do **not
+yet show up in the tools' session pickers**, which is the point. Codex lists
+from a SQLite index (`state_5.sqlite` → `threads`) rather than from the
+rollout files, so dropped files are invisible to it. See
+[Current state](#current-state).
 
 ## The problem
 
@@ -28,9 +31,10 @@ almost all of it is invisible from wherever you happen to be standing.
 
 ## What agentbridge does
 
-After `sync`, opening any tool in that directory shows every session in its
-own native picker — because as far as that tool can tell, they are its own
-sessions.
+The intent: after `sync`, opening any tool in that directory shows every
+session in its own native picker, because as far as that tool can tell they
+are its own sessions. **That last step does not work yet** — see
+[Current state](#current-state).
 
 ## Commands
 
@@ -113,7 +117,15 @@ Requires Rust (edition 2024). See `DECISIONS.md` for why Rust over TypeScript.
 
 ## Current state
 
-Verified end to end against the real `claude` and `codex` binaries:
+**The blocking gap:** Codex's `/resume` picker lists from
+`~/.codex/state_5.sqlite` (table `threads`), not by scanning
+`~/.codex/sessions/`. After a sync that wrote 164 rollouts, `threads` still
+held only the 11 real sessions and the picker showed 1. Making sessions
+*appear* requires inserting `threads` rows, the same way OpenCode requires
+INSERTs. Claude Code's picker has not been checked yet.
+
+Verified against the real `claude` and `codex` binaries — resume *by id*,
+which is a different code path from listing:
 
 - A Codex session opening and resuming inside Claude Code, and vice versa.
 - The same session resumable from multiple directories, one physical copy.
