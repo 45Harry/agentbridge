@@ -192,11 +192,17 @@ impl SessionConverter for ClaudeCodeConverter {
             }));
         }
 
-        let content: Vec<String> = records
+        // Trailing newline is required, not cosmetic: these files are appended
+        // to by the real tools when a session is continued. Without it the
+        // tool's first new record concatenates onto our last line and corrupts
+        // the session.
+        let mut content: String = records
             .iter()
-            .map(|r| serde_json::to_string(r).unwrap_or_default())
+            .map(|r| serde_json::to_string(r).unwrap_or_default() + "\n")
             .collect();
-        let content = content.join("\n");
+        if content.is_empty() {
+            content.push('\n');
+        }
 
         std::fs::write(&out_path, &content)
             .map_err(|e| format!("failed to write converted session: {}", e))?;
@@ -317,11 +323,17 @@ impl SessionConverter for CodexCliConverter {
             }));
         }
 
-        let content: Vec<String> = records
+        // Trailing newline is required, not cosmetic: these files are appended
+        // to by the real tools when a session is continued. Without it the
+        // tool's first new record concatenates onto our last line and corrupts
+        // the session.
+        let mut content: String = records
             .iter()
-            .map(|r| serde_json::to_string(r).unwrap_or_default())
+            .map(|r| serde_json::to_string(r).unwrap_or_default() + "\n")
             .collect();
-        let content = content.join("\n");
+        if content.is_empty() {
+            content.push('\n');
+        }
 
         std::fs::write(&out_path, &content)
             .map_err(|e| format!("failed to write codex converted session: {}", e))?;
@@ -529,6 +541,31 @@ mod tests {
         assert!(last["leafUuid"].is_string());
     }
 
+    /// Files the real tools append to must end with a newline, or the tool's
+    /// first new record concatenates onto our last line and corrupts the
+    /// session. Caught in real end-to-end testing, not by any unit test.
+    #[test]
+    fn test_output_ends_with_newline_so_appends_do_not_corrupt() {
+        let session = test_session();
+        let tmp = tempfile::tempdir().unwrap();
+
+        for path in [
+            ClaudeCodeConverter::new().convert(&session, &tmp.path().to_path_buf()).unwrap(),
+            CodexCliConverter::new().convert(&session, &tmp.path().to_path_buf()).unwrap(),
+        ] {
+            let body = std::fs::read_to_string(&path).unwrap();
+            assert!(body.ends_with('\n'), "{} must end with a newline", path.display());
+
+            // Appending must yield a parseable extra line, not a mangled one.
+            let mut appended = body.clone();
+            appended.push_str("{\"type\":\"probe\"}\n");
+            for (i, line) in appended.lines().enumerate() {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .unwrap_or_else(|e| panic!("line {i} unparseable after append: {e}"));
+            }
+        }
+    }
+
     /// parentUuid must form an unbroken chain: first turn is null-rooted, each
     /// subsequent turn points at its predecessor's uuid.
     #[test]
@@ -707,7 +744,7 @@ mod tests {
             .convert(&session, &tmp.path().to_path_buf())
             .unwrap();
 
-        let loaded = crate::connectors::claude_code::load_for_testing(&path, &session.id)
+        let loaded = crate::connectors::claude_code::load_file(&path, &session.id)
             .expect("our own connector must be able to read what we wrote");
 
         assert_eq!(loaded.id, session.id);
@@ -791,7 +828,7 @@ mod tests {
             .convert(&session, &tmp.path().to_path_buf())
             .unwrap();
 
-        let loaded = crate::connectors::codex_cli::load_for_testing(&path, &session.id)
+        let loaded = crate::connectors::codex_cli::load_file(&path, &session.id)
             .expect("our own connector must be able to read what we wrote");
 
         assert_eq!(loaded.id, session.id);

@@ -1,206 +1,148 @@
 # HANDOFF.md
 
-Session continuity note. If you're picking this project up on a different
-machine (new Claude Code / Codex / etc. session with no memory of the prior
-conversation), read this file first, then `SPEC.md` (the original build
-brief), then `DECISIONS.md` (choices already locked in), then `CONNECTORS.md`
-(reverse-engineered provider formats).
+Pick this project up cold — new machine, new session, no memory of prior
+conversation. Read this, then `DESIGN.md` (architecture and why), then
+`CONNECTORS.md` (each tool's on-disk format).
 
 **Last updated:** 2026-07-31.
 
-**Correction (2026-07-31):** the "Verified working" `agentbridge resume`
-transcript below (§3) was retested end-to-end on a different machine against
-real `claude`/`codex` binaries and **does not work** — both directions were
-rejected identically to a fake UUID. Full root-cause analysis in
-`CONNECTORS.md` §6. Do not trust "verified" claims in this file at face
-value going forward without rerunning them — see §3 for what's actually
-confirmed now.
-
----
-
-## 0. Getting started on a new machine
+## 0. Start here
 
 ```bash
 git clone git@github.com:45Harry/agentbridge.git
 cd agentbridge
-cargo build              # should build clean
-cargo test               # 19 tests, all pass
-cargo clippy             # style nits only, no errors
-cargo run -- info        # shows detected connectors on this machine
+cargo build && cargo test      # 42 tests, all pass
+cargo run -- init              # read-only: what's on this machine
 ```
 
-Requires Rust edition 2024 toolchain (Rust 1.85+; repo was built with
-1.97.0).
+Requires Rust edition 2024.
 
-## 1. Where things stand
+## 1. What this is
 
-**M1 (connectors) complete and verified.** `agentbridge resume`
-(file-copy cross-tool conversion) is **implemented but confirmed NOT working**
-as of 2026-07-31 — see the correction note above and `CONNECTORS.md` §6 for
-the full retest. The connectors themselves (`ls`/`index`, reading real
-sessions) work correctly; it's specifically the *writer* side in
-`convert.rs` that produces a format neither real tool recognizes.
+One session layer for every agent tool on a machine. Every tool scopes its
+session picker to the current directory and can't read other tools' sessions,
+so most of your history is invisible from wherever you're standing.
+agentbridge makes all of it visible in every tool's *own* picker.
 
-## 2. Architecture map
+The goal in the operator's words: start a "python programming" session in
+Claude, open Codex anywhere on the box, continue where Claude left off.
+
+## 2. Where things stand
+
+**Working and verified end to end against the real binaries** (Claude Code ↔
+Codex CLI):
+
+- Discovery, sync, write-back, unsync, status.
+- A Codex session resuming inside Claude Code and vice versa.
+- One session resumable from multiple directories, one physical copy.
+- Continue a synced session in Claude Code → `sync` → the turn appears in the
+  Codex copy → `unsync` leaves the original untouched.
+
+**Not done:** OpenCode / agy / Kilo connectors, redaction, and proof that the
+tools' *interactive* pickers list synced sessions (resume-by-id is proven;
+driving a TTY picker isn't automated).
+
+## 3. Architecture in one page
+
+Full detail in `DESIGN.md`; the three rules that matter:
+
+1. **Never copy a session body.** The source files are the store; agentbridge
+   keeps an index pointing at them.
+2. **One derived artifact per (session, target format, directory)**, content
+   in `~/.agentbridge/cache`. Formats genuinely differ, so some derived bytes
+   are unavoidable — but exactly one copy is.
+3. **Directory presence via hardlink**, not copy. Same inode, zero extra
+   bytes. Refreshing the cache artifact updates every directory at once.
+
+Write-back: a tool's own files are never modified, so turns appended to a
+materialized session are recovered into an append-only **overlay** that
+agentbridge owns (`~/.agentbridge/overlay/<session>.jsonl`) and folded into
+other tools' copies on the next sync.
 
 ```
 src/
-  model.rs               Data model: Project, RawSession, Session, Message,
-                         Artifact, Fact, Provenance
-  connector.rs           Connector trait (id/detect/roots/scan/load/
-                         resume_cmd/inject), Registry, ConnectorError,
-                         InjectTarget, SessionStream
-  connectors/
-    mod.rs               Registration + test helpers (all_for_testing)
-    claude_code.rs       Claude Code connector (real + fixture formats)
-    codex_cli.rs         Codex CLI connector (real + fixture formats)
-  convert.rs             Cross-tool session converters + brief builder
-  inject.rs              Brief injection helpers (start/inject commands)
-  main.rs                CLI: ls, index, resume, start, inject, info
-tests/
-  fixtures/
-    claude-code/         10 synthetic fixtures (realistic but hand-authored)
-    codex-cli/           10 synthetic fixtures in date-partitioned layout
+  index.rs      discovery — metadata only, bodies stay in source files
+  sync.rs       cache, hardlink fan-out, manifest, pull_back, status, unsync
+  convert.rs    native-format writers (Claude Code, Codex) + brief builder
+  connectors/   per-tool readers; mod.rs is the single registration point
+  model.rs      Project / Session / Message / Artifact / Fact
+  connector.rs  the Connector trait every provider implements
 ```
 
-### Connector formats handled
+## 4. Hard-won lessons — read before changing anything
 
-- **Claude Code** (`~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`):
-  skips `permission-mode`/`file-history-snapshot` records; parses `user`,
-  `assistant`, `tool_use`, `tool_result` event types with nested
-  `message.role`/`message.content` (string or array-of-blocks). Skips
-  `isMeta` records. Handles RFC3339 + epoch timestamps.
-- **Codex CLI** (`~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl`):
-  `session_meta` first record (metadata in `payload`), then `event_msg`
-  (user messages in `payload.message`), `response_item` (assistant content
-  in `payload.content`), `tool_use`/`tool_result` (in `payload`). Skips
-  `world_state`/`turn_context`. Also parses the older flat fixture format
-  for backward compat with tests.
+**Unit tests passing means nothing here.** Three separate times a feature was
+"verified" by green tests and was completely broken against the real binaries.
+Every format change must be checked by running the actual tool.
 
-Both connectors tolerate: truncated final line, non-UTF-8 bytes, empty
-files, paths with hyphens/spaces, integer epoch timestamps.
+- The very first converter emitted an invented JSONL schema that neither tool
+  accepted. Its tests passed because they asserted the converter's *own*
+  output. Tests now assert the real on-disk contract (`CONNECTORS.md` §6).
+- **Missing trailing newline**: generated JSONL didn't end with `\n`, so a
+  tool appending its first record concatenated onto our last line and
+  corrupted the session.
+- **Self-truncation**: re-linking a destination already sharing the source's
+  inode fell through to `fs::copy`, which truncates the destination *before*
+  reading the source. A 240-record session became one line.
+- **Non-determinism breaks everything**: random v4 ids and `Utc::now()` in
+  filenames meant every sync minted new paths and duplicated sessions. Ids are
+  now UUID v5 of the source id; Codex rollout paths derive from the session's
+  own start time.
+- **Sync used to feed on its own output** — files it wrote were rediscovered
+  as new sessions and re-materialized, multiplying every run. The manifest now
+  marks generated files as never-a-source.
 
-## 3. CLI usage
+**Never `rm -rf ~/.agentbridge` — always `agentbridge unsync`.** Deleting the
+manifest orphans generated files, and without it agentbridge cannot tell its
+own output from a real session. This actually happened and polluted a real
+`~/.codex` with 16 stray rollouts, which then produced duplicate index
+entries. A durable marker inside generated files would remove the footgun —
+still to do, and probably the next thing worth building.
 
-| Command | What it does |
-|---|---|
-| `agentbridge info` | Show connectors + detected roots |
-| `agentbridge ls [--project <p>] [--provider <p>]` | List sessions from all providers |
-| `agentbridge index [--provider <p>]` | Load all sessions, print message counts |
-| `agentbridge resume <session-id> <target-provider> [--dry-run]` | **Cross-tool session copy** — converts session and writes it into the target tool's storage dir |
-| `agentbridge start <provider> [--dry-run]` | Inject cross-tool brief into a provider |
-| `agentbridge inject <provider> <session-ids...> [--dry-run]` | Inject specific sessions |
+**Test in a sandbox, not on real data.** Use a fake `HOME` with *copies*:
 
-### Verified 2026-07-31 (supersedes the 2026-07-30 claim below)
-
-`ls`/`index`/`info` all confirmed working against real local installs of
-Claude Code and Codex CLI. `resume` (file-copy conversion) was retested
-end-to-end with real binaries and **is currently non-functional** — the
-`convert.rs` writer produces a record schema neither tool's resume
-validator accepts, even though the file lands at the exact correct path.
-See `CONNECTORS.md` §6 for the full test (both directions, with fake-UUID
-control runs proving the rejections are real, and confirmation that the
-generated test files were cleaned up from `~/.claude/projects/` and
-`~/.codex/sessions/` afterward).
-
-`--dry-run` still works and is useful for previewing source/target/message
-count — just don't trust the non-dry-run write to produce a resumable
-session yet.
-
-<details>
-<summary>Original 2026-07-30 claim (inaccurate — kept for context, do not
-rely on it)</summary>
-
-```
-$ cargo run -- ls
-[Claude Code]
-  7adbc643-e0bd-4c49-8432-6ef37c9001fd | /home/harry/Documents
-  fc6ddb7b-02b2-47c3-9dce-dc873ede46db | /home/harry/Documents/Mantra/apf-digital-border-ai
-[Codex CLI]
-  019fb0ce-8d89-7e82-9d2a-8639d3a57afa | /home/harry
-
-$ cargo run -- resume 019fb0ce-8d89-7e82-9d2a-8639d3a57afa claude-code
-✓ Session copied → /home/harry/.claude/projects/-home-harry/019fb0ce-....jsonl
-# claimed: now `claude --resume 019fb0ce-...` works from Claude Code
-# RETEST 2026-07-31: this does NOT happen — resume rejects it same as a fake UUID
-
-$ cargo run -- resume 7adbc643-e0bd-4c49-8432-6ef37c9001fd codex-cli
-✓ Session copied → /home/harry/.codex/sessions/2026/07/30/rollout-...jsonl
-# claimed: now `codex resume 7adbc643-...` works from Codex CLI
-# RETEST 2026-07-31: this does NOT happen — codex also rejects it same as a fake UUID
+```bash
+SB=/tmp/ab-sandbox
+mkdir -p $SB/.claude/projects/-work-proj $SB/.codex/sessions/2026/07/29 $SB/work
+cp <a real claude session>.jsonl $SB/.claude/projects/-work-proj/
+cp <a real codex rollout>.jsonl $SB/.codex/sessions/2026/07/29/
+cargo build     # build FIRST — HOME override breaks rustup
+HOME=$SB AGENTBRIDGE_DATA_DIR=$SB/.agentbridge ./target/debug/agentbridge sync --project $SB/work
 ```
 
-</details>
+**Zero-cost signals for checking a tool accepted a session** (no model call,
+no cost):
 
-## 4. What's pending (next session's work)
+- Claude Code: `claude --resume <id>` → `No conversation found` means
+  rejected; `No deferred tool marker found…` means it loaded the session.
+  Run it **from the session's own directory** — resume is cwd-scoped, and
+  testing from the wrong directory makes a genuine session look rejected.
+- Codex: `codex delete <id> --force` → `Deleted session` means recognized;
+  `Error: failed to delete session` means not. (Destructive — synthetic files
+  only.)
+- Wrap CLI probes in a timeout; macOS has no GNU `timeout`, and `agy` once
+  hung for 8s on an invalid id.
 
-In priority order:
+## 5. Next steps, in order
 
-0. **Fix `convert.rs` to emit the real schema, or drop the file-copy
-   approach in favor of M4 brief-injection only.** Currently non-functional
-   (see §3, `CONNECTORS.md` §6). If fixing: `ClaudeCodeConverter` needs every
-   record to carry `sessionId` and use real `type` values
-   (`mode`/`permission-mode`/`user`/`assistant`/`tool_use`/`tool_result` with
-   nested `message.role`/`message.content`, matching what
-   `claude_code.rs`'s reader already parses); `CodexCliConverter` needs a
-   leading `{"type":"session_meta","payload":{"session_id":...,"cwd":...}}`
-   record and subsequent records wrapped in `payload` (matching
-   `codex_cli.rs`'s reader). Whichever direction is chosen, prove it with a
-   real end-to-end test against real `claude`/`codex` binaries the way §3
-   did, not just a round-trip unit test against the converter's own output —
-   that's what let the original bug ship undetected. Also fix
-   `ClaudeCodeConverter::encode_project_dir`'s `.to_lowercase()` (real
-   Claude Code encoding preserves case; only masked here by APFS being
-   case-insensitive — would break on Linux).
-
-1. **Redaction pass** — `src/redact.rs` does not exist yet. `SPEC.md` §3
-   hard constraint: must run over every extracted snippet before it is
-   stored or sent anywhere. Default rules: AWS keys, bearer tokens, private
-   key blocks, `sk-` keys, connection strings with creds. **Fail closed.**
-   Needs positive/negative unit tests + must-fail safety tests (§7).
-
-2. **OpenCode connector (M2)** — storage verified in `CONNECTORS.md` §3:
-   SQLite at `~/.local/share/opencode/opencode.db`, `session` table with
-   plain `directory` column, IDs `ses_...`. Connector not yet implemented;
-   `OpenCodeConverter::convert` returns "not yet implemented".
-
-3. **Injection target resolution** — `ClaudeCodeConnector::inject()` and
-   `CodexCliConnector::inject()` return errors (cannot determine the target
-   file yet). Needs: resolve active project dir → `CLAUDE.md` (or Codex's
-   equivalent) → write fenced block with begin/end markers → `clean`
-   subcommand to remove exactly the fence. Dry-run paths exist in the CLI.
-
-4. **Persistent SQLite storage** — no `schema_version` table, no
-   `migrations/`, no DB writes. `index` currently only loads and prints.
-   Decision locked in `DECISIONS.md`: forward-only migrations, FTS5 via
-   triggers, own data dir via `AGENTBRIDGE_DATA_DIR`.
-
-5. **agy connector (M2)** — storage location still unknown; needs research
-   spike (see `DECISIONS.md` last entry + `CONNECTORS.md` §4).
-
-6. **M3 distillation** — `brief` command with extractive pass (zero LLM),
-   optional `--llm` abstractive pass, hard token budget, provenance on
-   every fact.
-
-## 5. Key findings (full detail in CONNECTORS.md)
-
-- **Claude Code**: `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`. Directory
-  encoding is lossy — always read `cwd` from inside records.
-- **Codex CLI**: `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl`,
-  date-partitioned. `history.jsonl` + two `.sqlite` files in `~/.codex/` are
-  still uncharacterized.
-- **OpenCode**: SQLite at `~/.local/share/opencode/opencode.db` — the odd
-  one out (not JSONL). Plain unencoded cwd in `directory` column.
-- **agy**: storage location unknown — blocks M2.
-- **Native cross-tool resume does NOT work** — each tool validates session
-  IDs against its own storage only. That's why `agentbridge resume` does
-  format conversion + file placement instead of shelling out to foreign
-  `--resume` flags. Do not attempt literal session transfer; M4 brief
-  injection + M5 copy-shim are the spec'd approaches.
+1. **Durable marker in generated files** so orphans can never be mistaken for
+   real sessions (see the footgun above).
+2. **OpenCode connector** — storage fully mapped in `CONNECTORS.md` §3
+   (SQLite, `session` table, plain `directory` column, `ses_…` ids). It is the
+   only tool where materializing means `INSERT`ing into real data, so it needs
+   backup-before-write, tagged rows, refusal while OpenCode is running, and
+   `--dry-run` printing the SQL. Deferred deliberately.
+3. **Redaction** (`src/redact.rs`, doesn't exist) — `SPEC.md` §3 requires it
+   before anything is written or sent. Fail closed.
+4. **agy connector** — storage location still unknown; needs a tracing spike
+   (`CONNECTORS.md` §4). **Kilo Code** — not investigated at all.
+5. **Verify the interactive pickers** actually list synced sessions.
+6. Topic threading — grouping sessions across tools by subject rather than
+   project path (`DESIGN.md` §10).
 
 ## 6. Repo hygiene
 
-- Repo: **public**, `https://github.com/45Harry/agentbridge`, branch `master`.
-- `.gitignore` excludes `/target` only — don't commit local session data.
-- Commit at each milestone per `SPEC.md` §6.
-- 19 tests currently pass; keep them green before committing.
+- Public: `https://github.com/45Harry/agentbridge`, branch `master`.
+- Keep tests green; add a regression test for every bug, and verify format
+  changes against the real binary before believing them.
+- Never commit session data.

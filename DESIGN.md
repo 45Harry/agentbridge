@@ -164,6 +164,16 @@ same topic/thread — is the open question in §10.
 
 ## 9. Current state
 
+**Write-back verified end to end 2026-07-31** in an isolated sandbox (fake
+`HOME`, copies of two real sessions): sync -> continue the session in Claude
+Code -> `sync` auto-pulls the new turn -> **the turn appears in the Codex
+copy** -> `unsync` removes all 4 links, keeps the recovered turn in the
+overlay, and leaves the original session untouched.
+
+Note how republishing works: destinations are hardlinks to the cache
+artifact, so refreshing the cache updates every linked directory at once —
+sync reports `created 0` and the new turn is already everywhere.
+
 Done and verified against real binaries:
 
 - Reading Claude Code + Codex sessions (`ls`, `index`).
@@ -173,8 +183,32 @@ Done and verified against real binaries:
 - Hardlink fan-out across directories (§4 Rule 3).
 - `--project` re-homing a session into any working directory.
 
-Not built yet: the index, content-addressed cache, lazy materialization, sync
-and write-back loop, `unsync`, OpenCode/agy/Kilo connectors, redaction.
+Also done: discovery/index (`init`), cache + hardlink fan-out, `sync`,
+`unsync`, write-back (`pull`), and `status` — drift between what was written
+and what is on disk, which is the diagnostic that exposed the bugs below.
+
+Three bugs found only by real end-to-end runs, all now regression-tested:
+
+1. **Missing trailing newline.** Generated JSONL did not end with a newline,
+   so a tool appending its first record concatenated it onto our last line
+   and corrupted the session.
+2. **Self-truncation.** Re-linking a destination that already shared the
+   source's inode fell through to `fs::copy`, which truncates the destination
+   before reading the source — destroying the content. Observed as a
+   240-record session collapsing to one line. Now inode-checked, with an
+   atomic temp+rename replace for the genuinely-different case.
+3. **Duplicate destinations.** Two index entries sharing a (provider, id) —
+   e.g. a generated file orphaned by a deleted manifest sitting beside its
+   own source — resolved to one path and overwrote each other. Now deduped.
+
+Operational lesson: deleting the manifest orphans generated files, and
+without it agentbridge cannot distinguish its own output from a real session.
+Always `unsync`; never remove the data dir by hand. A durable marker inside
+generated files would remove this footgun entirely — still to do.
+
+Not built yet: OpenCode/agy/Kilo connectors, redaction, and proof that the
+tools' *interactive* pickers list synced sessions (resume-by-id is verified;
+driving a TTY picker is not automated).
 
 ## 10. Open question — how far does "same thread" go?
 

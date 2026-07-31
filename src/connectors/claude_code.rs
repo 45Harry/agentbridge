@@ -295,11 +295,13 @@ fn extract_cc_title(val: &Value) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Test-only shim so converter tests can verify that files we *write* are
-/// readable by the connector that *reads* the real format. Guards against the
-/// converter drifting into a private format again (CONNECTORS.md §6).
-#[cfg(test)]
-pub(crate) fn load_for_testing(path: &Path, id: &str) -> ConnectorResult<Session> {
+/// Read a session from an explicit path rather than by id.
+///
+/// Used by write-back to re-read a file agentbridge materialized (which lives
+/// under a directory the connector's own id lookup would not search), and by
+/// converter tests to prove that what we *write* is readable by the reader for
+/// the real format (CONNECTORS.md §6).
+pub(crate) fn load_file(path: &Path, id: &str) -> ConnectorResult<Session> {
     load_from_path(path, id)
 }
 

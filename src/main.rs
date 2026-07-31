@@ -66,6 +66,18 @@ enum Commands {
         dry_run: bool,
     },
 
+    /// Recover turns other tools appended to synced sessions
+    #[command(name = "pull")]
+    Pull {
+        /// Show what would be recovered without writing
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Show drift between what agentbridge wrote and what is on disk now
+    #[command(name = "status")]
+    Status,
+
     /// Remove exactly the files agentbridge created
     #[command(name = "unsync")]
     Unsync {
@@ -130,6 +142,8 @@ fn main() {
         }
         Commands::Init => cmd_init(&registry),
         Commands::Sync { project, dry_run } => cmd_sync(&registry, project.as_deref(), dry_run),
+        Commands::Pull { dry_run } => cmd_pull(dry_run),
+        Commands::Status => cmd_status(),
         Commands::Unsync { dry_run } => cmd_unsync(dry_run),
         Commands::Info => cmd_info(&registry),
     }
@@ -547,6 +561,18 @@ fn cmd_sync(registry: &agentbridge::connector::Registry, project: Option<&str>, 
         None => std::env::current_dir().unwrap_or_default(),
     };
 
+    // Recover anything other tools appended before re-materializing, so the
+    // refreshed copies carry it.
+    let pulled = agentbridge::sync::pull_back(dry_run);
+    let n: usize = pulled.pulled.iter().map(|(_, n)| n).sum();
+    if n > 0 {
+        println!(
+            "  pulled    {} new turn(s) from {} session(s) worked on elsewhere",
+            n,
+            pulled.pulled.len()
+        );
+    }
+
     println!("Surfacing all machine sessions in {}", dir.display());
     let report = agentbridge::sync::sync_into(registry, &dir, dry_run);
 
@@ -585,4 +611,56 @@ fn cmd_unsync(dry_run: bool) {
     if report.missing > 0 {
         println!("{} already gone", report.missing);
     }
+}
+
+fn cmd_pull(dry_run: bool) {
+    let report = agentbridge::sync::pull_back(dry_run);
+    let total: usize = report.pulled.iter().map(|(_, n)| n).sum();
+
+    if report.pulled.is_empty() {
+        println!("No new turns — nothing was continued in another tool.");
+    } else if dry_run {
+        println!("[dry-run] would recover {} turn(s):", total);
+    } else {
+        println!("Recovered {} turn(s):", total);
+    }
+    for (id, n) in &report.pulled {
+        println!("  {:<40} +{} turn(s)", id, n);
+    }
+    for e in report.errors.iter().take(10) {
+        eprintln!("  ! {}", e);
+    }
+    if !dry_run && total > 0 {
+        println!();
+        println!("Run `agentbridge sync` to push these to every other tool.");
+    }
+}
+
+fn cmd_status() {
+    let rows = agentbridge::sync::status();
+    if rows.is_empty() {
+        println!("Nothing synced. Run `agentbridge sync`.");
+        return;
+    }
+    println!("{:<38} {:<12} {:>8} {:>8} {:>7}", "SESSION", "TARGET", "WROTE", "ON DISK", "NEW");
+    let mut drifted = 0;
+    for r in &rows {
+        let actual = r.actual.map(|n| n.to_string()).unwrap_or_else(|| {
+            if r.exists { "unreadable".into() } else { "gone".into() }
+        });
+        let d = r.drift();
+        if d > 0 {
+            drifted += 1;
+        }
+        println!(
+            "{:<38} {:<12} {:>8} {:>8} {:>7}",
+            &r.session_id[..r.session_id.len().min(36)],
+            r.target_provider,
+            r.expected,
+            actual,
+            if d > 0 { format!("+{}", d) } else { "-".to_string() }
+        );
+    }
+    println!();
+    println!("{} file(s) tracked, {} with new turns to pull", rows.len(), drifted);
 }

@@ -32,6 +32,187 @@ pub struct LinkRecord {
     /// Inode at creation time. Removal requires a match, so a file a tool has
     /// since rewritten is never deleted by us.
     pub inode: u64,
+    /// How many messages agentbridge wrote into this file. Anything beyond
+    /// this on a later read was appended by the tool itself and is new work
+    /// to pull back. Defaults to 0 for manifests written before write-back
+    /// existed.
+    #[serde(default)]
+    pub message_count: usize,
+}
+
+#[derive(Debug, Default)]
+pub struct PullReport {
+    /// (session id, number of new messages recovered)
+    pub pulled: Vec<(String, usize)>,
+    pub errors: Vec<String>,
+}
+
+fn overlay_dir() -> PathBuf {
+    data_dir().join("overlay")
+}
+
+fn overlay_path(session_id: &str) -> PathBuf {
+    overlay_dir().join(format!("{}.jsonl", session_id))
+}
+
+/// Turns that exist only because a tool appended them to a materialized copy.
+///
+/// The source file belongs to another tool and is never modified (invariant
+/// 2), so this overlay is the durable home for that new work — it is not a
+/// duplicate of anything, it is the only copy that survives `unsync`.
+pub fn overlay_messages(session_id: &str) -> Vec<crate::model::Message> {
+    let Ok(content) = fs::read_to_string(overlay_path(session_id)) else {
+        return Vec::new();
+    };
+    content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
+}
+
+/// Identity of a message for dedup: a turn is the same turn if its role, time
+/// and text match. Ordinals are not usable — they are reassigned per file.
+fn message_key(m: &crate::model::Message) -> String {
+    format!(
+        "{:?}|{}|{}|{}",
+        m.role,
+        m.timestamp.map(|t| t.timestamp_millis()).unwrap_or(0),
+        m.text.as_deref().unwrap_or(""),
+        m.tool_name.as_deref().unwrap_or(""),
+    )
+}
+
+fn append_overlay(session_id: &str, messages: &[crate::model::Message]) -> std::io::Result<usize> {
+    if messages.is_empty() {
+        return Ok(0);
+    }
+    fs::create_dir_all(overlay_dir())?;
+
+    // Never append a turn already recorded — pulls can overlap when the same
+    // session is materialized into several tools.
+    let existing: std::collections::HashSet<String> =
+        overlay_messages(session_id).iter().map(message_key).collect();
+
+    let mut body = fs::read_to_string(overlay_path(session_id)).unwrap_or_default();
+    let mut added = 0;
+    for m in messages {
+        if existing.contains(&message_key(m)) {
+            continue;
+        }
+        body.push_str(&serde_json::to_string(m).unwrap_or_default());
+        body.push('\n');
+        added += 1;
+    }
+    if added > 0 {
+        fs::write(overlay_path(session_id), body)?;
+    }
+    Ok(added)
+}
+
+fn load_materialized(target: &str, path: &Path, id: &str) -> Option<crate::model::Session> {
+    match target {
+        "claude-code" => crate::connectors::claude_code::load_file(path, id).ok(),
+        "codex-cli" => crate::connectors::codex_cli::load_file(path, id).ok(),
+        _ => None,
+    }
+}
+
+/// What agentbridge believes about each materialized file vs what is actually
+/// on disk now. Exposes drift — the basis of write-back and the first thing to
+/// look at when a pull recovers nothing.
+pub struct StatusRow {
+    pub session_id: String,
+    pub target_provider: String,
+    pub dest: PathBuf,
+    pub exists: bool,
+    /// Messages agentbridge wrote.
+    pub expected: usize,
+    /// Messages the reader finds now; `None` when the file cannot be read.
+    pub actual: Option<usize>,
+}
+
+impl StatusRow {
+    /// New turns waiting to be pulled back.
+    pub fn drift(&self) -> i64 {
+        self.actual.unwrap_or(self.expected) as i64 - self.expected as i64
+    }
+}
+
+pub fn status() -> Vec<StatusRow> {
+    read_manifest()
+        .into_iter()
+        .map(|r| {
+            let exists = r.dest.exists();
+            let actual = if exists {
+                load_materialized(&r.target_provider, &r.dest, &r.session_id)
+                    .map(|s| s.messages.len())
+            } else {
+                None
+            };
+            StatusRow {
+                session_id: r.session_id,
+                target_provider: r.target_provider,
+                dest: r.dest,
+                exists,
+                expected: r.message_count,
+                actual,
+            }
+        })
+        .collect()
+}
+
+/// Write-back: recover turns a tool appended to a materialized session so
+/// every other tool can see them (DESIGN.md §6).
+///
+/// Reads only files agentbridge itself created; source sessions are untouched.
+pub fn pull_back(dry_run: bool) -> PullReport {
+    let mut report = PullReport::default();
+    let mut manifest = read_manifest();
+    let mut changed = false;
+
+    for rec in manifest.iter_mut() {
+        if !rec.dest.exists() {
+            continue;
+        }
+        let Some(session) = load_materialized(&rec.target_provider, &rec.dest, &rec.session_id)
+        else {
+            continue;
+        };
+
+        // Anything past what we wrote is the tool's own new work.
+        if session.messages.len() <= rec.message_count {
+            continue;
+        }
+        let new = &session.messages[rec.message_count..];
+
+        if dry_run {
+            report.pulled.push((rec.session_id.clone(), new.len()));
+            continue;
+        }
+
+        match append_overlay(&rec.session_id, new) {
+            Ok(0) => {}
+            Ok(n) => {
+                report.pulled.push((rec.session_id.clone(), n));
+                rec.message_count = session.messages.len();
+                changed = true;
+            }
+            Err(e) => report
+                .errors
+                .push(format!("overlay {}: {}", rec.session_id, e)),
+        }
+    }
+
+    if changed && !dry_run {
+        let body: String = manifest
+            .iter()
+            .map(|r| serde_json::to_string(r).unwrap_or_default() + "\n")
+            .collect();
+        let _ = fs::write(manifest_path(), body);
+    }
+
+    report
 }
 
 #[derive(Debug, Default)]
@@ -98,11 +279,31 @@ fn link_or_copy(src: &Path, dest: &Path) -> std::io::Result<u64> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
+
+    // Already the same inode: the hardlink is in place, nothing to do. Falling
+    // through to copy here would truncate the file we are copying *from*.
+    if let (Ok(a), Ok(b)) = (fs::metadata(src), fs::metadata(dest)) {
+        if a.ino() == b.ino() {
+            return Ok(a.ino());
+        }
+    }
+
     match fs::hard_link(src, dest) {
         Ok(()) => {}
-        Err(_) => {
-            // Cross-device or unsupported: fall back to a real copy so the
-            // session is still visible, just at the cost of bytes.
+        Err(_) if dest.exists() => {
+            // `hard_link` fails when the destination exists. Replace it via a
+            // temp file + rename so the swap is atomic: a bare `fs::copy` onto
+            // an existing path truncates it first, and if src and dest are the
+            // same inode that destroys the content before it is read.
+            let tmp = dest.with_extension("agentbridge-tmp");
+            fs::copy(src, &tmp)?;
+            fs::rename(&tmp, dest)?;
+        }
+        Err(e) => {
+            // Cross-device or unsupported: a real copy, at the cost of bytes.
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                return Err(e);
+            }
             fs::copy(src, dest)?;
         }
     }
@@ -164,7 +365,19 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
     let generated: std::collections::HashSet<PathBuf> =
         manifest.iter().map(|r| r.dest.clone()).collect();
 
-    for entry in &index.entries {
+    // Two index entries can carry the same (provider, id) — e.g. a generated
+    // file orphaned by a deleted manifest sits alongside its own source. They
+    // resolve to one destination, so the second pass would overwrite the
+    // first. Keep the newest and drop the rest.
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let mut entries: Vec<&crate::index::IndexEntry> = Vec::new();
+    for e in &index.entries {
+        if seen.insert((e.provider.clone(), e.id.clone())) {
+            entries.push(e);
+        }
+    }
+
+    for entry in entries {
         if generated.contains(&entry.source_path) {
             continue;
         }
@@ -193,6 +406,26 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
             };
             session.project_id = project.to_string_lossy().to_string();
 
+            // Fold in turns other tools appended (write-back). Dedup by turn
+            // identity: a source session may already contain them if the user
+            // also continued it in its own tool.
+            let overlay = overlay_messages(&entry.id);
+            if !overlay.is_empty() {
+                let have: std::collections::HashSet<String> =
+                    session.messages.iter().map(message_key).collect();
+                for m in overlay {
+                    if !have.contains(&message_key(&m)) {
+                        session.messages.push(m);
+                    }
+                }
+                session
+                    .messages
+                    .sort_by_key(|m| m.timestamp.map(|t| t.timestamp_millis()).unwrap_or(0));
+                for (i, m) in session.messages.iter_mut().enumerate() {
+                    m.ordinal = i as u64;
+                }
+            }
+
             if dry_run {
                 report.created.push(LinkRecord {
                     dest: live.join("(planned)"),
@@ -202,6 +435,7 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
                     target_provider: target.clone(),
                     project: project.to_path_buf(),
                     inode: 0,
+                    message_count: session.messages.len(),
                 });
                 continue;
             }
@@ -235,6 +469,7 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
                     target_provider: target.clone(),
                     project: project.to_path_buf(),
                     inode,
+                    message_count: session.messages.len(),
                 }),
                 Err(e) => report.errors.push(format!("link {}: {}", entry.id, e)),
             }
@@ -355,6 +590,47 @@ mod tests {
         assert_eq!(fs::read_to_string(&dest).unwrap(), "hello");
     }
 
+    /// Regression: linking a file onto itself must not destroy it. `fs::copy`
+    /// truncates the destination before reading the source, so when both names
+    /// are the same inode the content is lost. Observed as a 240-record
+    /// session collapsing to a single line.
+    #[test]
+    fn test_relinking_same_inode_does_not_truncate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("artifact.jsonl");
+        fs::write(&src, "line1\nline2\nline3\n").unwrap();
+        let dest = tmp.path().join("linked.jsonl");
+        link_or_copy(&src, &dest).unwrap();
+
+        // Sync again over the existing link — the common idempotent case.
+        link_or_copy(&src, &dest).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&dest).unwrap(),
+            "line1\nline2\nline3\n",
+            "re-linking must preserve content"
+        );
+        assert_eq!(fs::read_to_string(&src).unwrap(), "line1\nline2\nline3\n");
+    }
+
+    /// Replacing a *different* existing file must swap it wholesale, never
+    /// leave it truncated.
+    #[test]
+    fn test_relinking_over_different_file_replaces_atomically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("new.jsonl");
+        fs::write(&src, "NEW\n").unwrap();
+        let dest = tmp.path().join("old.jsonl");
+        fs::write(&dest, "OLD CONTENT THAT IS LONGER\n").unwrap();
+
+        link_or_copy(&src, &dest).unwrap();
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "NEW\n");
+        assert!(
+            !tmp.path().join("old.agentbridge-tmp").exists(),
+            "temp file must not be left behind"
+        );
+    }
+
     #[test]
     fn test_unsync_keeps_files_it_did_not_create() {
         let _sb = Sandbox::new();
@@ -372,6 +648,7 @@ mod tests {
             target_provider: "claude-code".into(),
             project: tmp.path().to_path_buf(),
             inode: 999_999_999,
+            message_count: 0,
         };
         append_manifest(&[rec]).unwrap();
 
@@ -422,6 +699,139 @@ mod tests {
     /// Regression: sync writes into the tools' stores, so a second pass must
     /// not treat those files as new sessions and materialize them again.
     /// Without this guard the session count multiplies on every run.
+
+    /// Simulate a tool appending a turn to a session agentbridge materialized.
+    fn append_claude_turn(dest: &Path, sid: &str, text: &str) {
+        let mut body = fs::read_to_string(dest).unwrap();
+        if !body.ends_with('\n') {
+            body.push('\n');
+        }
+        body.push_str(&serde_json::json!({
+            "parentUuid": serde_json::Value::Null,
+            "isSidechain": false,
+            "type": "user",
+            "uuid": uuid::Uuid::new_v4().to_string(),
+            "timestamp": "2026-08-01T00:00:00.000Z",
+            "userType": "external",
+            "entrypoint": "cli",
+            "cwd": "/tmp/some-project",
+            "sessionId": sid,
+            "version": "2.1.220",
+            "gitBranch": "",
+            "message": { "role": "user", "content": text },
+        }).to_string());
+        body.push('\n');
+        fs::write(dest, body).unwrap();
+    }
+
+    fn first_claude_link(report: &SyncReport) -> LinkRecord {
+        report
+            .created
+            .iter()
+            .find(|r| r.target_provider == "claude-code")
+            .expect("a claude-code link")
+            .clone()
+    }
+
+    /// Core write-back: a turn a tool appended must be recovered into the
+    /// overlay, since the source file belongs to another tool and is never
+    /// modified.
+    #[test]
+    fn test_pull_back_recovers_turns_a_tool_appended() {
+        let _sb = Sandbox::new();
+        let registry = crate::connectors::all_for_testing(&fixture_root());
+        let project = PathBuf::from("/tmp/some-project");
+
+        let synced = sync_into(&registry, &project, false);
+        let link = first_claude_link(&synced);
+
+        // Nothing new yet.
+        assert!(pull_back(false).pulled.is_empty(), "no new turns to pull");
+
+        append_claude_turn(&link.dest, &link.session_id, "CONTINUED IN ANOTHER TOOL");
+
+        let report = pull_back(false);
+        let got: usize = report.pulled.iter().map(|(_, n)| n).sum();
+        assert_eq!(got, 1, "the appended turn must be recovered");
+
+        let overlay = overlay_messages(&link.session_id);
+        assert!(
+            overlay.iter().any(|m| m.text.as_deref() == Some("CONTINUED IN ANOTHER TOOL")),
+            "overlay must hold the new turn"
+        );
+    }
+
+    /// Pulling twice must not duplicate the same turn.
+    #[test]
+    fn test_pull_back_is_idempotent() {
+        let _sb = Sandbox::new();
+        let registry = crate::connectors::all_for_testing(&fixture_root());
+        let project = PathBuf::from("/tmp/some-project");
+        let synced = sync_into(&registry, &project, false);
+        let link = first_claude_link(&synced);
+
+        append_claude_turn(&link.dest, &link.session_id, "ONLY ONCE");
+        pull_back(false);
+        let after_first = overlay_messages(&link.session_id).len();
+
+        pull_back(false);
+        let after_second = overlay_messages(&link.session_id).len();
+
+        assert_eq!(after_first, after_second, "re-pulling must not duplicate");
+    }
+
+    /// The point of write-back: work done in one tool reaches the others.
+    #[test]
+    fn test_recovered_turn_propagates_to_other_tools() {
+        let _sb = Sandbox::new();
+        let registry = crate::connectors::all_for_testing(&fixture_root());
+        let project = PathBuf::from("/tmp/some-project");
+        let synced = sync_into(&registry, &project, false);
+        let link = first_claude_link(&synced);
+
+        append_claude_turn(&link.dest, &link.session_id, "CROSS TOOL TURN");
+        pull_back(false);
+
+        // Re-materialize: the Codex copy of the same session must now carry it.
+        unsync(false);
+        let resynced = sync_into(&registry, &project, false);
+        let codex = resynced
+            .created
+            .iter()
+            .find(|r| r.target_provider == "codex-cli" && r.session_id == link.session_id)
+            .expect("a codex link for the same session");
+
+        let body = fs::read_to_string(&codex.dest).unwrap();
+        assert!(
+            body.contains("CROSS TOOL TURN"),
+            "a turn added in one tool must appear in the other tool's copy"
+        );
+    }
+
+    /// The overlay is the ONLY durable copy of turns added in a materialized
+    /// session — `unsync` deletes the materialized files, so destroying the
+    /// overlay with them would lose real work.
+    #[test]
+    fn test_unsync_never_destroys_recovered_work() {
+        let _sb = Sandbox::new();
+        let registry = crate::connectors::all_for_testing(&fixture_root());
+        let project = PathBuf::from("/tmp/some-project");
+        let synced = sync_into(&registry, &project, false);
+        let link = first_claude_link(&synced);
+
+        append_claude_turn(&link.dest, &link.session_id, "PRECIOUS WORK");
+        pull_back(false);
+        assert!(!overlay_messages(&link.session_id).is_empty());
+
+        unsync(false);
+
+        let overlay = overlay_messages(&link.session_id);
+        assert!(
+            overlay.iter().any(|m| m.text.as_deref() == Some("PRECIOUS WORK")),
+            "unsync must not delete recovered turns"
+        );
+    }
+
     #[test]
     fn test_sync_does_not_feed_on_its_own_output() {
         let _sb = Sandbox::new();
