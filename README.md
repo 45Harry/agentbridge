@@ -6,8 +6,8 @@ One session layer for every AI coding agent on your machine. Start a
 conversation in Claude Code, keep going in Codex — from any directory, using
 each tool's own session picker. No new UI to learn.
 
-**Status:** working for Claude Code, Codex CLI and OpenCode, verified end to
-end against the real binaries. OpenCode, agy and Kilo Code are not connected yet. See
+**Status:** working for Claude Code, Codex CLI and OpenCode, verified against
+the real binaries. agy and Kilo Code are not connected yet. See
 [Current state](#current-state) for exactly what is and isn't proven.
 
 ## The problem
@@ -20,7 +20,7 @@ machine:
 | --- | --- |
 | `~/Documents/bankNotes-OCR` | 9 |
 | `~/Users/harry` | 11 |
-| **actually in OpenCode's database** | **147** |
+| **actually in OpenCode's database** | **148** |
 
 Claude Code does the same thing via `~/.claude/projects/<encoded-cwd>/`, and
 Codex filters rollouts by cwd. So your history is real, it's on your disk, and
