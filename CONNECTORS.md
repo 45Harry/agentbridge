@@ -181,3 +181,69 @@ continuity has to go through a distilled brief (M4), not literal session
 hand-off. M5's cross-directory *resume shim* stays scoped to Claude Code
 resuming its own sessions across directories — never to resuming a foreign
 tool's session.
+
+## 6. `agentbridge resume` file-copy conversion — retested and does NOT work (2026-07-31)
+
+Commit `cb75d98` (pulled from a different machine/session) added `src/convert.rs`
+and wired `agentbridge resume <id> <target-provider>` to convert a session and
+**write it directly into the target tool's own storage directory**
+(`~/.claude/projects/...`, `~/.codex/sessions/...`), on the theory that the
+target tool's native resume would then pick it up. That commit's `HANDOFF.md`
+claimed this was "Verified working" with a transcript showing successful
+`claude --resume`/`codex resume` output.
+
+**Retested end-to-end on this machine against real binaries and it fails in
+both directions**, cleanly reproducing the same rejection as a deliberately
+invalid UUID:
+
+- **Codex → Claude Code**: converted a real 16-line Codex session
+  (`019efcc7-...`) into `~/.claude/projects/-Users-harry/019efcc7-....jsonl`.
+  File landed in the correct directory with the correct filename. `claude
+  --resume 019efcc7-...` still returned `No conversation found with session
+  ID: ...` — identical to the error for an all-zero fake UUID tested
+  immediately before it.
+- **Claude Code → Codex CLI**: converted a real Claude Code session
+  (`7a65dbea-...`) into `~/.codex/sessions/2026/07/31/rollout-...jsonl`.
+  `codex delete 7a65dbea-... --force` (chosen because, unlike `resume`, it
+  validates a session ID against Codex's index without any model call)
+  returned `Error: failed to delete session` — identical to the error for an
+  all-zero fake UUID tested immediately before it.
+
+**Root cause**: correct file path + correct filename is not sufficient;
+each tool's resume path validates the *internal record schema*, and the
+converter's output doesn't match either tool's real schema:
+
+- Real Claude Code records are shaped like
+  `{"type":"mode","mode":"normal","sessionId":"<uuid>"}` /
+  `{"type":"permission-mode",...,"sessionId":"<uuid>"}` as the leading
+  records, with every subsequent record also carrying `sessionId`. The
+  converter emits an invented `{"type":"conversation_start","uuid":...}`
+  shape with no `sessionId` field anywhere.
+- Real Codex CLI records lead with
+  `{"type":"session_meta","payload":{"session_id":"<uuid>","cwd":...,...}}`.
+  The converter emits a flat `{"id":...,"type":"conversation","cwd":...}`
+  shape with no `payload` wrapper and no `session_meta` record.
+
+Both connectors' own *readers* (`claude_code.rs`, `codex_cli.rs`) already
+know the real schema — they parse it correctly for `ls`/`index`. The bug is
+isolated to `convert.rs`'s *writers*, which were never checked against the
+real format, only against each other (the existing tests in `convert.rs`
+assert structural properties of the converter's own invented format, so they
+pass regardless of whether real Claude Code/Codex would accept the output).
+
+Test files were deleted after the check — both `~/.claude/projects/` and
+`~/.codex/sessions/` are back to their pre-test state.
+
+**Implication**: the file-copy approach is fixable in principle (mirror the
+exact real schema, including `sessionId`/`payload.session_id` threaded
+through every record, not just the first), but as shipped in `cb75d98` it did
+not work, and the previous "Verified working" claim in `HANDOFF.md` was not
+accurate. Until the writer is rewritten against the real schema and retested
+against real binaries, treat `agentbridge resume` as **non-functional** —
+`--dry-run` still gives useful information (source/target/message count) but
+the real write should not be relied on. This does not change the project's
+core conclusion in §5: native cross-tool resume doesn't exist, and even a
+correctly-implemented copy-shim is inherently fragile (must track two
+undocumented, drifting vendor formats exactly). It strengthens the case for
+prioritizing M4 (distilled brief injection, format-agnostic) over polishing
+the M5 copy-shim.

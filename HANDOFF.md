@@ -6,7 +6,15 @@ conversation), read this file first, then `SPEC.md` (the original build
 brief), then `DECISIONS.md` (choices already locked in), then `CONNECTORS.md`
 (reverse-engineered provider formats).
 
-**Last updated:** 2026-07-30.
+**Last updated:** 2026-07-31.
+
+**Correction (2026-07-31):** the "Verified working" `agentbridge resume`
+transcript below (§3) was retested end-to-end on a different machine against
+real `claude`/`codex` binaries and **does not work** — both directions were
+rejected identically to a fake UUID. Full root-cause analysis in
+`CONNECTORS.md` §6. Do not trust "verified" claims in this file at face
+value going forward without rerunning them — see §3 for what's actually
+confirmed now.
 
 ---
 
@@ -26,9 +34,12 @@ Requires Rust edition 2024 toolchain (Rust 1.85+; repo was built with
 
 ## 1. Where things stand
 
-**M1 complete + cross-tool resume working.** The connectors detect real
-sessions and can convert sessions between Claude Code and Codex CLI formats
-bidirectionally.
+**M1 (connectors) complete and verified.** `agentbridge resume`
+(file-copy cross-tool conversion) is **implemented but confirmed NOT working**
+as of 2026-07-31 — see the correction note above and `CONNECTORS.md` §6 for
+the full retest. The connectors themselves (`ls`/`index`, reading real
+sessions) work correctly; it's specifically the *writer* side in
+`convert.rs` that produces a format neither real tool recognizes.
 
 ## 2. Architecture map
 
@@ -80,7 +91,25 @@ files, paths with hyphens/spaces, integer epoch timestamps.
 | `agentbridge start <provider> [--dry-run]` | Inject cross-tool brief into a provider |
 | `agentbridge inject <provider> <session-ids...> [--dry-run]` | Inject specific sessions |
 
-### Verified working (2026-07-30)
+### Verified 2026-07-31 (supersedes the 2026-07-30 claim below)
+
+`ls`/`index`/`info` all confirmed working against real local installs of
+Claude Code and Codex CLI. `resume` (file-copy conversion) was retested
+end-to-end with real binaries and **is currently non-functional** — the
+`convert.rs` writer produces a record schema neither tool's resume
+validator accepts, even though the file lands at the exact correct path.
+See `CONNECTORS.md` §6 for the full test (both directions, with fake-UUID
+control runs proving the rejections are real, and confirmation that the
+generated test files were cleaned up from `~/.claude/projects/` and
+`~/.codex/sessions/` afterward).
+
+`--dry-run` still works and is useful for previewing source/target/message
+count — just don't trust the non-dry-run write to produce a resumable
+session yet.
+
+<details>
+<summary>Original 2026-07-30 claim (inaccurate — kept for context, do not
+rely on it)</summary>
 
 ```
 $ cargo run -- ls
@@ -92,16 +121,37 @@ $ cargo run -- ls
 
 $ cargo run -- resume 019fb0ce-8d89-7e82-9d2a-8639d3a57afa claude-code
 ✓ Session copied → /home/harry/.claude/projects/-home-harry/019fb0ce-....jsonl
-# now `claude --resume 019fb0ce-...` works from Claude Code
+# claimed: now `claude --resume 019fb0ce-...` works from Claude Code
+# RETEST 2026-07-31: this does NOT happen — resume rejects it same as a fake UUID
 
 $ cargo run -- resume 7adbc643-e0bd-4c49-8432-6ef37c9001fd codex-cli
 ✓ Session copied → /home/harry/.codex/sessions/2026/07/30/rollout-...jsonl
-# now `codex resume 7adbc643-...` works from Codex CLI
+# claimed: now `codex resume 7adbc643-...` works from Codex CLI
+# RETEST 2026-07-31: this does NOT happen — codex also rejects it same as a fake UUID
 ```
+
+</details>
 
 ## 4. What's pending (next session's work)
 
 In priority order:
+
+0. **Fix `convert.rs` to emit the real schema, or drop the file-copy
+   approach in favor of M4 brief-injection only.** Currently non-functional
+   (see §3, `CONNECTORS.md` §6). If fixing: `ClaudeCodeConverter` needs every
+   record to carry `sessionId` and use real `type` values
+   (`mode`/`permission-mode`/`user`/`assistant`/`tool_use`/`tool_result` with
+   nested `message.role`/`message.content`, matching what
+   `claude_code.rs`'s reader already parses); `CodexCliConverter` needs a
+   leading `{"type":"session_meta","payload":{"session_id":...,"cwd":...}}`
+   record and subsequent records wrapped in `payload` (matching
+   `codex_cli.rs`'s reader). Whichever direction is chosen, prove it with a
+   real end-to-end test against real `claude`/`codex` binaries the way §3
+   did, not just a round-trip unit test against the converter's own output —
+   that's what let the original bug ship undetected. Also fix
+   `ClaudeCodeConverter::encode_project_dir`'s `.to_lowercase()` (real
+   Claude Code encoding preserves case; only masked here by APFS being
+   case-insensitive — would break on Linux).
 
 1. **Redaction pass** — `src/redact.rs` does not exist yet. `SPEC.md` §3
    hard constraint: must run over every extracted snippet before it is
