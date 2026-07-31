@@ -1,0 +1,5 @@
+{"uuid":"legacy-0001-0000-0000-000000000001","type":"conversation_start","cwd":"/home/user/project","timestamp":1721234567,"title":"Legacy session"}
+{"uuid":"legacy-0001-0000-0000-000000000002","type":"user_message","cwd":"/home/user/project","timestamp":1721234568,"content":"This uses epoch timestamps"}
+{"uuid":"legacy-0001-0000-0000-000000000003","type":"assistant_message","cwd":"/home/user/project","timestamp":1721234570,"content":"Yes, older format with integer timestamps"}
+{"uuid":"legacy-0001-0000-0000-000000000004","type":"tool_use","cwd":"/home/user/project","timestamp":1721234575,"tool_name":"Bash","tool_input":{"command":"echo test"}}
+{"uuid":"legacy-0001-0000-0000-000000000005","type":"tool_result","cwd":"/home/user/project","timestamp":1721234576,"tool_name":"Bash","tool_result":"test\n"}

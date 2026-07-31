@@ -1,0 +1,4 @@
+{"uuid":"trunc-0001-0000-0000-000000000001","type":"conversation_start","cwd":"/home/user/project","timestamp":"2026-07-05T09:00:00Z"}
+{"uuid":"trunc-0001-0000-0000-000000000002","type":"user_message","cwd":"/home/user/project","timestamp":"2026-07-05T09:01:00Z","content":"This is a normal message"}
+{"uuid":"trunc-0001-0000-0000-000000000003","type":"assistant_message","cwd":"/home/user/project","timestamp":"2026-07-05T09:02:00Z","content":"This is a normal response"}
+{"uuid":"trunc-0001-0000-0000-000000000004","type":"user_message","cwd":"/home/user/project","timestamp":"2026-07-05T09:03:00Z","content":"This message has a truncated JSON line below

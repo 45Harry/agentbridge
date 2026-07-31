@@ -1,6 +1,451 @@
+use agentbridge::connector::Connector;
+use agentbridge::connectors;
+use agentbridge::convert::{ClaudeCodeConverter, CodexCliConverter, SessionConverter};
+use agentbridge::model::Session;
+use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+
+#[derive(Parser)]
+#[command(name = "agentbridge", version, about = "Cross-tool session & memory bridge for AI coding agents")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// List sessions from all providers
+    #[command(name = "ls")]
+    List {
+        /// Filter by project path (substring match)
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Filter by provider
+        #[arg(long)]
+        provider: Option<String>,
+    },
+
+    /// Index sessions from all providers
+    #[command(name = "index")]
+    Index {
+        /// Provider to index (default: all detected)
+        #[arg(long)]
+        provider: Option<String>,
+    },
+
+    /// Start an agent with cross-tool context injected
+    #[command(name = "start")]
+    Start {
+        /// Target provider (claude-code, codex-cli, opencode)
+        provider: String,
+
+        /// Passthrough args to the agent
+        #[arg(last = true)]
+        passthrough: Vec<String>,
+
+        /// Dry run (show what would be injected without writing)
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Resume a session across tools
+    #[command(name = "resume")]
+    Resume {
+        /// Session ID to resume
+        session_id: String,
+
+        /// Target provider to resume in
+        target: String,
+
+        /// Project path override
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Dry run (show what would happen without doing it)
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Inject session context into an agent's startup
+    #[command(name = "inject")]
+    Inject {
+        /// Target provider
+        provider: String,
+
+        /// Session IDs to include
+        #[arg(required = true)]
+        session_ids: Vec<String>,
+
+        /// Dry run
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Show information about detected connectors
+    #[command(name = "info")]
+    Info,
+}
+
 fn main() {
-    let registry = agentbridge::connectors::all();
-    let detected: Vec<&str> = registry.detected().map(|c| c.id()).collect();
-    println!("agentbridge {} — connectors registered: {}", env!("CARGO_PKG_VERSION"), registry.all().len());
-    println!("detected on this machine: {:?}", detected);
+    let cli = Cli::parse();
+    let registry = connectors::all();
+
+    match cli.command {
+        Commands::List { project, provider } => cmd_list(&registry, project, provider),
+        Commands::Index { provider } => cmd_index(&registry, provider),
+        Commands::Start { provider, passthrough, dry_run } => {
+            cmd_start(&registry, &provider, &passthrough, dry_run)
+        }
+        Commands::Resume { session_id, target, project, dry_run } => {
+            cmd_resume(&registry, &session_id, &target, project.as_deref(), dry_run)
+        }
+        Commands::Inject { provider, session_ids, dry_run } => {
+            cmd_inject(&registry, &provider, &session_ids, dry_run)
+        }
+        Commands::Info => cmd_info(&registry),
+    }
+}
+
+fn cmd_info(registry: &agentbridge::connector::Registry) {
+    println!("agentbridge v{}", env!("CARGO_PKG_VERSION"));
+    println!("Connectors registered: {}", registry.all().len());
+    println!();
+    for c in registry.all() {
+        let detected = if c.detect() { "✓" } else { "✗" };
+        println!("  {} {} ({})", detected, c.display_name(), c.id());
+        for root in c.roots() {
+            println!("         {}", root.display());
+        }
+    }
+}
+
+fn cmd_list(registry: &agentbridge::connector::Registry, project: Option<String>, provider: Option<String>) {
+    let connectors: Vec<_> = match provider {
+        Some(ref p) => {
+            vec![registry.by_id(p)]
+        }
+        None => registry.all().iter().map(|c| Some(c.as_ref())).collect(),
+    };
+
+    for c_opt in connectors {
+        let c = match c_opt {
+            Some(c) => c,
+            None => continue,
+        };
+        if !c.detect() {
+            continue;
+        }
+        println!("[{}]", c.display_name());
+        let scan = match c.scan() {
+            Ok(s) => s,
+            Err(_) => {
+                println!("  (scan failed)");
+                continue;
+            }
+        };
+        let mut count = 0;
+        for result in scan {
+            let raw = match result {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            if let Some(ref proj_filter) = project {
+                if let Some(ref pp) = raw.project_path {
+                    if !pp.to_string_lossy().contains(proj_filter) {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+            }
+            count += 1;
+            let title = raw.title.as_deref().unwrap_or("(untitled)");
+            let proj = raw
+                .project_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| "(unknown)".to_string());
+            let started = raw
+                .started_at
+                .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_else(|| "(unknown)".to_string());
+            println!("  {} | {} | {} | {}", raw.id, proj, started, title);
+        }
+        if count == 0 {
+            println!("  (no sessions)");
+        }
+        println!();
+    }
+}
+
+fn cmd_index(registry: &agentbridge::connector::Registry, provider: Option<String>) {
+    let connectors: Vec<&dyn Connector> = match provider {
+        Some(ref p) => {
+            registry.by_id(p).map(|c| vec![c]).unwrap_or_default()
+        }
+        None => registry.detected().collect(),
+    };
+
+    let mut total = 0;
+    for c in &connectors {
+        println!("Indexing {}...", c.display_name());
+        let scan = match c.scan() {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("  Error scanning {}: {}", c.id(), e);
+                continue;
+            }
+        };
+        let mut count = 0;
+        for result in scan {
+            let raw = match result {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("  Error on session: {}", e);
+                    continue;
+                }
+            };
+            if raw.body_available {
+                match c.load(&raw.id) {
+                    Ok(session) => {
+                        count += 1;
+                        println!("  ✓ {} ({} msgs)", raw.id, session.messages.len());
+                    }
+                    Err(e) => {
+                        eprintln!("  ✗ {} load failed: {}", raw.id, e);
+                    }
+                }
+            } else {
+                println!("  - {} (metadata only)", raw.id);
+            }
+        }
+        println!("  → {} sessions from {}\n", count, c.display_name());
+        total += count;
+    }
+    println!("Indexed {} sessions total.", total);
+}
+
+fn cmd_start(
+    registry: &agentbridge::connector::Registry,
+    provider: &str,
+    _passthrough: &[String],
+    dry_run: bool,
+) {
+    let connector = match registry.by_id(provider) {
+        Some(c) => c,
+        None => {
+            eprintln!("Unknown provider: {}. Use: {}", provider,
+                registry.all().iter().map(|c| c.id()).collect::<Vec<_>>().join(", "));
+            return;
+        }
+    };
+
+    let mut all_sessions: Vec<Session> = Vec::new();
+    for c in registry.detected() {
+        let scan = match c.scan() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        for result in scan {
+            let raw = match result {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            if raw.body_available {
+                if let Ok(session) = c.load(&raw.id) {
+                    all_sessions.push(session);
+                }
+            }
+        }
+    }
+
+    all_sessions.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+
+    let brief = agentbridge::convert::build_cross_tool_brief(&all_sessions);
+
+    if dry_run {
+        println!("[dry-run] Would inject brief into {}:", provider);
+        println!("{}", brief);
+        println!();
+        match connector.inject(&brief, true) {
+            Ok(target) => {
+                println!("Would write to: {}", target.path.display());
+            }
+            Err(e) => {
+                println!("Inject target resolution: {} (expected during dry-run)", e);
+            }
+        }
+        return;
+    }
+
+    match connector.inject(&brief, false) {
+        Ok(target) => {
+            println!("Injected brief into {} at {}", provider, target.path.display());
+            if let Some((start, end)) = target.fenced_range {
+                println!("  Fenced block: bytes [{}, {})", start, end);
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to inject into {}: {}", provider, e);
+        }
+    }
+}
+
+fn cmd_resume(
+    registry: &agentbridge::connector::Registry,
+    session_id: &str,
+    target: &str,
+    _project: Option<&str>,
+    dry_run: bool,
+) {
+    let source_session = find_session(registry, session_id);
+    let session = match source_session {
+        Some(s) => s,
+        None => {
+            eprintln!("Session '{}' not found in any provider.", session_id);
+            return;
+        }
+    };
+
+    println!("Resuming session {} from {} into {}...", session.id, session.provider, target);
+
+    let target_dirs = match target {
+        "claude-code" => {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            vec![PathBuf::from(&home).join(".claude").join("projects")]
+        }
+        "codex-cli" => {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            vec![PathBuf::from(&home).join(".codex")]
+        }
+        "opencode" => {
+            let data_dir = std::env::var("XDG_DATA_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| {
+                    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                    PathBuf::from(&home).join(".local").join("share").join("opencode")
+                });
+            vec![data_dir]
+        }
+        _ => {
+            eprintln!("Unknown target provider: {}", target);
+            return;
+        }
+    };
+
+    let Some(target_dir) = target_dirs.first() else {
+        eprintln!("Could not determine target directory for {}", target);
+        return;
+    };
+
+    if dry_run {
+        println!("[dry-run] Would copy session to {} directory", target);
+        println!("  Source: {} (from {})", session.id, session.provider);
+        println!("  Target: {} ({})", target, target_dir.display());
+        println!("  Project path: {}", session.project_path().unwrap_or_else(|| "(none)".to_string()));
+        println!("  Messages: {}", session.messages.len());
+        return;
+    }
+
+    let result: Result<PathBuf, String> = match target {
+        "claude-code" => {
+            let converter = ClaudeCodeConverter::new();
+            converter.convert(&session, target_dir)
+        }
+        "codex-cli" => {
+            let converter = CodexCliConverter::new();
+            converter.convert(&session, target_dir)
+        }
+        "opencode" => {
+            let converter = agentbridge::convert::OpenCodeConverter::new();
+            converter.convert(&session, target_dir)
+        }
+        _ => unreachable!(),
+    };
+
+    match result {
+        Ok(path) => {
+            let prev_provider = &session.provider;
+            println!("✓ Session '{}' (from {}) copied to {} format", session.id, prev_provider, target);
+            println!("  → {}", path.display());
+            println!("  Run: {}", match target {
+                "claude-code" => format!("claude --resume {}", session.id),
+                "codex-cli" => format!("codex resume {}", session.id),
+                "opencode" => format!("opencode run --session {}", session.id),
+                _ => String::new(),
+            });
+        }
+        Err(e) => {
+            eprintln!("Failed to convert/resume session: {}", e);
+        }
+    }
+}
+
+fn cmd_inject(
+    registry: &agentbridge::connector::Registry,
+    provider: &str,
+    session_ids: &[String],
+    dry_run: bool,
+) {
+    let sessions: Vec<Session> = session_ids
+        .iter()
+        .filter_map(|id| find_session(registry, id))
+        .collect();
+
+    if sessions.is_empty() {
+        eprintln!("No sessions found for the given IDs.");
+        return;
+    }
+
+    let brief = agentbridge::convert::build_cross_tool_brief(&sessions);
+
+    let connector = match registry.by_id(provider) {
+        Some(c) => c,
+        None => {
+            eprintln!("Unknown provider: {}", provider);
+            return;
+        }
+    };
+
+    if dry_run {
+        println!("[dry-run] Would inject brief into {}:", provider);
+        println!("{}", brief);
+        match connector.inject(&brief, true) {
+            Ok(target) => {
+                println!("Would write to: {}", target.path.display());
+            }
+            Err(e) => {
+                println!("Inject target resolution: {}", e);
+            }
+        }
+        return;
+    }
+
+    match connector.inject(&brief, false) {
+        Ok(target) => {
+            println!("✓ Injected brief into {} at {}", provider, target.path.display());
+        }
+        Err(e) => {
+            eprintln!("Failed to inject: {}", e);
+        }
+    }
+}
+
+fn find_session(registry: &agentbridge::connector::Registry, session_id: &str) -> Option<Session> {
+    for c in registry.all() {
+        if !c.detect() {
+            continue;
+        }
+        let scan = c.scan().ok()?;
+        for result in scan {
+            let raw = result.ok()?;
+            if raw.id == session_id || raw.id.contains(session_id) || session_id.contains(&raw.id) {
+                if raw.body_available {
+                    return c.load(&raw.id).ok();
+                }
+            }
+        }
+    }
+    None
 }

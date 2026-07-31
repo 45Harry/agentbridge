@@ -1,0 +1,3 @@
+{"uuid":"hyp-0001-0000-0000-000000000001","type":"conversation_start","cwd":"/home/user/my-project with spaces","timestamp":"2026-07-06T10:00:00Z"}
+{"uuid":"hyp-0001-0000-0000-000000000002","type":"user_message","cwd":"/home/user/my-project with spaces","timestamp":"2026-07-06T10:01:00Z","content":"Session in a path with hyphens and spaces"}
+{"uuid":"hyp-0001-0000-0000-000000000003","type":"assistant_message","cwd":"/home/user/my-project with spaces","timestamp":"2026-07-06T10:02:00Z","content":"Working in this project directory"}

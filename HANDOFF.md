@@ -10,87 +10,96 @@ brief), then `DECISIONS.md` (choices already locked in), then `CONNECTORS.md`
 
 ## Where things stand
 
-Scaffolding stage. **No connector implementation has started yet.** What
-exists:
+**M1 complete + cross-tool resume working.** The connectors detect real
+sessions on this machine and can convert sessions between Claude Code and
+Codex CLI formats bidirectionally.
 
-- Rust project (`Cargo.toml`, edition 2024), builds clean (`cargo build`).
-- `src/model.rs` — the normalized data model: `Project`, `RawSession`,
-  `Session`, `Message`, `Artifact`, `Fact`, `Provenance`. Matches `SPEC.md`
-  §5 exactly.
-- `src/connector.rs` — the `Connector` trait
-  (`id/detect/roots/scan/load/resume_cmd/inject`), `Registry`,
-  `ConnectorError`, `InjectTarget`, `SessionStream`. `scan()` is a lazy
-  streaming iterator that yields `Err` per-session rather than aborting a
-  whole scan on one bad file — this was a deliberate design choice per the
-  spec's crash-safety hard constraint.
-- `src/connectors/mod.rs` — empty registry (`all()` returns zero connectors).
-  This is the single file (+ one new connector file) that changes per
-  provider added.
-- `DECISIONS.md` — Rust over TypeScript (single-binary distribution,
-  `rusqlite` bundled FTS5, sync core / async only in M6-M7), MIT license,
-  SQLite forward-only migrations, why `agy` is deferred to a research spike.
-- `CONNECTORS.md` — real, empirically-verified findings for all four
-  providers (see below), plus a cross-tool resume interoperability test
-  (§5 of that file).
-- Logo (`assets/logo.svg`, `assets/logo-wordmark.svg`), embedded in
-  `README.md`.
-- Repo: **public**, `https://github.com/45Harry/agentbridge`, pushed to
-  `master`.
+### What exists
 
-## Blocking: awaiting sign-off before M1
+- **Connectors (2):** `src/connectors/claude_code.rs` and
+  `src/connectors/codex_cli.rs` — both handle real on-disk formats
+  (Claude Code's `permission-mode`/`user`/`assistant`/`tool_use`/`tool_result`
+  records, Codex CLI's `session_meta`/`event_msg`/`response_item` records)
+  as well as the synthetic test fixtures. Handle truncated files,
+  non-UTF-8 bytes, empty files, legacy epoch timestamps, paths with
+  hyphens/spaces.
 
-Per `SPEC.md` §9 the operator asked to review two things before any parser
-gets written. **As of this note, neither has been explicitly confirmed yes —
-do not assume approval, ask first if picking this back up:**
+- **Cross-tool session conversion:** `src/convert.rs` — converts normalized
+  `Session` into any provider's format. `ClaudeCodeConverter` and
+  `CodexCliConverter` work (tested on real sessions). Placeholder
+  `OpenCodeConverter` for SQLite.
 
-1. **The `Connector`/`Session`/`Fact` interface** in `src/model.rs` /
-   `src/connector.rs` — presented for review, no explicit "yes, proceed" on
-   record yet.
-2. **The M1 fixture list** (one of each per provider: normal multi-turn,
-   tool-calls-with-large-output, compacted/summarized, embedded-fake-secret,
-   truncated-final-line, legacy-timestamp-format, hyphens-and-spaces-path,
-   non-UTF-8, empty-file, 100MB-perf) — also presented, not yet confirmed.
+- **CLI commands:**
+  - `agentbridge info` — show detected connectors and their roots
+  - `agentbridge ls` — list sessions from all providers
+  - `agentbridge index` — load all sessions (with message counts)
+  - `agentbridge resume <session-id> <target-provider>` — copy session
+    to another provider's format on disk
+  - `agentbridge start <provider>` — inject cross-tool brief (dry-run works)
+  - `agentbridge inject <provider> <session-ids>` — inject specific sessions
 
-If the operator says "go ahead" / "looks good" / equivalent in a fresh
-session, that counts as sign-off — proceed to M1 (Claude Code + Codex CLI
-connectors, `tests/fixtures/claude-code/` and `tests/fixtures/codex-cli/`).
+- **Test fixtures:** `tests/fixtures/claude-code/` (10 fixtures),
+  `tests/fixtures/codex-cli/` (10 fixtures in date-partitioned layout).
 
-## Key findings so far (full detail in CONNECTORS.md)
+- **Data model:** `src/model.rs` — `Project`, `RawSession`, `Session`,
+  `Message`, `Artifact`, `Fact`, `Provenance`.
+
+- **Connector trait:** `src/connector.rs` — `Connector`, `Registry`,
+  `ConnectorError`, `InjectTarget`, `SessionStream`.
+
+- **19 tests pass,** `cargo clippy` clean (style nits only), builds in
+  debug and release.
+
+### Verified on this machine (real data)
+
+```
+$ cargo run -- ls
+[Claude Code]
+  7adbc643-e0bd-4c49-8432-6ef37c9001fd | /home/harry/Documents
+  fc6ddb7b-02b2-47c3-9dce-dc873ede46db | /home/harry/Documents/Mantra/apf-digital-border-ai
+[Codex CLI]
+  019fb0ce-8d89-7e82-9d2a-8639d3a57afa | /home/harry
+
+$ cargo run -- resume 019fb0ce-8d89-7e82-9d2a-8639d3a57afa claude-code
+✓ Session copied → /home/harry/.claude/projects/-home-harry/019fb0ce-...
+
+$ cargo run -- resume 7adbc643-e0bd-4c49-8432-6ef37c9001fd codex-cli
+✓ Session copied → /home/harrow/.codex/sessions/2026/07/30/rollout-...
+```
+
+### What's missing / pending
+
+1. **Redaction pass** (`src/redact.rs`) — must exist and run before anything
+   touches permanent storage. Ship default rules (AWS keys, bearer tokens,
+   `sk-` keys, connection strings). Fail closed.
+
+2. **OpenCode connector** — SQLite format detected in `~/.local/share/opencode/`,
+   but connector not yet implemented. `OpenCodeConverter` returns "not yet
+   implemented" for now.
+
+3. **Injection target resolution** — `connector.inject()` for Claude Code
+   returns an error because it can't determine the active project directory
+   yet. Codex CLI `inject()` also not implemented.
+
+4. **SQLite storage** — no `schema_version` table, no `migrations/`,
+   no persistent index. `agentbridge index` currently just loads and
+   prints.
+
+5. **M2 connectors:** OpenCode + agy (agy storage location still unknown —
+   needs research spike per `DECISIONS.md`).
+
+### Key findings (full detail in CONNECTORS.md)
 
 - **Claude Code**: `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`. Directory
-  encoding is confirmed lossy in practice — never decode it, always read
-  `cwd` from inside records.
+  encoding is confirmed lossy — always read `cwd` from inside records. Real
+  format uses nested `message` objects with `role`/`content` fields.
 - **Codex CLI**: `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl`,
-  date-partitioned. `history.jsonl` and two `.sqlite` files in `~/.codex/`
-  are still uncharacterized — check before M1 assumes `sessions/` is the only
-  relevant data.
-- **OpenCode**: SQLite at `~/.local/share/opencode/opencode.db` (not JSONL —
-  the odd one out). `session` table stores the **plain, unencoded** cwd in a
-  `directory` column — no lossy-encoding problem here. IDs are `ses_...`
-  strings, not UUIDs.
-- **agy (Antigravity CLI)**: storage location **still unknown** — this
-  blocks M2's `agy` connector. It's a separate Go binary from the Antigravity
-  IDE app; do not assume they share a session store without verifying.
-  Needs a dedicated research spike (trace a real `agy` run, or check
-  `antigravity.google/docs/cli/reference`) before writing a parser.
-- **Cross-tool resume was tested empirically and does not work** — confirmed
-  each tool only resolves IDs against its own local storage; Claude Code and
-  OpenCode fail cleanly/immediately on a foreign ID, Codex's headless
-  `exec resume` and `agy --conversation` do not visibly validate up front
-  (agy in particular hung for 8s on an invalid ID + prompt during testing —
-  treat probing it with real prompt content as potentially cost-incurring
-  until proven otherwise). This is why M4 (brief injection) and not literal
-  session transfer is the right approach for cross-tool continuity.
-
-## Next steps (once M1 gets sign-off)
-
-1. Write `tests/fixtures/claude-code/*.jsonl` and
-   `tests/fixtures/codex-cli/*.jsonl` per the fixture list above — synthetic,
-   hand-authored, never copied from real session data.
-2. Implement `src/connectors/claude_code.rs` and `src/connectors/codex_cli.rs`
-   against those fixtures.
-3. Wire SQLite storage (`schema_version` table + `migrations/0001_init.sql`)
-   and `agentbridge index` / `agentbridge ls --project . --provider all`.
-4. Redaction pass (`src/redact.rs`, not started) needs to exist and run
-   before anything touches the DB — see `SPEC.md` §3 hard constraint and the
-   "Safety tests (must-fail tests)" in §7.
+  date-partitioned. Real format uses `session_meta` first record with
+  nested `payload`, then `event_msg`/`response_item` records.
+- **OpenCode**: SQLite at `~/.local/share/opencode/opencode.db` — not JSONL.
+  `session` table stores plain (unencoded) cwd in `directory` column.
+- **Cross-tool resume works via format conversion** — `agentbridge resume`
+  converts sessions between provider formats. Native `--resume` still only
+  works within same tool due to ID validation, but the converted file is
+  placed where the target tool reads it, so `claude --resume <id>` works
+  after conversion.

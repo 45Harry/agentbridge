@@ -1,0 +1,5 @@
+{"id":"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb","type":"conversation","cwd":"/home/user/project","created_at":"2026-07-02T14:00:00Z"}
+{"id":"cccccccc-cccc-cccc-cccc-cccccccccccc","type":"user_turn","cwd":"/home/user/project","created_at":"2026-07-02T14:01:00Z","content":"Deploy to production"}
+{"id":"dddddddd-dddd-dddd-dddd-dddddddddddd","type":"assistant_turn","cwd":"/home/user/project","created_at":"2026-07-02T14:02:00Z","content":"Let me check the deployment configuration first."}
+{"id":"eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee","type":"tool_use","cwd":"/home/user/project","created_at":"2026-07-02T14:02:30Z","tool_name":"read","tool_input":{"path":"deploy/config.toml"}}
+{"id":"ffffffff-ffff-ffff-ffff-ffffffffffff","type":"tool_result","cwd":"/home/user/project","created_at":"2026-07-02T14:02:31Z","tool_name":"read","tool_result":"[server]\nhost = \"0.0.0.0\"\nport = 8080\n\n[database]\nurl = \"postgres://user:secret123@prod-db.example.com:5432/app\"\nmax_connections = 20\n\n[secrets]\napi_key = \"sk-proj-real-looking-fake-key-for-testing\"\njwt_secret = \"super-secret-jwt-key-12345\"\n","tool_use_id":"eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"}

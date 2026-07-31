@@ -1,0 +1,2 @@
+{"id":"hyp-0001-0000-0000-000000000001","type":"conversation","cwd":"/home/user/my-project with hyphens","created_at":"2026-07-05T10:00:00Z"}
+{"id":"hyp-0001-0000-0000-000000000002","type":"user_turn","cwd":"/home/user/my-project with hyphens","created_at":"2026-07-05T10:01:00Z","content":"Session in path with hyphens and spaces"}
