@@ -1,3 +1,4 @@
+pub mod auto;
 pub mod connector;
 pub mod connectors;
 pub mod convert;

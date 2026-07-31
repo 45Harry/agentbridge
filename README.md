@@ -6,8 +6,8 @@ One session layer for every AI coding agent on your machine. Start a
 conversation in Claude Code, keep going in Codex — from any directory, using
 each tool's own session picker. No new UI to learn.
 
-**Status:** working for Claude Code ↔ Codex CLI, verified end to end against
-the real binaries. OpenCode, agy and Kilo Code are not connected yet. See
+**Status:** working for Claude Code, Codex CLI and OpenCode, verified end to
+end against the real binaries. OpenCode, agy and Kilo Code are not connected yet. See
 [Current state](#current-state) for exactly what is and isn't proven.
 
 ## The problem
@@ -40,7 +40,9 @@ sessions.
 | `agentbridge status` | Per synced file: how many turns agentbridge wrote vs how many are on disk now, so you can see what has new work. | no |
 | `agentbridge sync` | Surface every session in the current directory for every detected tool. Pulls new turns first, then republishes. | yes |
 | `agentbridge pull` | Recover turns you added to a synced session in some other tool, into agentbridge's overlay. | yes |
-| `agentbridge unsync` | Remove exactly the files `sync` created — verified by inode, so it never deletes anything else. | yes |
+| `agentbridge unsync` | Remove exactly what `sync` created — files verified by inode, OpenCode rows by marker — so it never deletes anything else. | yes |
+| `agentbridge auto install` | Add a shell hook so every new terminal syncs on its own. Run once; stop thinking about syncing. | yes |
+| `agentbridge auto watch` | Foreground loop that re-syncs whenever your sessions change. | yes |
 | `agentbridge ls` | List sessions across all providers. | no |
 | `agentbridge info` | Which connectors are detected, and where they store sessions. | no |
 | `agentbridge resume <id> <tool>` | Materialize one specific session into one tool. | yes |
@@ -53,10 +55,11 @@ reverses everything recorded in the manifest regardless of directory.
 ### Typical use
 
 ```bash
-# once, to see what you have — read-only
-agentbridge init
+# once, at install
+agentbridge init          # see what you have (read-only)
+agentbridge auto install  # new terminals sync themselves from now on
 
-# in whatever project you're working in
+# ...that's it. Or drive it manually:
 cd ~/code/my-project
 agentbridge sync
 
@@ -117,13 +120,19 @@ Verified end to end against the real `claude` and `codex` binaries:
 - `sync` → continue a session in Claude Code → `sync` → **the new turn appears
   in the Codex copy** → `unsync` leaves the original untouched.
 - Idempotency: repeated syncs create nothing new.
+- OpenCode: 148 real sessions read; writes refuse while OpenCode is running
+  (confirmed on a live machine — the database was left untouched).
+
+### OpenCode is handled carefully
+
+It is the only tool whose sessions are rows in a live database rather than
+files, so it is the only place agentbridge writes into real data. Every write
+backs the database up first, tags its rows in the `metadata` column (unused by
+OpenCode itself), refuses to run while OpenCode is open, and is removable by
+that tag alone — `unsync` cannot touch a session OpenCode authored.
 
 Not done yet:
 
-- **OpenCode** (the 147-session one) — it stores sessions as rows in a live
-  SQLite database, so it needs `INSERT`s with backup, tagged rows and a
-  dry-run. Deferred deliberately: it is the only place agentbridge would write
-  into real data rather than a copy.
 - **agy / Kilo Code** — agy's storage location is still unknown
   (`CONNECTORS.md` §4); Kilo has not been investigated.
 - **Redaction** — `SPEC.md` §3 requires secret redaction before anything is

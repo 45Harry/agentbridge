@@ -74,6 +74,13 @@ enum Commands {
         dry_run: bool,
     },
 
+    /// Keep sessions synced automatically
+    #[command(name = "auto")]
+    Auto {
+        #[command(subcommand)]
+        action: AutoAction,
+    },
+
     /// Show drift between what agentbridge wrote and what is on disk now
     #[command(name = "status")]
     Status,
@@ -124,6 +131,32 @@ enum Commands {
     Info,
 }
 
+#[derive(Subcommand)]
+enum AutoAction {
+    /// Add a shell hook so every new terminal syncs automatically
+    Install {
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Remove the shell hook
+    Uninstall {
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Watch for changes and re-sync as they happen
+    Watch {
+        /// Directory to keep synced (defaults to cwd)
+        #[arg(long)]
+        project: Option<String>,
+        /// Seconds between checks
+        #[arg(long, default_value = "30")]
+        interval: u64,
+        /// Run a single pass and exit
+        #[arg(long)]
+        once: bool,
+    },
+}
+
 fn main() {
     let cli = Cli::parse();
     let registry = connectors::all();
@@ -143,6 +176,7 @@ fn main() {
         Commands::Init => cmd_init(&registry),
         Commands::Sync { project, dry_run } => cmd_sync(&registry, project.as_deref(), dry_run),
         Commands::Pull { dry_run } => cmd_pull(dry_run),
+        Commands::Auto { action } => cmd_auto(&registry, action),
         Commands::Status => cmd_status(),
         Commands::Unsync { dry_run } => cmd_unsync(dry_run),
         Commands::Info => cmd_info(&registry),
@@ -663,4 +697,44 @@ fn cmd_status() {
     }
     println!();
     println!("{} file(s) tracked, {} with new turns to pull", rows.len(), drifted);
+}
+
+fn cmd_auto(registry: &agentbridge::connector::Registry, action: AutoAction) {
+    match action {
+        AutoAction::Install { dry_run } => match agentbridge::auto::install_hook(dry_run) {
+            Ok(rc) => {
+                if dry_run {
+                    println!("[dry-run] would add the agentbridge hook to {}", rc.display());
+                } else {
+                    println!("Installed the agentbridge hook in {}", rc.display());
+                    println!("New terminals will sync automatically. Undo: agentbridge auto uninstall");
+                }
+            }
+            Err(e) => eprintln!("Could not update your shell rc: {}", e),
+        },
+        AutoAction::Uninstall { dry_run } => match agentbridge::auto::uninstall_hook(dry_run) {
+            Ok((rc, had)) => {
+                if !had {
+                    println!("No agentbridge hook found in {}", rc.display());
+                } else if dry_run {
+                    println!("[dry-run] would remove the hook from {}", rc.display());
+                } else {
+                    println!("Removed the agentbridge hook from {}", rc.display());
+                }
+            }
+            Err(e) => eprintln!("Could not update your shell rc: {}", e),
+        },
+        AutoAction::Watch { project, interval, once } => {
+            let dir = match project {
+                Some(p) => std::fs::canonicalize(&p).unwrap_or_else(|_| PathBuf::from(p)),
+                None => std::env::current_dir().unwrap_or_default(),
+            };
+            if once {
+                agentbridge::auto::watch(registry, &dir, std::time::Duration::from_secs(interval), true);
+            } else {
+                println!("Watching for session changes in {} (every {}s). Ctrl-C to stop.", dir.display(), interval);
+                agentbridge::auto::watch(registry, &dir, std::time::Duration::from_secs(interval), false);
+            }
+        }
+    }
 }
