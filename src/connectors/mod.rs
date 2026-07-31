@@ -16,7 +16,7 @@ pub fn all() -> Registry {
 }
 
 #[cfg(test)]
-pub fn all_for_testing(fixture_root: &std::path::Path) -> Registry {
+pub(crate) fn all_for_testing(fixture_root: &std::path::Path) -> Registry {
     let mut connectors: Vec<Box<dyn Connector>> = vec![];
 
     let cc_root = fixture_root.join("claude-code");

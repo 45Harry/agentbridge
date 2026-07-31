@@ -10,6 +10,12 @@ const CLAUDE_CODE_VERSION: &str = "2.1.220";
 /// Version stamped into generated Codex CLI `session_meta` records.
 const CODEX_CLI_VERSION: &str = "0.146.0";
 
+/// Fixed namespace for deriving stable UUIDs from foreign session ids.
+/// Must never change: it is what makes a given source session map to the same
+/// target id on every machine and every run.
+const AGENTBRIDGE_NAMESPACE: uuid::Uuid =
+    uuid::uuid!("6ba7b814-9dad-11d1-80b4-00c04fd430c8");
+
 pub trait SessionConverter {
     fn convert(&self, session: &Session, target_dir: &PathBuf) -> Result<PathBuf, String>;
 
@@ -38,13 +44,17 @@ impl ClaudeCodeConverter {
     }
 
     /// Claude Code requires a UUID session id. Foreign ids that already parse
-    /// as UUIDs (Codex) are reused so the id stays stable across tools;
-    /// non-UUID ids (OpenCode `ses_...`) get a fresh v4.
+    /// as UUIDs (Codex) are reused so the id stays stable across tools.
+    ///
+    /// Non-UUID ids (OpenCode `ses_...`) are mapped through UUID **v5**, i.e.
+    /// a pure function of the source id — the same session always yields the
+    /// same UUID. A random v4 here would mint a new id (and a new filename) on
+    /// every run, so sync could never be idempotent and the same session would
+    /// pile up as duplicates.
     fn session_uuid(id: &str) -> String {
-        if uuid::Uuid::parse_str(id).is_ok() {
-            id.to_string()
-        } else {
-            uuid::Uuid::new_v4().to_string()
+        match uuid::Uuid::parse_str(id) {
+            Ok(u) => u.to_string(),
+            Err(_) => uuid::Uuid::new_v5(&AGENTBRIDGE_NAMESPACE, id.as_bytes()).to_string(),
         }
     }
 }
@@ -214,9 +224,17 @@ impl CodexCliConverter {
 
 impl SessionConverter for CodexCliConverter {
     fn convert(&self, session: &Session, target_dir: &PathBuf) -> Result<PathBuf, String> {
-        let now: DateTime<Utc> = Utc::now();
-        let date_str = now.format("%Y/%m/%d").to_string();
-        let ts_str = now.format("%Y-%m-%dT%H-%M-%S").to_string();
+        // Derive the rollout path from the session's own start time, never
+        // from `now`: the same session must always map to the same filename,
+        // or sync can never be idempotent (it would create a new rollout on
+        // every run). Falls back to a fixed epoch when the source has no
+        // timestamp, so the result stays deterministic.
+        let anchor: DateTime<Utc> = session
+            .started_at
+            .or(session.last_event_at)
+            .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap());
+        let date_str = anchor.format("%Y/%m/%d").to_string();
+        let ts_str = anchor.format("%Y-%m-%dT%H-%M-%S").to_string();
         let rollout_dir = target_dir.join("sessions").join(&date_str);
         std::fs::create_dir_all(&rollout_dir)
             .map_err(|e| format!("failed to create rollout dir: {}", e))?;
@@ -539,6 +557,33 @@ mod tests {
     /// A non-UUID source id (OpenCode `ses_...`) must be replaced, because
     /// Claude Code rejects ids that don't parse as UUIDs before it even looks
     /// on disk.
+    /// Determinism guard: the same source session must always map to the same
+    /// target id/path, or sync creates duplicates on every run.
+    #[test]
+    fn test_session_uuid_is_deterministic_for_non_uuid_ids() {
+        let a = ClaudeCodeConverter::session_uuid("ses_8f3a2b1c9d4e");
+        let b = ClaudeCodeConverter::session_uuid("ses_8f3a2b1c9d4e");
+        assert_eq!(a, b, "same source id must always map to the same uuid");
+        assert!(uuid::Uuid::parse_str(&a).is_ok());
+        assert_ne!(
+            a,
+            ClaudeCodeConverter::session_uuid("ses_different"),
+            "different sources must not collide"
+        );
+    }
+
+    /// Codex rollout paths must derive from the session's own start time, not
+    /// from `now`, for the same reason.
+    #[test]
+    fn test_codex_rollout_path_is_deterministic() {
+        let session = test_session();
+        let tmp = tempfile::tempdir().unwrap();
+        let c = CodexCliConverter::new();
+        let p1 = c.convert(&session, &tmp.path().to_path_buf()).unwrap();
+        let p2 = c.convert(&session, &tmp.path().to_path_buf()).unwrap();
+        assert_eq!(p1, p2, "same session must always map to the same rollout path");
+    }
+
     #[test]
     fn test_non_uuid_session_id_is_replaced_with_uuid() {
         let mut session = test_session();
@@ -757,13 +802,6 @@ mod tests {
             .filter_map(|m| m.text.clone())
             .collect();
         assert!(texts.iter().any(|t| t.contains("Hello")), "user text preserved");
-    }
-}
-
-fn format_timestamp(ts: Option<DateTime<Utc>>) -> Value {
-    match ts {
-        Some(dt) => Value::String(dt.to_rfc3339()),
-        None => Value::Null,
     }
 }
 

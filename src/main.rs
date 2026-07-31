@@ -49,6 +49,31 @@ enum Commands {
         dry_run: bool,
     },
 
+    /// Discover every agent session on this machine (read-only)
+    #[command(name = "init")]
+    Init,
+
+    /// Make every session on the machine visible in a directory, for every
+    /// detected tool
+    #[command(name = "sync")]
+    Sync {
+        /// Directory to surface sessions in (defaults to cwd)
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Show what would happen without writing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Remove exactly the files agentbridge created
+    #[command(name = "unsync")]
+    Unsync {
+        /// Show what would be removed without removing it
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Resume a session across tools
     #[command(name = "resume")]
     Resume {
@@ -103,6 +128,9 @@ fn main() {
         Commands::Inject { provider, session_ids, dry_run } => {
             cmd_inject(&registry, &provider, &session_ids, dry_run)
         }
+        Commands::Init => cmd_init(&registry),
+        Commands::Sync { project, dry_run } => cmd_sync(&registry, project.as_deref(), dry_run),
+        Commands::Unsync { dry_run } => cmd_unsync(dry_run),
         Commands::Info => cmd_info(&registry),
     }
 }
@@ -472,4 +500,89 @@ fn find_session(registry: &agentbridge::connector::Registry, session_id: &str) -
         }
     }
     None
+}
+
+/// Zero-config discovery: find every agent session on this machine.
+/// Read-only — writes nothing anywhere (DESIGN.md §8).
+fn cmd_init(registry: &agentbridge::connector::Registry) {
+    println!("scanning…");
+    let index = agentbridge::index::discover(registry);
+
+    for c in registry.all() {
+        let name = c.display_name();
+        if !c.detect() {
+            println!("  {:<14}— not detected", name);
+            continue;
+        }
+        let n = index.entries.iter().filter(|e| e.provider == c.id()).count();
+        let root = c
+            .roots()
+            .first()
+            .map(|r| r.display().to_string())
+            .unwrap_or_default();
+        println!("  {:<14}{:>4} sessions   {}", name, n, root);
+    }
+
+    println!();
+    println!(
+        "indexed {} sessions across {} tools, {} project directories",
+        index.entries.len(),
+        index.by_provider().len(),
+        index.project_dirs().len()
+    );
+    if !index.errors.is_empty() {
+        println!("{} session(s) could not be read (skipped)", index.errors.len());
+    }
+}
+
+fn cmd_sync(registry: &agentbridge::connector::Registry, project: Option<&str>, dry_run: bool) {
+    let dir = match project {
+        Some(p) => match std::fs::canonicalize(p) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("--project '{}' could not be resolved: {}", p, e);
+                return;
+            }
+        },
+        None => std::env::current_dir().unwrap_or_default(),
+    };
+
+    println!("Surfacing all machine sessions in {}", dir.display());
+    let report = agentbridge::sync::sync_into(registry, &dir, dry_run);
+
+    if dry_run {
+        println!("[dry-run] would materialize {} session(s); nothing written", report.created.len());
+    } else {
+        println!("  created   {}", report.created.len());
+        println!("  unchanged {}", report.unchanged);
+    }
+    if report.skipped_native > 0 {
+        println!("  skipped   {} (already native here)", report.skipped_native);
+    }
+    for e in report.errors.iter().take(10) {
+        eprintln!("  ! {}", e);
+    }
+    if !dry_run && !report.created.is_empty() {
+        println!();
+        println!("Open any tool here — its own session picker now lists them.");
+        println!("Undo with: agentbridge unsync");
+    }
+}
+
+fn cmd_unsync(dry_run: bool) {
+    let report = agentbridge::sync::unsync(dry_run);
+    if dry_run {
+        println!("[dry-run] would remove {} file(s)", report.removed.len());
+    } else {
+        println!("removed {} file(s)", report.removed.len());
+    }
+    if !report.kept_foreign.is_empty() {
+        println!(
+            "kept {} file(s) that no longer match what agentbridge created",
+            report.kept_foreign.len()
+        );
+    }
+    if report.missing > 0 {
+        println!("{} already gone", report.missing);
+    }
 }
