@@ -265,6 +265,16 @@ fn live_root(target: &str) -> Option<PathBuf> {
     }
 }
 
+/// OpenCode's database, when present.
+fn opencode_db() -> Option<PathBuf> {
+    let p = if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+        PathBuf::from(xdg).join("opencode").join("opencode.db")
+    } else {
+        home().join(".local").join("share").join("opencode").join("opencode.db")
+    };
+    p.exists().then_some(p)
+}
+
 fn converter_for(target: &str) -> Option<Box<dyn SessionConverter>> {
     match target {
         "claude-code" => Some(Box::new(ClaudeCodeConverter::new())),
@@ -346,11 +356,15 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
     let index: Index = discover(registry);
     let mut report = SyncReport::default();
 
+    // OpenCode has no live_root (rows, not files) but is still a valid target.
     let targets: Vec<String> = registry
         .detected()
         .map(|c| c.id().to_string())
-        .filter(|id| live_root(id).is_some())
+        .filter(|id| live_root(id).is_some() || (id == "opencode" && opencode_db().is_some()))
         .collect();
+
+    // Back up OpenCode's database once per run, before any INSERT.
+    let mut opencode_backed_up = false;
 
     let manifest = read_manifest();
     let already: Vec<(String, PathBuf)> = manifest
@@ -389,8 +403,10 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
                 continue;
             }
 
-            let Some(live) = live_root(target) else { continue };
-            let Some(converter) = converter_for(target) else { continue };
+            let is_opencode = target == "opencode";
+            if !is_opencode && (live_root(target).is_none() || converter_for(target).is_none()) {
+                continue;
+            }
 
             // Load through the owning connector, then re-home the session into
             // the requested directory so the target tool scopes it here.
@@ -428,7 +444,11 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
 
             if dry_run {
                 report.created.push(LinkRecord {
-                    dest: live.join("(planned)"),
+                    dest: if is_opencode {
+                        opencode_db().unwrap_or_default()
+                    } else {
+                        live_root(target).unwrap_or_default().join("(planned)")
+                    },
                     cache: cache_root(target).join("(planned)"),
                     session_id: entry.id.clone(),
                     source_provider: entry.provider.clone(),
@@ -440,8 +460,46 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
                 continue;
             }
 
+            // OpenCode: rows, not files — INSERT instead of link (DESIGN.md §5).
+            if is_opencode {
+                let Some(db) = opencode_db() else { continue };
+                if let Err(e) = crate::opencode_write::ensure_safe_to_write() {
+                    report.errors.push(e.to_string());
+                    continue;
+                }
+                if !opencode_backed_up {
+                    match crate::opencode_write::backup(&db) {
+                        Ok(_) => opencode_backed_up = true,
+                        Err(e) => {
+                            report.errors.push(e.to_string());
+                            continue;
+                        }
+                    }
+                }
+                match crate::opencode_write::write_session(
+                    &db,
+                    &session,
+                    &project.to_string_lossy(),
+                ) {
+                    Ok(new_id) => report.created.push(LinkRecord {
+                        dest: db.clone(),
+                        cache: PathBuf::from(new_id),
+                        session_id: entry.id.clone(),
+                        source_provider: entry.provider.clone(),
+                        target_provider: target.clone(),
+                        project: project.to_path_buf(),
+                        inode: 0,
+                        message_count: session.messages.len(),
+                    }),
+                    Err(e) => report.errors.push(format!("opencode {}: {}", entry.id, e)),
+                }
+                continue;
+            }
+
             // Rule 2: derive once into the cache.
             let cache = cache_root(target);
+            let live = live_root(target).unwrap_or_default();
+            let converter = match converter_for(target) { Some(c) => c, None => continue };
             let artifact = match converter.convert(&session, &cache) {
                 Ok(p) => p,
                 Err(e) => {
@@ -491,7 +549,25 @@ pub fn unsync(dry_run: bool) -> UnsyncReport {
     let mut report = UnsyncReport::default();
     let records = read_manifest();
 
+    // OpenCode rows are removed by their marker, not by path.
+    if !dry_run && records.iter().any(|r| r.target_provider == "opencode") {
+        if let Some(db) = opencode_db() {
+            match crate::opencode_write::ensure_safe_to_write() {
+                Ok(()) => {
+                    let _ = crate::opencode_write::remove_all(&db);
+                }
+                Err(_) => {
+                    // Leave them; the operator is told to quit OpenCode.
+                }
+            }
+        }
+    }
+
     for r in &records {
+        if r.target_provider == "opencode" {
+            report.removed.push(r.dest.clone());
+            continue;
+        }
         let Ok(meta) = fs::metadata(&r.dest) else {
             report.missing += 1;
             continue;
