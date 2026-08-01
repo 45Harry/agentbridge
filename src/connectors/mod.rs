@@ -4,12 +4,14 @@
 
 use crate::connector::{Connector, Registry};
 
+pub(crate) mod antigravity;
 pub(crate) mod claude_code;
 pub(crate) mod codex_cli;
 pub(crate) mod opencode;
 
 pub fn all() -> Registry {
     let connectors: Vec<Box<dyn Connector>> = vec![
+        Box::new(antigravity::AntigravityConnector::new()),
         Box::new(claude_code::ClaudeCodeConnector::new()),
         Box::new(codex_cli::CodexCliConnector::new()),
         Box::new(opencode::OpenCodeConnector::new()),
