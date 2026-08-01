@@ -393,7 +393,8 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
     // Back up OpenCode's database once per run, before any INSERT.
     let mut opencode_backed_up = false;
 
-    let manifest = read_manifest();
+    let mut manifest = read_manifest();
+    let mut manifest_dirty = false;
     let already: Vec<(String, PathBuf)> = manifest
         .iter()
         .map(|r| (r.session_id.clone(), r.dest.clone()))
@@ -542,6 +543,17 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
             let dest = live.join(rel);
 
             if already.iter().any(|(id, d)| id == &entry.id && d == &dest) && dest.exists() {
+                // The artifact was just re-converted and the live copy shares
+                // its inode (hardlink), so the copy *is* refreshed even though
+                // nothing is linked. The manifest count must follow, or the
+                // next pull reads agentbridge's own refresh as tool drift.
+                if let Some(row) = manifest
+                    .iter_mut()
+                    .find(|r| r.session_id == entry.id && r.dest == dest)
+                {
+                    row.message_count = session.messages.len();
+                    manifest_dirty = true;
+                }
                 report.unchanged += 1;
                 continue;
             }
@@ -564,6 +576,17 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
     }
 
     if !dry_run {
+        // Rewrite refreshed rows before appending newly created ones, so the
+        // append never clobbers the update.
+        if manifest_dirty {
+            let body: String = manifest
+                .iter()
+                .map(|r| serde_json::to_string(r).unwrap_or_default() + "\n")
+                .collect();
+            if let Err(e) = fs::write(manifest_path(), body) {
+                report.errors.push(format!("manifest update failed: {}", e));
+            }
+        }
         if let Err(e) = append_manifest(&report.created) {
             report.errors.push(format!("manifest write failed: {}", e));
         }
@@ -1114,5 +1137,57 @@ mod tests {
         let rows = read_manifest();
         assert_eq!(rows.len(), 1, "one row per dest");
         assert_eq!(rows[0].message_count, 1202, "must keep the last write");
+    }
+
+    /// The live copy shares the cache artifact's inode (hardlink), so a
+    /// re-conversion refreshes it even when nothing is linked. The manifest
+    /// count must follow, or pull reads agentbridge's own refresh as drift.
+    #[test]
+    fn test_resync_updates_manifest_count_after_refresh() {
+        let _sb = Sandbox::new();
+        let registry = crate::connectors::all_for_testing(&fixture_root());
+        let project = PathBuf::from("/tmp/some-project");
+
+        let first = sync_into(&registry, &project, false);
+        let row = first
+            .created
+            .iter()
+            .find(|r| r.target_provider == "claude-code")
+            .expect("claude target must be materialized");
+        let before = row.message_count;
+        let sid = row.session_id.clone();
+
+        // A turn lands in the overlay (pulled back from another tool).
+        let overlay = crate::sync::overlay_path(&sid);
+        std::fs::create_dir_all(overlay.parent().unwrap()).unwrap();
+        std::fs::write(
+            &overlay,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "session_id": "ses_new",
+                    "ordinal": 9999,
+                    "role": "user",
+                    "timestamp": "2026-07-31T00:00:00Z",
+                    "text": "CONTINUED ELSEWHERE",
+                })
+            ),
+        )
+        .unwrap();
+
+        // Second pass must refresh the copy (shared inode) and update the row.
+        let second = sync_into(&registry, &project, false);
+        assert!(second.created.is_empty(), "nothing new linked");
+
+        let rows = read_manifest();
+        let row = rows
+            .iter()
+            .find(|r| r.target_provider == "claude-code" && r.session_id == sid)
+            .expect("row must still exist");
+        assert_eq!(
+            row.message_count,
+            before + 1,
+            "refresh must advance the manifest count"
+        );
     }
 }
