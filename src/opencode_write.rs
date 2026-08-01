@@ -131,7 +131,7 @@ pub fn write_session(
     db: &Path,
     session: &Session,
     directory: &str,
-) -> Result<String, WriteError> {
+) -> Result<(String, usize), WriteError> {
     let mut conn = Connection::open(db).map_err(|e| WriteError::Sql(e.to_string()))?;
     let tx = conn.transaction().map_err(|e| WriteError::Sql(e.to_string()))?;
 
@@ -331,7 +331,7 @@ pub fn write_session(
     }
 
     tx.commit().map_err(|e| WriteError::Sql(e.to_string()))?;
-    Ok(id)
+    Ok((id, idx))
 }
 
 /// Remove every session agentbridge inserted — matched by the marker, so rows
@@ -438,7 +438,7 @@ mod tests {
     #[test]
     fn test_written_session_is_visible_and_tagged() {
         let (_t, db) = db_with_schema();
-        let id = write_session(&db, &a_session(), "/home/u/p").unwrap();
+        let id = write_session(&db, &a_session(), "/home/u/p").unwrap().0;
 
         let conn = Connection::open(&db).unwrap();
         let (title, dir, meta): (String, String, String) = conn
@@ -600,7 +600,7 @@ mod tests {
             artifacts: vec![],
         };
 
-        let id = write_session(&db, &codex_session, "/home/harry/Documents/agentbridge").unwrap();
+        let id = write_session(&db, &codex_session, "/home/harry/Documents/agentbridge").unwrap().0;
 
         // 1. It must appear in OpenCode's own picker.
         let bin = std::env::var("OPENCODE_BIN").unwrap_or_else(|_| "opencode".to_string());

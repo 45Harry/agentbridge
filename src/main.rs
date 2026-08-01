@@ -460,7 +460,7 @@ fn cmd_resume(
                     } else {
                         let dir = session.project_path().unwrap_or_default();
                         match agentbridge::opencode_write::write_session(&db, &session, &dir) {
-                            Ok(id) => Ok(PathBuf::from(id)),
+                            Ok((id, _)) => Ok(PathBuf::from(id)),
                             Err(e) => Err(e.to_string()),
                         }
                     }

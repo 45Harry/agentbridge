@@ -19,9 +19,7 @@ use crate::model::{Message, RawSession, Role, Session, TokenTotals};
 use chrono::{DateTime, TimeZone, Utc};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
-use std::path::PathBuf;
-#[cfg(test)]
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub struct OpenCodeConnector {
     db_path: PathBuf,
@@ -34,7 +32,6 @@ impl OpenCodeConnector {
         }
     }
 
-    #[cfg(test)]
     pub fn with_db(db_path: PathBuf) -> Self {
         Self { db_path }
     }
@@ -299,8 +296,7 @@ impl Connector for OpenCodeConnector {
     }
 }
 
-/// Read a session from an explicit database path (used by tests).
-#[cfg(test)]
+/// Read a session from an explicit database path.
 pub(crate) fn load_from_db(db: &Path, id: &str) -> ConnectorResult<Session> {
     OpenCodeConnector::with_db(db.to_path_buf()).load(id)
 }

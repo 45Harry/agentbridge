@@ -114,6 +114,7 @@ fn load_materialized(target: &str, path: &Path, id: &str) -> Option<crate::model
     match target {
         "claude-code" => crate::connectors::claude_code::load_file(path, id).ok(),
         "codex-cli" => crate::connectors::codex_cli::load_file(path, id).ok(),
+        "opencode" => crate::connectors::opencode::load_from_db(path, id).ok(),
         _ => None,
     }
 }
@@ -145,7 +146,12 @@ pub fn status() -> Vec<StatusRow> {
         .map(|r| {
             let exists = r.dest.exists();
             let actual = if exists {
-                load_materialized(&r.target_provider, &r.dest, &r.session_id)
+                let id = if r.target_provider == "opencode" {
+                    r.cache.to_string_lossy().to_string()
+                } else {
+                    r.session_id.clone()
+                };
+                load_materialized(&r.target_provider, &r.dest, &id)
                     .map(|s| s.messages.len())
             } else {
                 None
@@ -175,7 +181,14 @@ pub fn pull_back(dry_run: bool) -> PullReport {
         if !rec.dest.exists() {
             continue;
         }
-        let Some(session) = load_materialized(&rec.target_provider, &rec.dest, &rec.session_id)
+        // OpenCode rows are addressed by the ses_... id agentbridge created;
+        // for file targets the source session id names the materialized file.
+        let id = if rec.target_provider == "opencode" {
+            rec.cache.to_string_lossy().to_string()
+        } else {
+            rec.session_id.clone()
+        };
+        let Some(session) = load_materialized(&rec.target_provider, &rec.dest, &id)
         else {
             continue;
         };
@@ -481,7 +494,7 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
                     &session,
                     &project.to_string_lossy(),
                 ) {
-                    Ok(new_id) => report.created.push(LinkRecord {
+                    Ok((new_id, written)) => report.created.push(LinkRecord {
                         dest: db.clone(),
                         cache: PathBuf::from(new_id),
                         session_id: entry.id.clone(),
@@ -489,7 +502,9 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
                         target_provider: target.clone(),
                         project: project.to_path_buf(),
                         inode: 0,
-                        message_count: session.messages.len(),
+                        // True row count, not session.messages.len(): a
+                        // placeholder turn may have been inserted.
+                        message_count: written,
                     }),
                     Err(e) => report.errors.push(format!("opencode {}: {}", entry.id, e)),
                 }
@@ -623,6 +638,7 @@ pub fn unsync(dry_run: bool) -> UnsyncReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::{params, Connection};
     use std::path::Path;
 
     fn fixture_root() -> PathBuf {
@@ -907,7 +923,101 @@ mod tests {
             "unsync must not delete recovered turns"
         );
     }
+    /// Write-back for the SQLite target: a turn OpenCode appended to a session
+    /// agentbridge wrote must be recoverable via `pull_back`.
+    #[test]
+    fn test_pull_back_recovers_turns_appended_in_opencode() {
+        let _sb = Sandbox::new();
+        let home = PathBuf::from(std::env::var("HOME").unwrap());
+        let db = home.join(".local/share/opencode/opencode.db");
+        fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            r#"
+            PRAGMA foreign_keys = ON;
+            CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT NOT NULL,
+                time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+                sandboxes TEXT NOT NULL);
+            CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                parent_id TEXT, slug TEXT NOT NULL, directory TEXT NOT NULL,
+                title TEXT NOT NULL, version TEXT NOT NULL,
+                time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+                metadata TEXT,
+                FOREIGN KEY (project_id) REFERENCES project(id) ON DELETE CASCADE);
+            CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES session(id) ON DELETE CASCADE);
+            CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL,
+                session_id TEXT NOT NULL, time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL, data TEXT NOT NULL,
+                FOREIGN KEY (message_id) REFERENCES message(id) ON DELETE CASCADE);
+            INSERT INTO project VALUES ('global','/',0,0,'[]');
+            "#,
+        )
+        .unwrap();
+        drop(conn);
 
+        // Materialize a fixture session into the sandbox database, exactly as
+        // `sync` would, and record the manifest row `pull_back` keys on.
+        let registry = crate::connectors::all_for_testing(&fixture_root());
+        let source = registry
+            .by_id("claude-code")
+            .expect("claude fixture")
+            .load("normal-multi-turn")
+            .expect("fixture loads");
+        let (oc_id, written) =
+            crate::opencode_write::write_session(&db, &source, "/tmp/some-project").unwrap();
+        append_manifest(&[LinkRecord {
+            dest: db.clone(),
+            cache: PathBuf::from(&oc_id),
+            session_id: source.id.clone(),
+            source_provider: "claude-code".into(),
+            target_provider: "opencode".into(),
+            project: PathBuf::from("/tmp/some-project"),
+            inode: 0,
+            message_count: written,
+        }])
+        .unwrap();
+
+        assert!(pull_back(false).pulled.is_empty(), "no new turns yet");
+
+        // OpenCode appended a turn of its own: rows addressed with its own
+        // id scheme (sorts after agentbridge's `msg_0…`), a fresh timestamp.
+        let conn = Connection::open(&db).unwrap();
+        let ts: i64 = 1_784_316_034_000 + 5_000;
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data) \
+             VALUES ('msg_f0001', ?1, ?2, ?2, ?3)",
+            params![oc_id, ts, serde_json::json!({"role":"user"}).to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) \
+             VALUES ('prt_f0001', 'msg_f0001', ?1, ?2, ?2, ?3)",
+            params![
+                oc_id,
+                ts,
+                serde_json::json!({"type":"text","text":"CONTINUED IN OPENCODE"}).to_string()
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let report = pull_back(false);
+        let got: usize = report.pulled.iter().map(|(_, n)| n).sum();
+        assert_eq!(got, 1, "the opencode-appended turn must be recovered");
+
+        let overlay = overlay_messages(&source.id);
+        assert!(
+            overlay
+                .iter()
+                .any(|m| m.text.as_deref() == Some("CONTINUED IN OPENCODE")),
+            "overlay must hold the opencode turn"
+        );
+    }
     #[test]
     fn test_sync_does_not_feed_on_its_own_output() {
         let _sb = Sandbox::new();
