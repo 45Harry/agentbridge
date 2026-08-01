@@ -412,14 +412,27 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
         manifest.iter().map(|r| r.dest.clone()).collect();
 
     // Two index entries can carry the same (provider, id) — e.g. a generated
-    // file orphaned by a deleted manifest sits alongside its own source. They
-    // resolve to one destination, so the second pass would overwrite the
-    // first. Keep the newest and drop the rest.
-    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    // file sits alongside its own source. They resolve to one destination, so
+    // the second pass would overwrite the first. Prefer a real source over a
+    // generated copy: a session whose only claude file is agentbridge's own
+    // materialization must still be loaded from its real store, or it would
+    // be skipped entirely (loop prevention) and never re-indexed.
+    let mut seen: std::collections::HashMap<(String, String), usize> =
+        std::collections::HashMap::new();
     let mut entries: Vec<&crate::index::IndexEntry> = Vec::new();
     for e in &index.entries {
-        if seen.insert((e.provider.clone(), e.id.clone())) {
-            entries.push(e);
+        let key = (e.provider.clone(), e.id.clone());
+        match seen.get(&key) {
+            None => {
+                seen.insert(key, entries.len());
+                entries.push(e);
+            }
+            Some(&i) => {
+                let kept = entries[i];
+                if generated.contains(&kept.source_path) && !generated.contains(&e.source_path) {
+                    entries[i] = e;
+                }
+            }
         }
     }
 

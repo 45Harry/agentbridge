@@ -235,6 +235,14 @@ pub fn ensure_thread_rows(
         }
 
         let sid = session_uuid_for_dir(&session.id, cwd);
+        // Rows we own for this rollout and directory under any other id
+        // (e.g. written by pre-0.3.2 syncs keyed on the plain session id)
+        // must not survive next to the per-directory row.
+        tx.execute(
+            "DELETE FROM threads WHERE rollout_path = ?1 AND thread_source = ?2 AND cwd = ?3 AND id <> ?4",
+            params![rollout_path.to_string_lossy(), MARKER, cwd, sid],
+        )
+        .map_err(|e| WriteError::Sql(e.to_string()))?;
         // A row we own under this id means the UPSERT below is an update
         // (refreshing an existing row), not an insert — changes() alone
         // cannot tell them apart (both report 1).
