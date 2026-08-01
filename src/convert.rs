@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 const CLAUDE_CODE_VERSION: &str = "2.1.220";
 
 /// Version stamped into generated Codex CLI `session_meta` records.
-const CODEX_CLI_VERSION: &str = "0.146.0";
+pub(crate) const CODEX_CLI_VERSION: &str = "0.146.0";
 
 /// Fixed namespace for deriving stable UUIDs from foreign session ids.
 /// Must never change: it is what makes a given source session map to the same
@@ -57,7 +57,7 @@ impl ClaudeCodeConverter {
     /// same UUID. A random v4 here would mint a new id (and a new filename) on
     /// every run, so sync could never be idempotent and the same session would
     /// pile up as duplicates.
-    fn session_uuid(id: &str) -> String {
+    pub(crate) fn session_uuid(id: &str) -> String {
         match uuid::Uuid::parse_str(id) {
             Ok(u) => u.to_string(),
             Err(_) => uuid::Uuid::new_v5(&AGENTBRIDGE_NAMESPACE, id.as_bytes()).to_string(),

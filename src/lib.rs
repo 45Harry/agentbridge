@@ -1,4 +1,5 @@
 pub mod auto;
+pub mod codex_write;
 pub mod connector;
 pub mod connectors;
 pub mod convert;

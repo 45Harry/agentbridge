@@ -110,15 +110,20 @@ inode, OpenCode rows by marker) and never deletes recovered work.
 | Connector | Sessions live in | Read | Write |
 | --- | --- | --- | --- |
 | Claude Code | `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl` | yes | yes |
-| Codex CLI | `~/.codex/sessions/<date>/rollout-*.jsonl` | yes | yes |
-| OpenCode | `~/.local/share/opencode/opencode.db` (SQLite) | yes | yes, guarded* |
-| Antigravity CLI | `~/.gemini/antigravity-cli/conversations/*.db` (SQLite) | yes | pending** |
+| Codex CLI | `~/.codex/sessions/<date>/rollout-*.jsonl` + `state_5.sqlite` | yes | yes, incl. picker rows* |
+| OpenCode | `~/.local/share/opencode/opencode.db` (SQLite) | yes | yes, guarded† |
+| Antigravity CLI | `~/.gemini/antigravity-cli/conversations/*.db` (SQLite) | yes | pending‡ |
 
-\* OpenCode is the only tool whose sessions live in a live database. Every
+\* Codex's `/resume` lists from the `threads` table in `state_5.sqlite`, never
+from the rollout files (its disk backfill is a one-time migration — verified).
+agentbridge inserts a `threads` row per synced session so they appear in the
+picker, with the same guards as OpenCode.
+
+† OpenCode is the only tool whose sessions live in a live database. Every
 write backs the database up first, tags its rows (removable by that tag alone),
 and refuses to run while OpenCode is open.
 
-\** Antigravity is read-only: its sessions are surfaced into every other tool,
+‡ Antigravity is read-only: its sessions are surfaced into every other tool,
 but foreign sessions are not yet materialized into it (write path deferred
 until the CLI's model quota resets and the binary can be exercised live).
 

@@ -225,6 +225,12 @@ been superseded by delivery. What now runs on the operator's machine:
   the write path backs up the database, tags its rows in the `metadata`
   column, refuses to run while OpenCode is open, and was verified against the
   real database. Write-back pulls append-only turns while OpenCode runs.
+- **Codex picker rows**: `codex /resume` lists from `state_5.sqlite` →
+  `threads`, and its disk backfill is a one-time migration (answered
+  2026-08-01) — so a synced rollout is invisible to the picker until a
+  `threads` row exists. `src/codex_write.rs` inserts those rows with the same
+  backup/marker/refuse-while-running gates as OpenCode; verified against the
+  real binary (`codex delete` resolves inserted rows).
 - **Antigravity CLI connector (read-only)**: sessions scanned from
   `~/.gemini/antigravity-cli/conversations/*.db` with a minimal hand-rolled
   Cortex protobuf reader; verified against the two real CLI databases.

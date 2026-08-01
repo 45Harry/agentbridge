@@ -446,7 +446,30 @@ fn cmd_resume(
         }
         "codex-cli" => {
             let converter = CodexCliConverter::new();
-            converter.convert(&session, target_dir)
+            match converter.convert(&session, target_dir) {
+                Err(e) => Err(e),
+                Ok(written) => {
+                    // Index the rollout in `state_5.sqlite` so it shows up in
+                    // `codex /resume`, not just by id (CONNECTORS.md §2).
+                    if let Some(db) = agentbridge::codex_write::state_db() {
+                        match agentbridge::codex_write::ensure_safe_to_write() {
+                            Err(e) => eprintln!("  ! {}", e),
+                            Ok(()) => {
+                                let _ = agentbridge::codex_write::backup(&db);
+                                let cwd = session.project_path().unwrap_or_default();
+                                match agentbridge::codex_write::ensure_thread_row(
+                                    &db, &session, &written, &cwd,
+                                ) {
+                                    Ok(Some(id)) => println!("  indexed into codex /resume as {}", id),
+                                    Ok(None) => {}
+                                    Err(e) => eprintln!("  ! {}", e),
+                                }
+                            }
+                        }
+                    }
+                    Ok(written)
+                }
+            }
         }
         "opencode" => {
             let db = target_dir.join("opencode.db");
@@ -632,6 +655,9 @@ fn cmd_sync(registry: &agentbridge::connector::Registry, project: Option<&str>, 
     } else {
         println!("  created   {}", report.created.len());
         println!("  unchanged {}", report.unchanged);
+        if report.codex_indexed > 0 {
+            println!("  indexed   {} session(s) into codex /resume", report.codex_indexed);
+        }
     }
     if report.skipped_native > 0 {
         println!("  skipped   {} (already native here)", report.skipped_native);

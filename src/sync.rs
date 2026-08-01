@@ -236,6 +236,9 @@ pub struct SyncReport {
     /// Skipped because the session is already native to that tool *in this
     /// directory*; agentbridge must not touch a tool's own sessions.
     pub skipped_native: usize,
+    /// Codex `threads` rows inserted so the materialized rollouts show up in
+    /// `codex /resume` (CONNECTORS.md §2).
+    pub codex_indexed: usize,
     pub errors: Vec<String>,
 }
 
@@ -391,6 +394,8 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
 
     // Back up OpenCode's database once per run, before any INSERT.
     let mut opencode_backed_up = false;
+    // Same for Codex's index (`state_5.sqlite`).
+    let mut codex_backed_up = false;
 
     let mut manifest = read_manifest();
     let mut manifest_dirty = false;
@@ -431,6 +436,7 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
             }
 
             let is_opencode = target == "opencode";
+            let is_codex = target == "codex-cli";
             if !is_opencode && (live_root(target).is_none() || converter_for(target).is_none()) {
                 continue;
             }
@@ -553,22 +559,33 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
                     row.message_count = session.messages.len();
                     manifest_dirty = true;
                 }
+                // A materialized rollout still needs its `threads` row for
+                // `codex /resume`; retry in case the previous run was refused
+                // while Codex was open.
+                if is_codex {
+                    ensure_codex_row(&mut report, &mut codex_backed_up, &session, &dest);
+                }
                 report.unchanged += 1;
                 continue;
             }
 
             // Rule 3: presence by hardlink, not copy.
             match link_or_copy(&artifact, &dest) {
-                Ok(inode) => report.created.push(LinkRecord {
-                    dest,
-                    cache: artifact,
-                    session_id: entry.id.clone(),
-                    source_provider: entry.provider.clone(),
-                    target_provider: target.clone(),
-                    project: project.to_path_buf(),
-                    inode,
-                    message_count: session.messages.len(),
-                }),
+                Ok(inode) => {
+                    if is_codex {
+                        ensure_codex_row(&mut report, &mut codex_backed_up, &session, &dest);
+                    }
+                    report.created.push(LinkRecord {
+                        dest,
+                        cache: artifact,
+                        session_id: entry.id.clone(),
+                        source_provider: entry.provider.clone(),
+                        target_provider: target.clone(),
+                        project: project.to_path_buf(),
+                        inode,
+                        message_count: session.messages.len(),
+                    });
+                }
                 Err(e) => report.errors.push(format!("link {}: {}", entry.id, e)),
             }
         }
@@ -594,8 +611,42 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
     report
 }
 
-/// Remove exactly the files agentbridge created. A destination whose inode no
-/// longer matches the manifest belongs to something else now and is kept.
+/// Give a materialized Codex rollout its `threads` row so `codex /resume`
+/// lists it (CONNECTORS.md §2). Guarded and backed up once per run, exactly
+/// like the OpenCode path. Silently skipped when Codex has never run here
+/// (no `state_5.sqlite` to index into) or while Codex is open.
+fn ensure_codex_row(
+    report: &mut SyncReport,
+    backed_up: &mut bool,
+    session: &crate::model::Session,
+    rollout_path: &Path,
+) {
+    let Some(db) = crate::codex_write::state_db() else {
+        return;
+    };
+    if let Err(e) = crate::codex_write::ensure_safe_to_write() {
+        report.errors.push(e.to_string());
+        return;
+    }
+    if !*backed_up {
+        match crate::codex_write::backup(&db) {
+            Ok(_) => *backed_up = true,
+            Err(e) => {
+                report.errors.push(e.to_string());
+                return;
+            }
+        }
+    }
+    let cwd = session.project_path().unwrap_or_default();
+    match crate::codex_write::ensure_thread_row(&db, session, rollout_path, &cwd) {
+        Ok(Some(_)) => report.codex_indexed += 1,
+        Ok(None) => {}
+        Err(e) => report.errors.push(e.to_string()),
+    }
+}
+
+/// Remove exactly the files agentbridge created. A destination whose inode
+/// no longer matches the manifest belongs to something else now and is kept.
 pub fn unsync(dry_run: bool) -> UnsyncReport {
     let mut report = UnsyncReport::default();
     let records = read_manifest();
@@ -609,6 +660,20 @@ pub fn unsync(dry_run: bool) -> UnsyncReport {
                 }
                 Err(_) => {
                     // Leave them; the operator is told to quit OpenCode.
+                }
+            }
+        }
+
+    // Codex `threads` rows agentbridge inserted are removed by their marker.
+    if !dry_run
+        && records.iter().any(|r| r.target_provider == "codex-cli")
+        && let Some(db) = crate::codex_write::state_db() {
+            match crate::codex_write::ensure_safe_to_write() {
+                Ok(()) => {
+                    let _ = crate::codex_write::remove_all(&db);
+                }
+                Err(_) => {
+                    // Leave them; the operator is told to quit Codex.
                 }
             }
         }

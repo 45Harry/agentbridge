@@ -56,6 +56,11 @@ one tool are pulled into the overlay and republished. See DECISIONS.md
 
 - OpenCode write-back is gated while OpenCode itself is running (`PID` check);
   `pull` still reads it, so recovery works, republish into opencode.db waits.
+- Codex write path: sessions now get `threads` rows (`src/codex_write.rs`,
+  v0.3.0) so they appear in `codex /resume` — same guard/backup/marker gates
+  as OpenCode, verified against the real binary (`codex delete` resolves an
+  inserted row; `codex /resume` shows them). Refused while Codex is running,
+  same as OpenCode.
 - Antigravity write connector + successful model-response text mapping (only
   error text at `.24.3.1` is mapped) — deferred until the CLI's model quota
   resets. Read-only is safe by construction: no `live_root`/converter for

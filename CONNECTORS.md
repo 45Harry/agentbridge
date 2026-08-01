@@ -100,6 +100,26 @@ with backup / marker / not-running guard), not a plain file drop.
 hints at exactly that). If it backfills, a simpler and safer route may be to
 let Codex discover the rollouts itself rather than inserting rows.
 
+**Answered and implemented (2026-08-01):** backfill is a **one-time
+migration**. On the operator's machine `backfill_state` holds exactly
+`(id=1, status='complete', null, …)` dated to the first run; it never re-scans
+`~/.codex/sessions/` — rollouts dropped in after that day stay invisible even
+after restarts, and the backfill indexed nothing in the first place (0 rows
+created from the files already present). There is no discovery route: the
+`threads` row that *does* exist for a synced rollout was created by Codex
+itself the one time that session was actually opened.
+
+The writer shipped in `src/codex_write.rs` (v0.3.0) — `INSERT OR IGNORE` into
+`threads` keyed on the deterministic UUID v5 id, same gates as OpenCode:
+database backed up before the first write of a run, every inserted row tagged
+`thread_source = 'agentbridge'` (real rows use `'user'`, verified), writes
+refused while Codex is running, `unsync` removes only tagged rows. Column
+values mirror a real row captured from Codex 0.146.0 (see §7-style
+capture above; `sandbox_policy` is regenerated for each `cwd`). Verified
+against the real binary: after `sync`, `codex delete <id> --force` on an
+inserted row returns `Deleted session` — the picker index resolves it — and
+the next `sync` restores the row after a delete.
+
 ## 3. OpenCode
 
 **Last verified:** against `1.17.15`, on 2026-07-30, macOS.

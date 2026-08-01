@@ -151,3 +151,22 @@ in type-17 steps, currently only error text at `.24.3.1` is known) waits for
 the CLI's model quota to reset so the binary can be exercised live. This is
 safe by construction: antigravity has no `live_root`/converter in sync.rs, so
 sync never writes into it.
+
+---
+
+## 2026-08-01 — Codex picker listing: build the `threads` writer
+
+The operator hit the picker gap in person (`codex /resume` showed exactly one
+session). The open question in CONNECTORS.md §2 was then answered on the real
+machine: `backfill_state` = 'complete' means backfill is a **one-time
+migration** (it ran once, indexed nothing, never re-runs), so file drops can
+never reach the picker and the "let Codex discover the files" route does not
+exist.
+
+**Decision:** implement the planned `threads` INSERT after all — the original
+requirement, now with the facts to justify it. `src/codex_write.rs` (v0.3.0)
+mirrors the OpenCode treatment exactly: backup before first write, rows tagged
+`thread_source = 'agentbridge'`, `INSERT OR IGNORE` keyed on the deterministic
+UUID v5 (genuine rows never touched), refuse-while-running guard, `unsync`
+removes tagged rows only, `--dry-run` untouched. Verified against the real
+binary: `codex delete <id> --force` → `Deleted session` for an inserted row.
