@@ -460,8 +460,10 @@ fn cmd_resume(
                                 match agentbridge::codex_write::ensure_thread_row(
                                     &db, &session, &written, &cwd,
                                 ) {
-                                    Ok(Some(id)) => println!("  indexed into codex /resume as {}", id),
-                                    Ok(None) => {}
+                                    Ok(agentbridge::codex_write::ThreadRowResult::Inserted(id)) => {
+                                        println!("  indexed into codex /resume as {}", id)
+                                    }
+                                    Ok(_) => {}
                                     Err(e) => eprintln!("  ! {}", e),
                                 }
                             }

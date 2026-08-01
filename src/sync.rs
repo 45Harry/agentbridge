@@ -639,8 +639,8 @@ fn ensure_codex_row(
     }
     let cwd = session.project_path().unwrap_or_default();
     match crate::codex_write::ensure_thread_row(&db, session, rollout_path, &cwd) {
-        Ok(Some(_)) => report.codex_indexed += 1,
-        Ok(None) => {}
+        Ok(crate::codex_write::ThreadRowResult::Inserted(_)) => report.codex_indexed += 1,
+        Ok(_) => {}
         Err(e) => report.errors.push(e.to_string()),
     }
 }

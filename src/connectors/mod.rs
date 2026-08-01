@@ -156,7 +156,7 @@ mod tests {
         let session = cx.load("cccccccc-cccc-cccc-cccc-cccccccccccc").unwrap();
 
         assert!(session.started_at.is_some(), "should parse epoch timestamp");
-        assert!(session.messages.len() >= 1, "should have messages");
+        assert!(!session.messages.is_empty(), "should have messages");
     }
 
     #[test]

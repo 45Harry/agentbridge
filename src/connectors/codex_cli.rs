@@ -339,13 +339,11 @@ impl Connector for TestCodexCli {
         for entry in WalkDir::new(&self.root).into_iter().filter_map(|e| e.ok()) {
             if entry.file_type().is_file() {
                 let path = entry.path();
-                if path.extension().is_some_and(|ext| ext == "jsonl") {
-                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                        if name.starts_with("rollout-") && name.contains(id) {
+                if path.extension().is_some_and(|ext| ext == "jsonl")
+                    && let Some(name) = path.file_name().and_then(|n| n.to_str())
+                        && name.starts_with("rollout-") && name.contains(id) {
                             return load_from_path(path, id);
                         }
-                    }
-                }
             }
         }
         Err(ConnectorError::NotFound(id.to_string()))

@@ -229,7 +229,7 @@ mod tests {
         let wal = tmp.path().join("sessions.db-wal");
         let shm = tmp.path().join("sessions.db-shm");
 
-        let f = fingerprint_files(&[db.clone()]);
+        let f = fingerprint_files(std::slice::from_ref(&db));
         let before: Vec<(PathBuf, u64, Option<SystemTime>)> = f
             .iter()
             .map(|(p, s, t)| (p.clone(), *s, *t))
@@ -238,7 +238,7 @@ mod tests {
         std::fs::write(&wal, "new rows").unwrap();
         std::fs::write(&shm, "index").unwrap();
 
-        let after = fingerprint_files(&[db.clone()]);
+        let after = fingerprint_files(std::slice::from_ref(&db));
         assert_ne!(
             before, after,
             "WAL growth must change the fingerprint even though the .db is untouched"

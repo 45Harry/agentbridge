@@ -141,14 +141,21 @@ fn anchor(session: &Session) -> chrono::DateTime<chrono::Utc> {
 }
 
 /// Insert a `threads` row for a materialized rollout, so it shows up in
-/// `codex /resume`. Returns the row id when the row was created, `None`
-/// when it already existed (never overwrites — genuine sessions included).
+/// `codex /resume`. Returns `Inserted(id)` when the row was created,
+/// `Updated(id)` when a row agentbridge owns was re-homed to a new
+/// directory, and `Unchanged` when the row already exists as-is.
+///
+/// The picker lists threads filtered by `cwd` (`ResumeCwdMode::current`),
+/// so a session surfaced for a directory only appears there when its row
+/// carries that cwd. Re-syncing a session for another directory updates the
+/// row (an `UPSERT` scoped to `thread_source = 'agentbridge'`): genuine
+/// Codex rows are never touched by either branch.
 pub fn ensure_thread_row(
     db: &Path,
     session: &Session,
     rollout_path: &Path,
     cwd: &str,
-) -> Result<Option<String>, WriteError> {
+) -> Result<ThreadRowResult, WriteError> {
     let sid = crate::convert::ClaudeCodeConverter::session_uuid(&session.id);
     let anchor = anchor(session);
     let secs = anchor.timestamp();
@@ -161,16 +168,52 @@ pub fn ensure_thread_row(
     };
 
     let conn = Connection::open(db).map_err(|e| WriteError::Sql(e.to_string()))?;
-    let inserted = conn
+
+    // Invariant 2: a row Codex itself authored already points at this
+    // rollout — the session is natively visible, never duplicate it.
+    let native = conn
+        .query_row(
+            "SELECT 1 FROM threads WHERE rollout_path = ?1 AND thread_source <> ?2 LIMIT 1",
+            params![rollout_path.to_string_lossy(), MARKER],
+            |_| Ok(()),
+        )
+        .is_ok();
+    if native {
+        return Ok(ThreadRowResult::Unchanged);
+    }
+
+    // A row we own under this id means the UPSERT below is an update
+    // (re-homing to a new directory), not an insert — changes() alone
+    // cannot tell them apart (both report 1).
+    let rehome = conn
+        .query_row(
+            "SELECT 1 FROM threads WHERE id = ?1 AND thread_source = ?2 LIMIT 1",
+            params![sid, MARKER],
+            |_| Ok(()),
+        )
+        .is_ok();
+
+    let changed = conn
         .execute(
-            "INSERT OR IGNORE INTO threads (
+            "INSERT INTO threads (
                 id, rollout_path, created_at, updated_at, source, model_provider,
                 cwd, title, sandbox_policy, approval_mode, cli_version,
                 first_user_message, preview, created_at_ms, updated_at_ms,
                 recency_at, recency_at_ms, thread_source, has_user_event
              ) VALUES (
                 ?1, ?2, ?3, ?3, 'cli', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?12, ?12, ?13, ?14
-             )",
+             )
+             ON CONFLICT(id) DO UPDATE SET
+                cwd = excluded.cwd,
+                rollout_path = excluded.rollout_path,
+                title = excluded.title,
+                preview = excluded.preview,
+                first_user_message = excluded.first_user_message,
+                updated_at = excluded.updated_at,
+                updated_at_ms = excluded.updated_at_ms,
+                recency_at = excluded.recency_at,
+                recency_at_ms = excluded.recency_at_ms
+             WHERE threads.thread_source = ?13",
             params![
                 sid,
                 rollout_path.to_string_lossy(),
@@ -190,7 +233,22 @@ pub fn ensure_thread_row(
         )
         .map_err(|e| WriteError::Sql(e.to_string()))?;
 
-    Ok((inserted > 0).then_some(sid))
+    Ok(match changed {
+        0 => ThreadRowResult::Unchanged,
+        _ if rehome => ThreadRowResult::Updated(sid),
+        _ => ThreadRowResult::Inserted(sid),
+    })
+}
+
+/// Outcome of an `ensure_thread_row` call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThreadRowResult {
+    /// The row did not exist and was created.
+    Inserted(String),
+    /// A row agentbridge owns was re-homed (cwd/rollout changed).
+    Updated(String),
+    /// The row already exists unchanged (or belongs to Codex — untouched).
+    Unchanged,
 }
 
 /// Remove every row agentbridge inserted — matched by the marker, so
@@ -299,9 +357,17 @@ mod tests {
     #[test]
     fn test_insert_creates_a_picker_visible_row() {
         let (_tmp, db) = db_with_schema();
-        let id = ensure_thread_row(&db, &a_session(), Path::new("/home/harry/.codex/sessions/2026/07/30/rollout-x.jsonl"), "/home/harry/work")
-            .unwrap()
-            .unwrap();
+        let id = match ensure_thread_row(
+            &db,
+            &a_session(),
+            Path::new("/home/harry/.codex/sessions/2026/07/30/rollout-x.jsonl"),
+            "/home/harry/work",
+        )
+        .unwrap()
+        {
+            ThreadRowResult::Inserted(id) => id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
         let conn = Connection::open(&db).unwrap();
         let (title, preview, src, cwd, path): (String, String, String, String, String) = conn
             .query_row("SELECT title, preview, thread_source, cwd, rollout_path FROM threads", [], |r| {
@@ -334,7 +400,10 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        assert_eq!(ensure_thread_row(&db, &s, Path::new("/ours.jsonl"), "/home/harry/work").unwrap(), None);
+        assert_eq!(
+            ensure_thread_row(&db, &s, Path::new("/ours.jsonl"), "/home/harry/work").unwrap(),
+            ThreadRowResult::Unchanged
+        );
         let conn = Connection::open(&db).unwrap();
         let (path, src, title): (String, String, String) = conn
             .query_row("SELECT rollout_path, thread_source, title FROM threads WHERE id = ?1", [&id], |r| {
@@ -352,9 +421,41 @@ mod tests {
         let (_tmp, db) = db_with_schema();
         let s = a_session();
         let p = Path::new("/home/harry/.codex/sessions/2026/07/30/rollout-x.jsonl");
-        assert!(ensure_thread_row(&db, &s, p, "/home/harry/work").unwrap().is_some());
-        assert_eq!(ensure_thread_row(&db, &s, p, "/home/harry/work").unwrap(), None);
+        assert!(matches!(
+            ensure_thread_row(&db, &s, p, "/home/harry/work").unwrap(),
+            ThreadRowResult::Inserted(_)
+        ));
+        assert!(matches!(
+            ensure_thread_row(&db, &s, p, "/home/harry/work").unwrap(),
+            ThreadRowResult::Updated(_) | ThreadRowResult::Unchanged
+        ));
         assert_eq!(count_written(&db), 1);
+    }
+
+    /// A row Codex itself authored for the same rollout must never be
+    /// duplicated: the session is already natively visible.
+    #[test]
+    fn test_native_row_for_same_rollout_is_never_duplicated() {
+        let (_tmp, db) = db_with_schema();
+        let s = a_session();
+        let rollout = Path::new("/home/harry/.codex/sessions/2026/07/30/rollout-native.jsonl");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute(
+            "INSERT INTO threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode, thread_source)
+             VALUES ('native-id', ?1, 1, 1, 'cli', 'openai', '/home/harry', 'agentbridge-test', '{}', 'on-request', 'user')",
+            [&rollout.to_string_lossy().to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert_eq!(
+            ensure_thread_row(&db, &s, rollout, "/home/harry/work").unwrap(),
+            ThreadRowResult::Unchanged
+        );
+        assert_eq!(count_written(&db), 0);
+        let conn = Connection::open(&db).unwrap();
+        let n: usize = conn.query_row("SELECT COUNT(*) FROM threads", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1);
     }
 
     #[test]
@@ -372,8 +473,7 @@ mod tests {
         drop(conn);
 
         ensure_thread_row(&db, &s, Path::new("/ours.jsonl"), "/home/harry/work").unwrap();
-        assert_eq!(remove_all(&db).unwrap(), 1);
-        let conn = Connection::open(&db).unwrap();
+        assert_eq!(remove_all(&db).unwrap(), 1);        let conn = Connection::open(&db).unwrap();
         let remaining: usize = conn
             .query_row("SELECT COUNT(*) FROM threads", [], |r| r.get(0))
             .unwrap();
