@@ -140,23 +140,70 @@ fn anchor(session: &Session) -> chrono::DateTime<chrono::Utc> {
         .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).unwrap())
 }
 
-/// Insert a `threads` row for a materialized rollout, so it shows up in
-/// `codex /resume`. Returns `Inserted(id)` when the row was created,
-/// `Updated(id)` when a row agentbridge owns was re-homed to a new
-/// directory, and `Unchanged` when the row already exists as-is.
+/// Directory-stable row id for a session surfaced in `directory`. The picker
+/// keys visibility on `cwd`, so a session carries one row per directory it
+/// should appear in (`/resume` filters `threads.cwd` with an exact match,
+/// `threads.cwd IN (...)`, verified in codex 0.146 source). Resuming reads
+/// `rollout_path` from the row, so any id works.
+pub fn session_uuid_for_dir(session_id: &str, dir: &str) -> String {
+    let ns = uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_URL,
+        format!("agentbridge:{}:{}", session_id, dir).as_bytes(),
+    );
+    ns.simple().to_string()
+}
+
+/// Insert one `threads` row per directory in `dirs` for a materialized
+/// rollout, so the session shows up in `codex /resume` from any of them.
 ///
-/// The picker lists threads filtered by `cwd` (`ResumeCwdMode::current`),
-/// so a session surfaced for a directory only appears there when its row
-/// carries that cwd. Re-syncing a session for another directory updates the
-/// row (an `UPSERT` scoped to `thread_source = 'agentbridge'`): genuine
-/// Codex rows are never touched by either branch.
-pub fn ensure_thread_row(
+/// The picker lists threads filtered by `cwd` (exact match against the
+/// launch directory), so one row alone only helps the directory it names.
+/// agentbridge writes rows for the sync project and `$HOME`; any other
+/// launch directory still sees them via the picker's `All` filter.
+///
+/// Safety (all preserved from before):
+/// - a row Codex itself authored for the same rollout *and directory* is
+///   never duplicated;
+/// - rows agentbridge owns for this rollout are rewritten (delete-then-
+///   reinsert), so re-syncing with a different directory set cannot leave
+///   stale duplicates behind;
+/// - the `UPSERT` update branch is scoped to `thread_source = 'agentbridge'`,
+///   so a genuine Codex row can never be modified through a coincidental
+///   id collision.
+pub fn ensure_thread_rows(
     db: &Path,
     session: &Session,
     rollout_path: &Path,
-    cwd: &str,
-) -> Result<ThreadRowResult, WriteError> {
-    let sid = crate::convert::ClaudeCodeConverter::session_uuid(&session.id);
+    dirs: &[String],
+) -> Result<ThreadRowReport, WriteError> {
+    let mut report = ThreadRowReport::default();
+    let mut conn = Connection::open(db).map_err(|e| WriteError::Sql(e.to_string()))?;
+    let tx = conn.transaction().map_err(|e| WriteError::Sql(e.to_string()))?;
+
+    // Rows agentbridge owns for this rollout in directories that are no
+    // longer in the requested set (e.g. written before the per-directory
+    // scheme, or after a directory set change) must not survive; rows for
+    // current directories are refreshed by the upsert below instead.
+    if !dirs.is_empty() {
+        let placeholders = std::iter::repeat_n("?", dirs.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "DELETE FROM threads WHERE rollout_path = ?1 AND thread_source = ?2 \
+             AND cwd NOT IN ({placeholders})"
+        );
+        let mut stmt = tx
+            .prepare(&sql)
+            .map_err(|e| WriteError::Sql(e.to_string()))?;
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> =
+            vec![Box::new(rollout_path.to_string_lossy().to_string()), Box::new(MARKER)];
+        for d in dirs {
+            params_vec.push(Box::new(d.clone()));
+        }
+        stmt.execute(rusqlite::params_from_iter(params_vec.iter().map(|b| b.as_ref())))
+            .map_err(|e| WriteError::Sql(e.to_string()))?;
+    }
+
     let anchor = anchor(session);
     let secs = anchor.timestamp();
     let ms = anchor.timestamp_millis();
@@ -166,89 +213,97 @@ pub fn ensure_thread_row(
     } else {
         clip(&first_user, PREVIEW_MAX)
     };
+    let has_user = if session.messages.iter().any(|m| m.role == Role::User) { 1 } else { 0 };
 
-    let conn = Connection::open(db).map_err(|e| WriteError::Sql(e.to_string()))?;
+    for cwd in dirs {
+        if cwd.is_empty() || !std::path::Path::new(cwd).is_absolute() {
+            continue;
+        }
 
-    // Invariant 2: a row Codex itself authored already points at this
-    // rollout — the session is natively visible, never duplicate it.
-    let native = conn
-        .query_row(
-            "SELECT 1 FROM threads WHERE rollout_path = ?1 AND thread_source <> ?2 LIMIT 1",
-            params![rollout_path.to_string_lossy(), MARKER],
-            |_| Ok(()),
-        )
-        .is_ok();
-    if native {
-        return Ok(ThreadRowResult::Unchanged);
+        // Invariant 2: Codex's own row already covers this rollout *in this
+        // directory* — nothing to do here (other directories are still ours
+        // to surface).
+        let native = tx
+            .query_row(
+                "SELECT 1 FROM threads WHERE rollout_path = ?1 AND cwd = ?2 AND thread_source <> ?3 LIMIT 1",
+                params![rollout_path.to_string_lossy(), cwd, MARKER],
+                |_| Ok(()),
+            )
+            .is_ok();
+        if native {
+            continue;
+        }
+
+        let sid = session_uuid_for_dir(&session.id, cwd);
+        // A row we own under this id means the UPSERT below is an update
+        // (refreshing an existing row), not an insert — changes() alone
+        // cannot tell them apart (both report 1).
+        let refresh = tx
+            .query_row(
+                "SELECT 1 FROM threads WHERE id = ?1 AND thread_source = ?2 LIMIT 1",
+                params![sid, MARKER],
+                |_| Ok(()),
+            )
+            .is_ok();
+
+        let changed = tx
+            .execute(
+                "INSERT INTO threads (
+                    id, rollout_path, created_at, updated_at, source, model_provider,
+                    cwd, title, sandbox_policy, approval_mode, cli_version,
+                    first_user_message, preview, created_at_ms, updated_at_ms,
+                    recency_at, recency_at_ms, thread_source, has_user_event
+                 ) VALUES (
+                    ?1, ?2, ?3, ?3, 'cli', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?12, ?12, ?13, ?14
+                 )
+                 ON CONFLICT(id) DO UPDATE SET
+                    cwd = excluded.cwd,
+                    rollout_path = excluded.rollout_path,
+                    title = excluded.title,
+                    preview = excluded.preview,
+                    first_user_message = excluded.first_user_message,
+                    updated_at = excluded.updated_at,
+                    updated_at_ms = excluded.updated_at_ms,
+                    recency_at = excluded.recency_at,
+                    recency_at_ms = excluded.recency_at_ms
+                 WHERE threads.thread_source = ?13",
+                params![
+                    sid,
+                    rollout_path.to_string_lossy(),
+                    secs,
+                    MODEL_PROVIDER,
+                    cwd,
+                    title,
+                    sandbox_policy(cwd),
+                    APPROVAL_MODE,
+                    CODEX_CLI_VERSION,
+                    clip(&first_user, 4000),
+                    clip(&first_user, PREVIEW_MAX),
+                    ms,
+                    MARKER,
+                    has_user,
+                ],
+            )
+            .map_err(|e| WriteError::Sql(e.to_string()))?;
+
+        match (changed, refresh) {
+            (0, _) => {}
+            (_, true) => report.updated += 1,
+            (_, false) => report.inserted += 1,
+        }
     }
 
-    // A row we own under this id means the UPSERT below is an update
-    // (re-homing to a new directory), not an insert — changes() alone
-    // cannot tell them apart (both report 1).
-    let rehome = conn
-        .query_row(
-            "SELECT 1 FROM threads WHERE id = ?1 AND thread_source = ?2 LIMIT 1",
-            params![sid, MARKER],
-            |_| Ok(()),
-        )
-        .is_ok();
-
-    let changed = conn
-        .execute(
-            "INSERT INTO threads (
-                id, rollout_path, created_at, updated_at, source, model_provider,
-                cwd, title, sandbox_policy, approval_mode, cli_version,
-                first_user_message, preview, created_at_ms, updated_at_ms,
-                recency_at, recency_at_ms, thread_source, has_user_event
-             ) VALUES (
-                ?1, ?2, ?3, ?3, 'cli', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?12, ?12, ?13, ?14
-             )
-             ON CONFLICT(id) DO UPDATE SET
-                cwd = excluded.cwd,
-                rollout_path = excluded.rollout_path,
-                title = excluded.title,
-                preview = excluded.preview,
-                first_user_message = excluded.first_user_message,
-                updated_at = excluded.updated_at,
-                updated_at_ms = excluded.updated_at_ms,
-                recency_at = excluded.recency_at,
-                recency_at_ms = excluded.recency_at_ms
-             WHERE threads.thread_source = ?13",
-            params![
-                sid,
-                rollout_path.to_string_lossy(),
-                secs,
-                MODEL_PROVIDER,
-                cwd,
-                title,
-                sandbox_policy(cwd),
-                APPROVAL_MODE,
-                CODEX_CLI_VERSION,
-                clip(&first_user, 4000),
-                clip(&first_user, PREVIEW_MAX),
-                ms,
-                MARKER,
-                if session.messages.iter().any(|m| m.role == Role::User) { 1 } else { 0 },
-            ],
-        )
-        .map_err(|e| WriteError::Sql(e.to_string()))?;
-
-    Ok(match changed {
-        0 => ThreadRowResult::Unchanged,
-        _ if rehome => ThreadRowResult::Updated(sid),
-        _ => ThreadRowResult::Inserted(sid),
-    })
+    tx.commit().map_err(|e| WriteError::Sql(e.to_string()))?;
+    Ok(report)
 }
 
-/// Outcome of an `ensure_thread_row` call.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ThreadRowResult {
-    /// The row did not exist and was created.
-    Inserted(String),
-    /// A row agentbridge owns was re-homed (cwd/rollout changed).
-    Updated(String),
-    /// The row already exists unchanged (or belongs to Codex — untouched).
-    Unchanged,
+/// Outcome of an `ensure_thread_rows` call.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ThreadRowReport {
+    /// Rows created (each is one directory the session is now visible from).
+    pub inserted: usize,
+    /// Rows refreshed (values rewritten, same id — not new visibility).
+    pub updated: usize,
 }
 
 /// Remove every row agentbridge inserted — matched by the marker, so
@@ -357,17 +412,14 @@ mod tests {
     #[test]
     fn test_insert_creates_a_picker_visible_row() {
         let (_tmp, db) = db_with_schema();
-        let id = match ensure_thread_row(
+        let report = ensure_thread_rows(
             &db,
             &a_session(),
             Path::new("/home/harry/.codex/sessions/2026/07/30/rollout-x.jsonl"),
-            "/home/harry/work",
+            &["/home/harry/work".to_string()],
         )
-        .unwrap()
-        {
-            ThreadRowResult::Inserted(id) => id,
-            other => panic!("expected Inserted, got {other:?}"),
-        };
+        .unwrap();
+        assert_eq!(report.inserted, 1);
         let conn = Connection::open(&db).unwrap();
         let (title, preview, src, cwd, path): (String, String, String, String, String) = conn
             .query_row("SELECT title, preview, thread_source, cwd, rollout_path FROM threads", [], |r| {
@@ -380,30 +432,100 @@ mod tests {
         assert_eq!(cwd, "/home/harry/work");
         assert_eq!(path, "/home/harry/.codex/sessions/2026/07/30/rollout-x.jsonl");
         assert_eq!(count_written(&db), 1);
-        // Same deterministic id as the rollout filename stem.
-        let expected = ClaudeCodeConverter::session_uuid("codex-session-1");
-        assert_eq!(id, expected);
+        // Deterministic, directory-stable id.
+        assert_eq!(
+            session_uuid_for_dir(&a_session().id, "/home/harry/work"),
+            session_uuid_for_dir(&a_session().id, "/home/harry/work")
+        );
+    }
+
+    /// Two directories means two rows: the session is visible from both.
+    #[test]
+    fn test_one_row_per_directory() {
+        let (_tmp, db) = db_with_schema();
+        let s = a_session();
+        let rollout = Path::new("/home/harry/.codex/sessions/2026/07/30/rollout-x.jsonl");
+        let dirs = vec!["/home/harry/work".to_string(), "/home/harry".to_string()];
+        let report = ensure_thread_rows(&db, &s, rollout, &dirs).unwrap();
+        assert_eq!(report.inserted, 2);
+        assert_eq!(count_written(&db), 2);
+
+        let conn = Connection::open(&db).unwrap();
+        let cwds: Vec<String> = conn
+            .prepare("SELECT cwd FROM threads ORDER BY cwd")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(cwds, vec!["/home/harry", "/home/harry/work"]);
+        // Distinct ids, both deterministic.
+        let (id_a, id_b): (String, String) = conn
+            .query_row(
+                "SELECT (SELECT id FROM threads WHERE cwd='/home/harry/work'), \
+                        (SELECT id FROM threads WHERE cwd='/home/harry')",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_ne!(id_a, id_b);
+        assert_eq!(id_a, session_uuid_for_dir(&s.id, "/home/harry/work"));
+        assert_eq!(id_b, session_uuid_for_dir(&s.id, "/home/harry"));
+    }
+
+    /// Re-syncing for a different directory set must replace the old rows,
+    /// never accumulate them.
+    #[test]
+    fn test_reshuffle_directories_replaces_old_rows() {
+        let (_tmp, db) = db_with_schema();
+        let s = a_session();
+        let rollout = Path::new("/home/harry/.codex/sessions/2026/07/30/rollout-x.jsonl");
+
+        ensure_thread_rows(
+            &db,
+            &s,
+            rollout,
+            &["/home/harry/work".to_string(), "/home/harry".to_string()],
+        )
+        .unwrap();
+        assert_eq!(count_written(&db), 2);
+
+        let report = ensure_thread_rows(&db, &s, rollout, &["/home/harry".to_string()]).unwrap();
+        assert_eq!(report.inserted, 0);
+        assert_eq!(report.updated, 1, "the home row already exists, just refreshed");
+        assert_eq!(count_written(&db), 1, "work row must be gone");
+        let conn = Connection::open(&db).unwrap();
+        let cwd: String = conn
+            .query_row("SELECT cwd FROM threads", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cwd, "/home/harry");
     }
 
     #[test]
     fn test_insert_is_idempotent_and_never_overwrites_genuine_rows() {
         let (_tmp, db) = db_with_schema();
         let s = a_session();
-        let id = ClaudeCodeConverter::session_uuid(&s.id);
-        // A genuine Codex row occupying the same id must survive untouched.
+        // A genuine Codex row occupying the same id as our directory row must
+        // survive untouched (the UPSERT update branch is scoped to our
+        // marker).
+        let id = session_uuid_for_dir(&s.id, "/home/harry/work");
         let conn = Connection::open(&db).unwrap();
         conn.execute(
             "INSERT INTO threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode, thread_source)
-             VALUES (?1, '/genuine.jsonl', 1, 1, 'cli', 'openai', '/home/harry', 'genuine', '{}', 'on-request', 'user')",
+             VALUES (?1, '/genuine.jsonl', 1, 1, 'cli', 'openai', '/home/harry/work', 'genuine', '{}', 'on-request', 'user')",
             [&id],
         )
         .unwrap();
         drop(conn);
 
-        assert_eq!(
-            ensure_thread_row(&db, &s, Path::new("/ours.jsonl"), "/home/harry/work").unwrap(),
-            ThreadRowResult::Unchanged
-        );
+        let report = ensure_thread_rows(
+            &db,
+            &s,
+            Path::new("/ours.jsonl"),
+            &["/home/harry/work".to_string()],
+        )
+        .unwrap();
+        assert_eq!(report.inserted, 0, "genuine row occupies that id");
         let conn = Connection::open(&db).unwrap();
         let (path, src, title): (String, String, String) = conn
             .query_row("SELECT rollout_path, thread_source, title FROM threads WHERE id = ?1", [&id], |r| {
@@ -421,21 +543,20 @@ mod tests {
         let (_tmp, db) = db_with_schema();
         let s = a_session();
         let p = Path::new("/home/harry/.codex/sessions/2026/07/30/rollout-x.jsonl");
-        assert!(matches!(
-            ensure_thread_row(&db, &s, p, "/home/harry/work").unwrap(),
-            ThreadRowResult::Inserted(_)
-        ));
-        assert!(matches!(
-            ensure_thread_row(&db, &s, p, "/home/harry/work").unwrap(),
-            ThreadRowResult::Updated(_) | ThreadRowResult::Unchanged
-        ));
+        let dirs = vec!["/home/harry/work".to_string()];
+        let first = ensure_thread_rows(&db, &s, p, &dirs).unwrap();
+        assert_eq!(first.inserted, 1);
+        let second = ensure_thread_rows(&db, &s, p, &dirs).unwrap();
+        assert_eq!(second.inserted, 0);
+        assert_eq!(second.updated, 1);
         assert_eq!(count_written(&db), 1);
     }
 
-    /// A row Codex itself authored for the same rollout must never be
-    /// duplicated: the session is already natively visible.
+    /// A row Codex itself authored for the same rollout *and directory* must
+    /// never be duplicated: that directory already shows the session. Other
+    /// directories are still ours to surface.
     #[test]
-    fn test_native_row_for_same_rollout_is_never_duplicated() {
+    fn test_native_row_is_never_duplicated_in_its_own_directory() {
         let (_tmp, db) = db_with_schema();
         let s = a_session();
         let rollout = Path::new("/home/harry/.codex/sessions/2026/07/30/rollout-native.jsonl");
@@ -448,14 +569,16 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        assert_eq!(
-            ensure_thread_row(&db, &s, rollout, "/home/harry/work").unwrap(),
-            ThreadRowResult::Unchanged
-        );
-        assert_eq!(count_written(&db), 0);
+        let dirs = vec!["/home/harry".to_string(), "/home/harry/work".to_string()];
+        let report = ensure_thread_rows(&db, &s, rollout, &dirs).unwrap();
+        // Home is covered natively; only the work directory gets our row.
+        assert_eq!(report.inserted, 1);
+        assert_eq!(count_written(&db), 1);
         let conn = Connection::open(&db).unwrap();
-        let n: usize = conn.query_row("SELECT COUNT(*) FROM threads", [], |r| r.get(0)).unwrap();
-        assert_eq!(n, 1);
+        let cwd: String = conn
+            .query_row("SELECT cwd FROM threads WHERE thread_source=?1", [MARKER], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cwd, "/home/harry/work");
     }
 
     #[test]
@@ -472,8 +595,10 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        ensure_thread_row(&db, &s, Path::new("/ours.jsonl"), "/home/harry/work").unwrap();
-        assert_eq!(remove_all(&db).unwrap(), 1);        let conn = Connection::open(&db).unwrap();
+        let dirs = vec!["/home/harry".to_string(), "/home/harry/work".to_string()];
+        ensure_thread_rows(&db, &s, Path::new("/ours.jsonl"), &dirs).unwrap();
+        assert_eq!(remove_all(&db).unwrap(), 2);
+        let conn = Connection::open(&db).unwrap();
         let remaining: usize = conn
             .query_row("SELECT COUNT(*) FROM threads", [], |r| r.get(0))
             .unwrap();

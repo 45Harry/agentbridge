@@ -457,12 +457,17 @@ fn cmd_resume(
                             Ok(()) => {
                                 let _ = agentbridge::codex_write::backup(&db);
                                 let cwd = session.project_path().unwrap_or_default();
-                                match agentbridge::codex_write::ensure_thread_row(
-                                    &db, &session, &written, &cwd,
+                                let mut dirs = vec![cwd];
+                                if let Ok(home) = std::env::var("HOME") {
+                                    dirs.push(home);
+                                }
+                                match agentbridge::codex_write::ensure_thread_rows(
+                                    &db, &session, &written, &dirs,
                                 ) {
-                                    Ok(agentbridge::codex_write::ThreadRowResult::Inserted(id)) => {
-                                        println!("  indexed into codex /resume as {}", id)
-                                    }
+                                    Ok(r) if r.inserted > 0 => println!(
+                                        "  indexed into codex /resume ({} new row(s))",
+                                        r.inserted
+                                    ),
                                     Ok(_) => {}
                                     Err(e) => eprintln!("  ! {}", e),
                                 }

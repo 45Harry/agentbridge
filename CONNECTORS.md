@@ -109,16 +109,32 @@ created from the files already present). There is no discovery route: the
 `threads` row that *does* exist for a synced rollout was created by Codex
 itself the one time that session was actually opened.
 
-The writer shipped in `src/codex_write.rs` (v0.3.0) — `INSERT OR IGNORE` into
-`threads` keyed on the deterministic UUID v5 id, same gates as OpenCode:
-database backed up before the first write of a run, every inserted row tagged
-`thread_source = 'agentbridge'` (real rows use `'user'`, verified), writes
-refused while Codex is running, `unsync` removes only tagged rows. Column
-values mirror a real row captured from Codex 0.146.0 (see §7-style
+**Picker visibility is cwd-scoped, verified in codex 0.146 source**
+(`codex-rs/tui/src/resume_picker.rs`, `codex-rs/state/src/runtime/threads.rs`,
+`codex-rs/app-server/src/filters.rs`): the picker filters `threads.cwd`
+against the launch directory with an **exact path match** (`threads.cwd IN
+(…)` after canonicalization). `tui.resume_cwd = "session"` only changes the
+working directory a resumed session runs in — it does *not* affect the list;
+`resume_show_all` is an internal flag (not a CLI/config option); the picker's
+`Filter: [Cwd] All` toggle does show everything but is **not persisted**.
+The list does not exclude `thread_source` values: agentbridge-tagged rows
+(`Feature` sources) list fine alongside `user` rows.
+
+The writer shipped in `src/codex_write.rs` — one `threads` row **per
+directory** (`session_uuid_for_dir`), defaulting to the sync project and
+`$HOME`, so a session shows up in `codex /resume` from either. Same gates as
+OpenCode: database backed up before the first write of a run, every inserted
+row tagged `thread_source = 'agentbridge'` (real rows use `'user'`,
+verified), writes refused while Codex is running, `unsync` removes only
+tagged rows. Rows for directories no longer in the set are deleted on
+re-sync; a genuine Codex row is never duplicated in its own directory (and
+never modified through the upsert — the update branch is marker-scoped).
+Column values mirror a real row captured from Codex 0.146.0 (see §7-style
 capture above; `sandbox_policy` is regenerated for each `cwd`). Verified
 against the real binary: after `sync`, `codex delete <id> --force` on an
 inserted row returns `Deleted session` — the picker index resolves it — and
-the next `sync` restores the row after a delete.
+the next `sync` restores the row after a delete. Sessions remain visible in
+any other directory via the picker's `All` filter.
 
 ## 3. OpenCode
 

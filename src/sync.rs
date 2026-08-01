@@ -611,7 +611,7 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
     report
 }
 
-/// Give a materialized Codex rollout its `threads` row so `codex /resume`
+/// Give a materialized Codex rollout its `threads` rows so `codex /resume`
 /// lists it (CONNECTORS.md §2). Guarded and backed up once per run, exactly
 /// like the OpenCode path. Silently skipped when Codex has never run here
 /// (no `state_5.sqlite` to index into) or while Codex is open.
@@ -637,10 +637,15 @@ fn ensure_codex_row(
             }
         }
     }
-    let cwd = session.project_path().unwrap_or_default();
-    match crate::codex_write::ensure_thread_row(&db, session, rollout_path, &cwd) {
-        Ok(crate::codex_write::ThreadRowResult::Inserted(_)) => report.codex_indexed += 1,
-        Ok(_) => {}
+    // The picker filters `threads.cwd` by the exact launch directory, so a
+    // session needs one row per directory it should appear in: the sync
+    // project and the home directory.
+    let mut dirs = vec![session.project_path().unwrap_or_default()];
+    if let Ok(home) = std::env::var("HOME") {
+        dirs.push(home);
+    }
+    match crate::codex_write::ensure_thread_rows(&db, session, rollout_path, &dirs) {
+        Ok(r) => report.codex_indexed += r.inserted,
         Err(e) => report.errors.push(e.to_string()),
     }
 }
