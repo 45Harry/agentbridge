@@ -26,17 +26,37 @@ pub fn fingerprint(registry: &Registry) -> Vec<(PathBuf, u64, Option<SystemTime>
     let mut seen: Vec<PathBuf> = index.entries.iter().map(|e| e.source_path.clone()).collect();
     seen.sort();
     seen.dedup();
+    fingerprint_files(&seen)
+}
 
-    seen.into_iter()
-        .map(|p| {
-            let meta = std::fs::metadata(&p).ok();
-            (
-                p,
-                meta.as_ref().map(|m| m.len()).unwrap_or(0),
-                meta.as_ref().and_then(|m| m.modified().ok()),
-            )
-        })
-        .collect()
+/// Stat each store path plus its SQLite WAL siblings.
+fn fingerprint_files(paths: &[PathBuf]) -> Vec<(PathBuf, u64, Option<SystemTime>)> {
+    let mut out: Vec<(PathBuf, u64, Option<SystemTime>)> = Vec::new();
+    for p in paths {
+        let meta = std::fs::metadata(p).ok();
+        out.push((
+            p.clone(),
+            meta.as_ref().map(|m| m.len()).unwrap_or(0),
+            meta.as_ref().and_then(|m| m.modified().ok()),
+        ));
+        // SQLite WAL databases write new rows to `<db>-wal` and only
+        // checkpoint into `<db>` later, so statting the .db alone can miss
+        // brand-new sessions for long stretches.
+        for suffix in ["-wal", "-shm"] {
+            let sib = p.with_extension(format!(
+                "{}{}",
+                p.extension().and_then(|e| e.to_str()).unwrap_or_default(),
+                suffix
+            ));
+            let m = std::fs::metadata(&sib).ok();
+            out.push((
+                sib,
+                m.as_ref().map(|x| x.len()).unwrap_or(0),
+                m.as_ref().and_then(|x| x.modified().ok()),
+            ));
+        }
+    }
+    out
 }
 
 pub struct WatchReport {
@@ -196,5 +216,36 @@ mod tests {
         std::fs::write(&f, "aa").unwrap();
         let after = (f.clone(), std::fs::metadata(&f).unwrap().len());
         assert_ne!(before, after, "size change must be observable");
+    }
+
+    /// Regression: OpenCode writes rows to `opencode.db-wal` and checkpoints
+    /// later, so a watch fingerprint over the .db alone would miss brand-new
+    /// sessions for long stretches. The fingerprint must stat WAL siblings.
+    #[test]
+    fn test_fingerprint_tracks_wal_siblings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("sessions.db");
+        std::fs::write(&db, "base").unwrap();
+        let wal = tmp.path().join("sessions.db-wal");
+        let shm = tmp.path().join("sessions.db-shm");
+
+        let f = fingerprint_files(&[db.clone()]);
+        let before: Vec<(PathBuf, u64, Option<SystemTime>)> = f
+            .iter()
+            .map(|(p, s, t)| (p.clone(), *s, *t))
+            .collect();
+
+        std::fs::write(&wal, "new rows").unwrap();
+        std::fs::write(&shm, "index").unwrap();
+
+        let after = fingerprint_files(&[db.clone()]);
+        assert_ne!(
+            before, after,
+            "WAL growth must change the fingerprint even though the .db is untouched"
+        );
+        assert!(
+            after.iter().any(|(p, s, _)| p == &wal && *s > 0),
+            "the -wal sibling must be fingerprinted"
+        );
     }
 }

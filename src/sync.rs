@@ -353,8 +353,22 @@ fn append_manifest(records: &[LinkRecord]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut existing = fs::read_to_string(&path).unwrap_or_default();
+    // Two source sessions can carry the same id (e.g. a genuine Codex rollout
+    // and a Claude copy of it), and both materialize into the same dest. The
+    // last write wins on disk, so earlier rows describing the same dest would
+    // report stale counts as drift on the next pull. Keep only the last row
+    // per dest.
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut kept: Vec<&LinkRecord> = Vec::new();
     for r in records {
+        if seen.contains(&r.dest) {
+            kept.retain(|k| k.dest != r.dest);
+        }
+        seen.insert(r.dest.clone());
+        kept.push(r);
+    }
+    let mut existing = fs::read_to_string(&path).unwrap_or_default();
+    for r in kept {
         existing.push_str(&serde_json::to_string(r).unwrap_or_default());
         existing.push('\n');
     }
@@ -1066,5 +1080,39 @@ mod tests {
             assert!(!p.exists(), "link should be gone: {}", p.display());
         }
         assert!(report.kept_foreign.is_empty());
+    }
+
+    /// Two source sessions can carry the same id and both materialize into the
+    /// same dest; the manifest must keep only the last row per dest, or the
+    /// earlier (stale) count reads as drift on the next pull.
+    #[test]
+    fn test_manifest_keeps_last_row_per_dest() {
+        let _sb = Sandbox::new();
+        let dest = PathBuf::from("/tmp/dest.jsonl");
+        let stale = LinkRecord {
+            dest: dest.clone(),
+            cache: PathBuf::from("/tmp/c1"),
+            session_id: "s".to_string(),
+            source_provider: "claude-code".to_string(),
+            target_provider: "claude-code".to_string(),
+            project: PathBuf::from("/p"),
+            inode: 0,
+            message_count: 812,
+        };
+        let fresh = LinkRecord {
+            dest,
+            cache: PathBuf::from("/tmp/c2"),
+            session_id: "s".to_string(),
+            source_provider: "codex-cli".to_string(),
+            target_provider: "claude-code".to_string(),
+            project: PathBuf::from("/p"),
+            inode: 0,
+            message_count: 1202,
+        };
+        append_manifest(&[stale, fresh]).unwrap();
+
+        let rows = read_manifest();
+        assert_eq!(rows.len(), 1, "one row per dest");
+        assert_eq!(rows[0].message_count, 1202, "must keep the last write");
     }
 }
