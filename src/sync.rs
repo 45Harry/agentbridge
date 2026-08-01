@@ -891,7 +891,6 @@ mod tests {
     /// Regression: sync writes into the tools' stores, so a second pass must
     /// not treat those files as new sessions and materialize them again.
     /// Without this guard the session count multiplies on every run.
-
     /// Simulate a tool appending a turn to a session agentbridge materialized.
     fn append_claude_turn(dest: &Path, sid: &str, text: &str) {
         let mut body = fs::read_to_string(dest).unwrap();
