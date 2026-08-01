@@ -1,7 +1,7 @@
 use crate::connector::{ConnectorError, ConnectorResult, InjectTarget, Registry};
 use crate::convert::build_cross_tool_brief;
 use crate::model::Session;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub fn inject_brief(
     registry: &Registry,
@@ -37,16 +37,15 @@ pub fn agentbridge_start(
             let mut sessions: Vec<Session> = scan
                 .filter_map(|r| r.ok())
                 .filter(|raw| {
-                    if let Some(ref pp) = raw.project_path {
-                        if let Some(target) = project_path {
+                    if let Some(ref pp) = raw.project_path
+                        && let Some(target) = project_path {
                             return pp.to_string_lossy().contains(target);
                         }
-                    }
                     project_path.is_none()
                 })
                 .filter_map(|raw| c.load(&raw.id).ok())
                 .collect();
-            sessions.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+            sessions.sort_by_key(|s| std::cmp::Reverse(s.started_at));
             Some(sessions)
         })
         .flatten()
@@ -61,7 +60,7 @@ pub fn agentbridge_start(
     connector.inject(&brief, dry_run)
 }
 
-pub fn write_claude_code_startup_brief(brief: &str, claude_project_dir: &PathBuf) -> ConnectorResult<PathBuf> {
+pub fn write_claude_code_startup_brief(brief: &str, claude_project_dir: &Path) -> ConnectorResult<PathBuf> {
     let claude_instructions = claude_project_dir.join("CLAUDE.md");
     let marker_begin = "<!-- agentbridge:brief -->";
     let marker_end = "<!-- /agentbridge:brief -->";

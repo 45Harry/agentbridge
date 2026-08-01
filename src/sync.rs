@@ -305,11 +305,10 @@ fn link_or_copy(src: &Path, dest: &Path) -> std::io::Result<u64> {
 
     // Already the same inode: the hardlink is in place, nothing to do. Falling
     // through to copy here would truncate the file we are copying *from*.
-    if let (Ok(a), Ok(b)) = (fs::metadata(src), fs::metadata(dest)) {
-        if a.ino() == b.ino() {
+    if let (Ok(a), Ok(b)) = (fs::metadata(src), fs::metadata(dest))
+        && a.ino() == b.ino() {
             return Ok(a.ino());
         }
-    }
 
     match fs::hard_link(src, dest) {
         Ok(()) => {}
@@ -602,8 +601,8 @@ pub fn unsync(dry_run: bool) -> UnsyncReport {
     let records = read_manifest();
 
     // OpenCode rows are removed by their marker, not by path.
-    if !dry_run && records.iter().any(|r| r.target_provider == "opencode") {
-        if let Some(db) = opencode_db() {
+    if !dry_run && records.iter().any(|r| r.target_provider == "opencode")
+        && let Some(db) = opencode_db() {
             match crate::opencode_write::ensure_safe_to_write() {
                 Ok(()) => {
                     let _ = crate::opencode_write::remove_all(&db);
@@ -613,7 +612,6 @@ pub fn unsync(dry_run: bool) -> UnsyncReport {
                 }
             }
         }
-    }
 
     for r in &records {
         if r.target_provider == "opencode" {

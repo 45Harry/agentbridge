@@ -93,7 +93,7 @@ pub fn discover(registry: &Registry) -> Index {
     // Newest first — matches how every tool's own picker orders sessions.
     index
         .entries
-        .sort_by(|a, b| b.last_event_at.cmp(&a.last_event_at));
+        .sort_by_key(|e| std::cmp::Reverse(e.last_event_at));
     index
 }
 

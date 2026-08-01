@@ -1,7 +1,7 @@
 use crate::model::{Role, Session};
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Version string stamped into generated Claude Code records. Kept close to
 /// the real client version the format was verified against (2.1.220).
@@ -17,12 +17,18 @@ const AGENTBRIDGE_NAMESPACE: uuid::Uuid =
     uuid::uuid!("6ba7b814-9dad-11d1-80b4-00c04fd430c8");
 
 pub trait SessionConverter {
-    fn convert(&self, session: &Session, target_dir: &PathBuf) -> Result<PathBuf, String>;
+    fn convert(&self, session: &Session, target_dir: &Path) -> Result<PathBuf, String>;
 
-    fn resume_cmd(&self, session_path: &PathBuf) -> Vec<String>;
+    fn resume_cmd(&self, session_path: &Path) -> Vec<String>;
 }
 
 pub struct ClaudeCodeConverter;
+
+impl Default for ClaudeCodeConverter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl ClaudeCodeConverter {
     pub fn new() -> Self {
@@ -60,7 +66,7 @@ impl ClaudeCodeConverter {
 }
 
 impl SessionConverter for ClaudeCodeConverter {
-    fn convert(&self, session: &Session, target_dir: &PathBuf) -> Result<PathBuf, String> {
+    fn convert(&self, session: &Session, target_dir: &Path) -> Result<PathBuf, String> {
         let project_dir_name = Self::encode_project_dir(
             &session.project_path().unwrap_or(session.project_id.clone())
         );
@@ -210,7 +216,7 @@ impl SessionConverter for ClaudeCodeConverter {
         Ok(out_path)
     }
 
-    fn resume_cmd(&self, session_path: &PathBuf) -> Vec<String> {
+    fn resume_cmd(&self, session_path: &Path) -> Vec<String> {
         let session_id = session_path
             .file_stem()
             .and_then(|s| s.to_str())
@@ -222,6 +228,12 @@ impl SessionConverter for ClaudeCodeConverter {
 
 pub struct CodexCliConverter;
 
+impl Default for CodexCliConverter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CodexCliConverter {
     pub fn new() -> Self {
         Self
@@ -229,7 +241,7 @@ impl CodexCliConverter {
 }
 
 impl SessionConverter for CodexCliConverter {
-    fn convert(&self, session: &Session, target_dir: &PathBuf) -> Result<PathBuf, String> {
+    fn convert(&self, session: &Session, target_dir: &Path) -> Result<PathBuf, String> {
         // Derive the rollout path from the session's own start time, never
         // from `now`: the same session must always map to the same filename,
         // or sync can never be idempotent (it would create a new rollout on
@@ -341,7 +353,7 @@ impl SessionConverter for CodexCliConverter {
         Ok(out_path)
     }
 
-    fn resume_cmd(&self, session_path: &PathBuf) -> Vec<String> {
+    fn resume_cmd(&self, session_path: &Path) -> Vec<String> {
         // Stem is `rollout-<timestamp>-<uuid>`; the trailing 5 hyphen-separated
         // groups are the UUID. Taking the whole stem would pass a bogus id.
         let stem = session_path
@@ -360,6 +372,12 @@ impl SessionConverter for CodexCliConverter {
 
 pub struct OpenCodeConverter;
 
+impl Default for OpenCodeConverter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OpenCodeConverter {
     pub fn new() -> Self {
         Self
@@ -374,11 +392,11 @@ impl OpenCodeConverter {
 }
 
 impl SessionConverter for OpenCodeConverter {
-    fn convert(&self, _session: &Session, _target_dir: &PathBuf) -> Result<PathBuf, String> {
+    fn convert(&self, _session: &Session, _target_dir: &Path) -> Result<PathBuf, String> {
         Err("OpenCode SQLite direct insert not yet implemented; use inject instead".to_string())
     }
 
-    fn resume_cmd(&self, _session_path: &PathBuf) -> Vec<String> {
+    fn resume_cmd(&self, _session_path: &Path) -> Vec<String> {
         vec!["opencode".to_string(), "run".to_string(), "--session".to_string(), "".to_string()]
     }
 }
@@ -456,7 +474,7 @@ mod tests {
     }
 
     /// Parse a converted file into records, failing loudly on bad JSON.
-    fn records(path: &PathBuf) -> Vec<serde_json::Value> {
+    fn records(path: &Path) -> Vec<serde_json::Value> {
         std::fs::read_to_string(path)
             .unwrap()
             .lines()
@@ -933,11 +951,10 @@ pub fn build_cross_tool_brief(sessions: &[Session]) -> String {
 
     for session in sessions {
         for msg in &session.messages {
-            if let Some(text) = &msg.text {
-                if text.len() > 20 && text.len() < 500 {
+            if let Some(text) = &msg.text
+                && text.len() > 20 && text.len() < 500 {
                     facts.push(format!("- [{}] {}: {}", session.provider, session.id, text.lines().next().unwrap_or("")));
                 }
-            }
             if let Some(tool_name) = &msg.tool_name {
                 tools_used.insert(tool_name.clone());
             }

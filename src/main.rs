@@ -328,15 +328,14 @@ fn cmd_start(
                 Ok(r) => r,
                 Err(_) => continue,
             };
-            if raw.body_available {
-                if let Ok(session) = c.load(&raw.id) {
+            if raw.body_available
+                && let Ok(session) = c.load(&raw.id) {
                     all_sessions.push(session);
                 }
-            }
         }
     }
 
-    all_sessions.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+    all_sessions.sort_by_key(|s| std::cmp::Reverse(s.started_at));
 
     let brief = agentbridge::convert::build_cross_tool_brief(&all_sessions);
 
@@ -559,11 +558,10 @@ fn find_session(registry: &agentbridge::connector::Registry, session_id: &str) -
         let scan = c.scan().ok()?;
         for result in scan {
             let raw = result.ok()?;
-            if raw.id == session_id || raw.id.contains(session_id) || session_id.contains(&raw.id) {
-                if raw.body_available {
+            if (raw.id == session_id || raw.id.contains(session_id) || session_id.contains(&raw.id))
+                && raw.body_available {
                     return c.load(&raw.id).ok();
                 }
-            }
         }
     }
     None

@@ -362,8 +362,8 @@ impl Connector for TestCodexCli {
 
 fn extract_cx_content_flexible(val: &Value) -> Option<String> {
     // Try real format: payload.content (string or array)
-    if let Some(payload) = val.get("payload") {
-        if let Some(content) = payload.get("content") {
+    if let Some(payload) = val.get("payload")
+        && let Some(content) = payload.get("content") {
             match content {
                 Value::String(s) => return Some(s.clone()),
                 Value::Array(arr) => {
@@ -379,7 +379,6 @@ fn extract_cx_content_flexible(val: &Value) -> Option<String> {
                 _ => {}
             }
         }
-    }
     // Try fixture format: content at top level
     val.get("content").and_then(|v| v.as_str()).map(|s| s.to_string())
 }
@@ -477,11 +476,10 @@ fn load_from_path(path: &Path, id: &str) -> ConnectorResult<Session> {
                         messages.push(m);
                         ordinal += 1;
                     }
-                    if project_path.is_none() {
-                        if let Some(msg_cwd) = p.get("cwd").and_then(|v| v.as_str()) {
+                    if project_path.is_none()
+                        && let Some(msg_cwd) = p.get("cwd").and_then(|v| v.as_str()) {
                             project_path = Some(msg_cwd.to_string());
                         }
-                    }
                 }
             }
             "response_item" => {

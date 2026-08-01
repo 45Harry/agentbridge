@@ -160,8 +160,8 @@ impl Iterator for ClaudeCodeScanIter {
 
 fn extract_cc_text_flexible(val: &Value) -> Option<String> {
     // Try real format: message.content (string or array)
-    if let Some(msg) = val.get("message") {
-        if let Some(content) = msg.get("content") {
+    if let Some(msg) = val.get("message")
+        && let Some(content) = msg.get("content") {
             match content {
                 Value::String(s) => return Some(s.clone()),
                 Value::Array(arr) => {
@@ -177,7 +177,6 @@ fn extract_cc_text_flexible(val: &Value) -> Option<String> {
                 _ => {}
             }
         }
-    }
     // Try fixture format: content at top level
     val.get("content").and_then(|v| v.as_str()).map(|s| s.to_string())
 }

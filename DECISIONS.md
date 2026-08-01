@@ -104,3 +104,50 @@ storage format. Per the spec's own reverse-engineering methodology (`CONNECTORS.
    copied from real user data.
 
 This does not block M1 (Claude Code + Codex CLI), which proceeds first.
+
+---
+
+## 2026-08-01 — Sync loop is the product; picker-listing is dropped as a requirement
+
+Supersedes the "everything must appear in each tool's native session picker"
+goal (see DESIGN.md §1, and HANDOFF's now-archived failed-picker section). The
+real verification of 2026-07-31 showed Codex's `/resume` picker lists from a
+SQLite index (`state_5.sqlite` → `threads`) that no file drop can reach, and
+Claude Code's picker was never automated either. Chasing each vendor's private
+index is unbounded work with no durable payoff.
+
+**What replaced it:** a write-back sync loop, verified live end to end:
+
+- `agentbridge init` once (read-only discovery), `agentbridge auto install`
+  (shell hook), then the `auto watch` loop re-syncs any new session created
+  in any tool into every other tool.
+- Sessions continue across tools *by id* (`resume`), which the real binaries
+  accept — proven for Claude Code ↔ Codex CLI ↔ OpenCode.
+- Turns appended in one tool are pulled back into an append-only overlay and
+  folded into the other tools' copies (`pull` + `sync`).
+- Delivery is files (hardlinked cache artifacts), not foreign index INSERTs —
+  except OpenCode, where the SQLite write path carries backup-before-write,
+  tagged rows, and a refuse-while-running guard.
+
+**Accepted:** a foreign session is reachable by id in another tool's picker
+only when that tool indexes by directory scan (Claude Code does; Codex CLI
+does not unless a future `backfill_state` check says otherwise).
+
+## 2026-08-01 — Antigravity CLI connector: read-only first
+
+The research spike from 2026-07-30 completed. Antigravity CLI stores sessions
+as SQLite databases under `~/.gemini/antigravity-cli/conversations/` (tables:
+`trajectory_meta`, `steps`, `gen_metadata`, `executor_metadata`,
+`parent_references`, `trajectory_metadata_blob`, `battle_mode_infos`), with a
+`conversation_summaries.db` alongside for previews/workspace URIs. Step
+payloads are Cortex protobufs decoded with a minimal hand-rolled reader (no
+deps, raw-slice descent — documented in `CONNECTORS.md` §6).
+
+**Decision:** ship the **read connector** now — antigravity sessions are
+discovered as sources and materialized into every other tool, verified
+against the operator's real databases. The **write connector** (materializing
+foreign sessions into antigravity, and mapping successful model-response text
+in type-17 steps, currently only error text at `.24.3.1` is known) waits for
+the CLI's model quota to reset so the binary can be exercised live. This is
+safe by construction: antigravity has no `live_root`/converter in sync.rs, so
+sync never writes into it.

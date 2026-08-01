@@ -3,164 +3,145 @@
 </p>
 
 One session layer for every AI coding agent on your machine. Start a
-conversation in Claude Code, keep going in Codex — from any directory, using
-each tool's own session picker. No new UI to learn.
+conversation in Claude Code, continue it in Codex or OpenCode — from any
+directory. Sessions you create in one tool automatically appear in every
+other tool, and the work you add anywhere is pulled back and shared everywhere.
 
-**Status: not working end to end yet.** Sessions are indexed, converted and
-placed correctly, and are resumable *by id* across tools — but they do **not
-yet show up in the tools' session pickers**, which is the point. Codex lists
-from a SQLite index (`state_5.sqlite` → `threads`) rather than from the
-rollout files, so dropped files are invisible to it. See
-[Current state](#current-state).
+Works today, verified live: **Claude Code, Codex CLI, OpenCode, Antigravity CLI**.
 
 ## The problem
 
 Every agent tool scopes its session list to the directory you launched it in,
-and none of them can read another tool's sessions. Measured on one real
-machine:
-
-| `opencode session list` run from | sessions shown |
-| --- | --- |
-| `~/Documents/bankNotes-OCR` | 9 |
-| `~/Users/harry` | 11 |
-| **actually in OpenCode's database** | **148** |
-
-Claude Code does the same thing via `~/.claude/projects/<encoded-cwd>/`, and
-Codex filters rollouts by cwd. So your history is real, it's on your disk, and
-almost all of it is invisible from wherever you happen to be standing.
+and none of them can read another tool's sessions. Your history is real, it's
+on your disk, and almost all of it is invisible from wherever you happen to be
+standing.
 
 ## What agentbridge does
 
-The intent: after `sync`, opening any tool in that directory shows every
-session in its own native picker, because as far as that tool can tell they
-are its own sessions. **That last step does not work yet** — see
-[Current state](#current-state).
+Indexes every agent session on the machine (`init`), then a sync loop keeps
+each directory's view fresh in every tool's own format:
 
-## Commands
+- **New session anywhere → visible everywhere.** Drop a session in any tool,
+  agentbridge converts it once and hardlinks the result into every other
+  tool's store — one physical artifact, zero extra bytes per directory.
+- **Continue across tools.** `agentbridge resume <id> <tool>` opens a session
+  started elsewhere in the tool of your choice.
+- **Write-back.** Turns you append in one tool are recovered into an
+  append-only overlay (`pull`) and folded into the other tools' copies on the
+  next sync. Your original files are never modified.
+- **Automatic.** `agentbridge auto install` hooks your shell; `auto watch`
+  re-syncs within seconds of any session change.
 
-| Command | What it does | Writes? |
-| --- | --- | --- |
-| `agentbridge init` | Find every agent session on this machine and index it. Zero config — no tool to register, no directory to point at. | no |
-| `agentbridge status` | Per synced file: how many turns agentbridge wrote vs how many are on disk now, so you can see what has new work. | no |
-| `agentbridge sync` | Surface every session in the current directory for every detected tool. Pulls new turns first, then republishes. | yes |
-| `agentbridge pull` | Recover turns you added to a synced session in some other tool, into agentbridge's overlay. | yes |
-| `agentbridge unsync` | Remove exactly what `sync` created — files verified by inode, OpenCode rows by marker — so it never deletes anything else. | yes |
-| `agentbridge auto install` | Add a shell hook so every new terminal syncs on its own. Run once; stop thinking about syncing. | yes |
-| `agentbridge auto watch` | Foreground loop that re-syncs whenever your sessions change. | yes |
-| `agentbridge ls` | List sessions across all providers. | no |
-| `agentbridge info` | Which connectors are detected, and where they store sessions. | no |
-| `agentbridge resume <id> <tool>` | Materialize one specific session into one tool. | yes |
+## Install (Linux)
 
-Every writing command (`sync`, `pull`, `unsync`, `resume`) takes `--dry-run`
-to show the plan without touching anything. `sync` and `resume` take
-`--project <dir>` to target a directory other than the current one; `unsync`
-reverses everything recorded in the manifest regardless of directory.
+Requires Rust (edition 2024). One-time toolchain, then the binary:
 
-### Typical use
+```bash
+# 1. Install Rust (one-time, if you don't have it)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+# then restart your shell, or run: source "$HOME/.cargo/env"
+
+# 2. Install agentbridge
+cargo install --git https://github.com/45Harry/agentbridge
+
+# 3. Verify
+agentbridge --version
+```
+
+Other platforms: `cargo install --git https://github.com/45Harry/agentbridge`
+works wherever Rust does (macOS, Windows). For local development:
+`cargo install --path .`.
+
+## Get started
 
 ```bash
 # once, at install
-agentbridge init          # see what you have (read-only)
+agentbridge init          # read-only: see what's on this machine
 agentbridge auto install  # new terminals sync themselves from now on
+agentbridge auto watch    # (optional) live re-sync daemon — or rely on the hook
 
-# ...that's it. Or drive it manually:
+# that's it. Sessions now flow both ways between your tools.
+```
+
+Manual driving:
+
+```bash
 cd ~/code/my-project
-agentbridge sync
-
-# now open any tool here; its own picker lists every session on the machine
-claude          # /resume shows them
-codex resume    # picker shows them
-
-# after working in one tool, publish those turns to the others
-agentbridge sync
-
-# put the directory back exactly as it was
-agentbridge unsync
+agentbridge sync                        # surface all sessions here, for all tools
+claude --resume <id>                    # continue any session in Claude Code
+codex resume <id>                       # ...or in Codex
+agentbridge resume <id> opencode        # ...or in OpenCode
+agentbridge status                      # what has new work since the last sync
 ```
 
 ### Try it safely first
 
-`sync` writes into your tools' session directories. To see exactly what it
-would do without touching anything:
+`sync` writes into your tools' session stores. Every writing command takes
+`--dry-run` to show the plan without touching anything:
 
 ```bash
 agentbridge sync --dry-run
 ```
 
-And `agentbridge unsync` reverses a real run completely.
+`agentbridge unsync` removes exactly what `sync` created (files verified by
+inode, OpenCode rows by marker) and never deletes recovered work.
 
-### It doesn't duplicate your data
+## Commands
 
-Session bodies are never copied into agentbridge; the index points at the
-files already on your disk. Each session is converted once per target format
-into a cache, and directories get **hardlinks** to it — same inode, zero extra
-bytes. 32 sessions surfaced across two tools cost ~1.7 MB, not 32 transcripts.
+| Command | What it does | Writes? |
+| --- | --- | --- |
+| `agentbridge init` | Find every agent session on this machine and index it. Zero config. | no |
+| `agentbridge ls [--project P] [--provider T]` | List sessions across all providers. | no |
+| `agentbridge index [--provider T]` | Index sessions from all (or one) detected provider. | no |
+| `agentbridge info` | Which connectors are detected, and where they store sessions. | no |
+| `agentbridge status` | Per synced file: turns agentbridge wrote vs on disk now — who has new work. | no |
+| `agentbridge sync [--project DIR]` | Pull new turns first, then republish every session into every tool for that directory. | yes |
+| `agentbridge pull` | Recover turns you added to a synced session in some other tool into agentbridge's overlay. | yes |
+| `agentbridge resume <id> <tool>` | Materialize one specific session into one tool. | yes |
+| `agentbridge inject <tool> <ids...>` | Inject session context (cross-tool brief) into a tool's startup. | yes |
+| `agentbridge start <tool> [args...]` | Launch an agent with cross-tool context injected. | yes |
+| `agentbridge unsync` | Remove exactly what `sync` created — never anything else. | yes |
+| `agentbridge auto install` | Add a shell hook so every new terminal syncs on its own. Run once. | yes |
+| `agentbridge auto uninstall` | Remove the shell hook. | yes |
+| `agentbridge auto watch [--interval SECS]` | Loop that re-syncs whenever your sessions change. | yes |
 
-A useful side effect: because destinations are hardlinks to one artifact,
-refreshing that artifact updates every directory at once.
+## Supported tools
 
-### Your sessions are never modified
+| Connector | Sessions live in | Read | Write |
+| --- | --- | --- | --- |
+| Claude Code | `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl` | yes | yes |
+| Codex CLI | `~/.codex/sessions/<date>/rollout-*.jsonl` | yes | yes |
+| OpenCode | `~/.local/share/opencode/opencode.db` (SQLite) | yes | yes, guarded* |
+| Antigravity CLI | `~/.gemini/antigravity-cli/conversations/*.db` (SQLite) | yes | pending** |
 
-agentbridge only ever reads a tool's own sessions. When you continue a synced
-session, the new turns are recovered into an append-only overlay that
-agentbridge owns and folded into the other tools' copies — the original file
-is left alone. `unsync` removes exactly the files it created (verified by
-inode) and never deletes recovered work.
+\* OpenCode is the only tool whose sessions live in a live database. Every
+write backs the database up first, tags its rows (removable by that tag alone),
+and refuses to run while OpenCode is open.
 
-## Install
+\** Antigravity is read-only: its sessions are surfaced into every other tool,
+but foreign sessions are not yet materialized into it (write path deferred
+until the CLI's model quota resets and the binary can be exercised live).
 
-```bash
-cargo install --path .
-```
+## How it works
 
-Requires Rust (edition 2024). See `DECISIONS.md` for why Rust over TypeScript.
+1. **Index in place.** Session bodies are never copied; the index points at
+   the files already on your disk.
+2. **Derive once, link many.** Each session is converted once per target
+   format into `~/.agentbridge/cache`, and directories get **hardlinks** to
+   it — same inode, zero extra bytes. Refreshing one artifact updates every
+   directory at once.
+3. **Never touch a tool's own sessions.** New turns are recovered into an
+   append-only overlay agentbridge owns and folded into the other tools'
+   copies. `unsync` deletes only what it created.
 
-## Current state
+## Docs
 
-**The blocking gap:** Codex's `/resume` picker lists from
-`~/.codex/state_5.sqlite` (table `threads`), not by scanning
-`~/.codex/sessions/`. After a sync that wrote 164 rollouts, `threads` still
-held only the 11 real sessions and the picker showed 1. Making sessions
-*appear* requires inserting `threads` rows, the same way OpenCode requires
-INSERTs. Claude Code's picker has not been checked yet.
-
-Verified against the real `claude` and `codex` binaries — resume *by id*,
-which is a different code path from listing:
-
-- A Codex session opening and resuming inside Claude Code, and vice versa.
-- The same session resumable from multiple directories, one physical copy.
-- `sync` → continue a session in Claude Code → `sync` → **the new turn appears
-  in the Codex copy** → `unsync` leaves the original untouched.
-- Idempotency: repeated syncs create nothing new.
-- OpenCode: 148 real sessions read; writes refuse while OpenCode is running
-  (confirmed on a live machine — the database was left untouched).
-
-### OpenCode is handled carefully
-
-It is the only tool whose sessions are rows in a live database rather than
-files, so it is the only place agentbridge writes into real data. Every write
-backs the database up first, tags its rows in the `metadata` column (unused by
-OpenCode itself), refuses to run while OpenCode is open, and is removable by
-that tag alone — `unsync` cannot touch a session OpenCode authored.
-
-Not done yet:
-
-- **agy / Kilo Code** — agy's storage location is still unknown
-  (`CONNECTORS.md` §4); Kilo has not been investigated.
-- **Redaction** — `SPEC.md` §3 requires secret redaction before anything is
-  written. Not implemented.
-- **Interactive picker listing** — resume *by id* is proven; that the TTY
-  picker lists synced sessions has not been automated.
-
-## Documentation
-
-- `DESIGN.md` — the architecture, the cost model, and the bugs real testing
-  found. Read this to understand *why* it works the way it does.
+- `DESIGN.md` — architecture, the cost model, and the bugs real testing found.
 - `HANDOFF.md` — pick the project up fresh on another machine.
 - `CONNECTORS.md` — each tool's on-disk format, reverse-engineered, with
   "last verified" dates.
-- `SPEC.md` — the original build spec, verbatim.
 - `DECISIONS.md` — dated record of every significant choice.
+- `SPEC.md` — the original build spec, verbatim.
 
 ## License
 

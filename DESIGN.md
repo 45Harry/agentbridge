@@ -1,7 +1,7 @@
 # DESIGN.md — the unified session layer
 
-**Status:** architecture agreed 2026-07-31, core write-path verified against
-real binaries. Sync loop not yet implemented.
+**Status:** architecture agreed 2026-07-31, sync loop shipped and verified
+live on the operator's machine 2026-08-01 (see §9).
 
 ## 1. The goal, stated precisely
 
@@ -9,6 +9,11 @@ Every agent session that exists anywhere on this machine should be visible and
 resumable from **any** agent tool, in **any** directory — using each tool's own
 native UI. Open OpenCode, type `/session`, and a thread you started in Claude
 Code is simply in the list. No new CLI to learn; agentbridge is plumbing.
+
+> **2026-08-01 amendment:** the *resumable* half of this goal is shipped and
+> verified live. The *native-picker-listing* half was dropped as a requirement
+> after the 2026-07-31 failure analysis (Codex's picker lists from a SQLite
+> index no file drop can reach) — see DECISIONS.md "Sync loop is the product".
 
 Corollary the operator was explicit about: **do not store the same data twice.**
 agentbridge indexes and links the session data already scattered across the
@@ -206,9 +211,28 @@ without it agentbridge cannot distinguish its own output from a real session.
 Always `unsync`; never remove the data dir by hand. A durable marker inside
 generated files would remove this footgun entirely — still to do.
 
-Not built yet: OpenCode/agy/Kilo connectors, redaction, and proof that the
-tools' *interactive* pickers list synced sessions (resume-by-id is verified;
-driving a TTY picker is not automated).
+### Shipped 2026-08-01 — the sync loop, verified live
+
+The original plan's tail (OpenCode/agy connectors, picker verification) has
+been superseded by delivery. What now runs on the operator's machine:
+
+- **Auto-sync loop**: `init` once + `auto install` (shell hook) +
+  `auto watch` (15s daemon). New sessions in any tool are picked up and
+  materialized into every other tool; turns appended anywhere are pulled
+  into the overlay and republished. Proven with a synthetic Codex session
+  surfacing in Claude Code's store within 35s.
+- **OpenCode connector (read + write)**: 148 real sessions read from SQLite;
+  the write path backs up the database, tags its rows in the `metadata`
+  column, refuses to run while OpenCode is open, and was verified against the
+  real database. Write-back pulls append-only turns while OpenCode runs.
+- **Antigravity CLI connector (read-only)**: sessions scanned from
+  `~/.gemini/antigravity-cli/conversations/*.db` with a minimal hand-rolled
+  Cortex protobuf reader; verified against the two real CLI databases.
+  Write path + successful-response text mapping deferred until the CLI's
+  model quota resets (`CONNECTORS.md` §6).
+
+Not built yet: redaction, a durable marker in generated files, Kilo Code,
+and topic threading (§10).
 
 ## 10. Open question — how far does "same thread" go?
 

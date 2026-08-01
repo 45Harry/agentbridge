@@ -145,7 +145,7 @@ pub fn write_session(
     let title = session
         .title
         .clone()
-        .unwrap_or_else(|| format!("{} session {}", session.provider, &session.id));
+        .unwrap_or_else(|| format!("{} session {}", session.provider, session.id));
     let metadata = json!({
         MARKER: true,
         "source_provider": session.provider,
@@ -192,11 +192,10 @@ pub fn write_session(
     let mut prev_msg_id: Option<String> = None;
     let mut last_ts = created - 1;
 
-    let mut insert_msg = |tx: &rusqlite::Transaction,
-                          role: &str,
-                          data: serde_json::Value,
-                          ts: i64,
-                          idx: usize|
+    let insert_msg = |tx: &rusqlite::Transaction,
+                      data: serde_json::Value,
+                      ts: i64,
+                      idx: usize|
      -> Result<String, WriteError> {
         let msg_id = format!("msg_0{}_m{:06}", id_hex, idx);
         tx.execute(
@@ -208,11 +207,11 @@ pub fn write_session(
         Ok(msg_id)
     };
 
-    let mut insert_part = |tx: &rusqlite::Transaction,
-                           msg_id: &str,
-                           data: serde_json::Value,
-                           ts: i64,
-                           idx: usize|
+    let insert_part = |tx: &rusqlite::Transaction,
+                       msg_id: &str,
+                       data: serde_json::Value,
+                       ts: i64,
+                       idx: usize|
      -> Result<(), WriteError> {
         tx.execute(
             "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) \
@@ -249,7 +248,6 @@ pub fn write_session(
         if prev_msg_id.is_none() && m.role != Role::User {
             let msg_id = insert_msg(
                 &tx,
-                "user",
                 json!({
                     "role": "user",
                     "time": { "created": ts },
@@ -281,7 +279,6 @@ pub fn write_session(
         let msg_id = match m.role {
             Role::User => insert_msg(
                 &tx,
-                "user",
                 json!({
                     "role": "user",
                     "time": { "created": ts },
@@ -316,7 +313,7 @@ pub fn write_session(
                 if let Some(pid) = &prev_msg_id {
                     data.as_object_mut().unwrap().insert("parentID".to_string(), json!(pid));
                 }
-                insert_msg(&tx, "assistant", data, ts, idx)?
+                insert_msg(&tx, data, ts, idx)?
             }
         };
 

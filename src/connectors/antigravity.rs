@@ -26,9 +26,13 @@ use crate::connector::{Connector, ConnectorError, ConnectorResult, InjectTarget,
 use crate::model::{Message, RawSession, Role, Session, TokenTotals};
 use chrono::{DateTime, TimeZone, Utc};
 use rusqlite::{Connection, OpenFlags};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 const ANTIGRAVITY_HOME: &str = ".gemini/antigravity-cli";
+
+/// (preview, workspace URI, last modified) per conversation id, from
+/// `conversation_summaries.db`.
+type SummaryMeta = std::collections::HashMap<String, (String, Option<String>, Option<DateTime<Utc>>)>;
 
 pub struct AntigravityConnector {
     root: PathBuf,
@@ -42,6 +46,7 @@ impl AntigravityConnector {
         }
     }
 
+    #[cfg(test)]
     pub fn with_root(root: PathBuf) -> Self {
         Self { root }
     }
@@ -69,7 +74,7 @@ impl AntigravityConnector {
     /// Look up metadata (preview / workspace / times) in the summaries index.
     fn summary_meta(&self, id: &str) -> Option<(String, Option<String>, Option<DateTime<Utc>>)> {
         let conn = Connection::open_with_flags(
-            &self.summaries_db(),
+            self.summaries_db(),
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
         )
         .ok()?;
@@ -130,7 +135,7 @@ impl Connector for AntigravityConnector {
         };
         dbs.sort();
 
-        let meta: std::collections::HashMap<String, (String, Option<String>, Option<DateTime<Utc>>)> = {
+        let meta: SummaryMeta = {
             let mut m = std::collections::HashMap::new();
             for name in dbs.iter().filter_map(|p| p.file_stem().and_then(|s| s.to_str())) {
                 if let Some(row) = self.summary_meta(name) {
@@ -253,7 +258,7 @@ struct AntigravityScanIter<'a> {
     connector: &'a AntigravityConnector,
     dbs: Vec<PathBuf>,
     idx: usize,
-    meta: std::collections::HashMap<String, (String, Option<String>, Option<DateTime<Utc>>)>,
+    meta: SummaryMeta,
 }
 
 impl Iterator for AntigravityScanIter<'_> {
@@ -272,21 +277,22 @@ impl Iterator for AntigravityScanIter<'_> {
                 Ok(c) => c,
                 Err(e) => return Some(Err(e)),
             };
-            let (first, latest) = match conn
+            let first = conn
                 .query_row(
-                    "SELECT (SELECT step_payload FROM steps ORDER BY idx LIMIT 1), \
-                            (SELECT step_payload FROM steps ORDER BY idx DESC LIMIT 1)",
+                    "SELECT step_payload FROM steps ORDER BY idx LIMIT 1",
                     [],
-                    |row| {
-                        let a: Option<Vec<u8>> = row.get(0).ok();
-                        let b: Option<Vec<u8>> = row.get(1).ok();
-                        Ok((a, b))
-                    },
+                    |row| row.get::<_, Option<Vec<u8>>>(0),
                 )
-            {
-                Ok(v) => v,
-                Err(_) => (None, None),
-            };
+                .ok()
+                .flatten();
+            let latest = conn
+                .query_row(
+                    "SELECT step_payload FROM steps ORDER BY idx DESC LIMIT 1",
+                    [],
+                    |row| row.get::<_, Option<Vec<u8>>>(0),
+                )
+                .ok()
+                .flatten();
             let started_at = first
                 .as_deref()
                 .and_then(step_time)
@@ -525,7 +531,7 @@ mod tests {
         out
     }
 
-    fn make_db(dir: &Path, id: &str) -> PathBuf {
+    fn make_db(dir: &std::path::Path, id: &str) -> PathBuf {
         let path = dir.join(format!("{}.db", id));
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(

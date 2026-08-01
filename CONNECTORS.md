@@ -142,7 +142,9 @@ let Codex discover the rollouts itself rather than inserting rows.
 ## 4. Antigravity CLI (`agy`)
 
 **Last verified:** against `agy 1.1.8`, on 2026-07-30, macOS. **Storage
-location not yet confirmed — connector build blocked on this.**
+location now confirmed on Linux 2026-08-01 — see §7 for the full on-disk
+format; the connector built from it is read-only and verified against real
+databases.**
 
 - `agy` is a separate Go binary (`~/.local/bin/agy`, ships its own bubbletea
   TUI) from the Antigravity IDE app (`~/.antigravity`,
@@ -186,6 +188,17 @@ location not yet confirmed — connector build blocked on this.**
 
 ## 5. Cross-tool resume interoperability (tested 2026-07-30)
 
+> **2026-08-01 amendment — superseded by delivery.** The conclusion below —
+> "none of the tools can resume a session started by a different tool" — was
+> true for *unconverted* foreign IDs, and it is exactly what agentbridge now
+> fixes: `resume` converts a session into the target's real on-disk schema
+> (threading `sessionId`/`payload.session_id` through every record per §6),
+> so a materialized session *is* native by the time the target looks it up.
+> Verified live in both directions (Claude Code ↔ Codex CLI) and against
+> OpenCode's real database. Read §6's original finding for the schema
+> facts; ignore its "non-functional" verdict, which predates the rewritten
+> writers.
+
 Direct question: can tool B resume a session created by tool A? Tested with
 real session IDs pulled from each provider's own storage on one machine with
 all four installed.
@@ -213,6 +226,15 @@ resuming its own sessions across directories — never to resuming a foreign
 tool's session.
 
 ## 6. `agentbridge resume` file-copy conversion — retested and does NOT work (2026-07-31)
+
+> **2026-08-01 amendment — superseded.** The writers were rewritten against
+> the real schemas recorded below (`sessionId` threaded through every Claude
+> record, `payload.session_id` + `session_meta` for Codex) and the real
+> binaries then accepted the output: cross-tool resume is verified working
+> and is the product's core loop (see §5's amendment). The schema facts in
+> this section remain the authoritative on-disk contract for the writers —
+> keep the regression tests pinned to them. Codex list-picker visibility is
+> the one true remnant of this section's problem space (see §2).
 
 Commit `cb75d98` (pulled from a different machine/session) added `src/convert.rs`
 and wired `agentbridge resume <id> <target-provider>` to convert a session and
@@ -277,3 +299,56 @@ correctly-implemented copy-shim is inherently fragile (must track two
 undocumented, drifting vendor formats exactly). It strengthens the case for
 prioritizing M4 (distilled brief injection, format-agnostic) over polishing
 the M5 copy-shim.
+
+## 7. Antigravity CLI session store (confirmed Linux, 2026-08-01)
+
+**Last verified:** against the operator's real databases on 2026-07-30/08-01,
+Linux. Read connector implemented in `src/connectors/antigravity.rs`
+(read-only; databases open with `SQLITE_OPEN_READ_ONLY` so a live Antigravity
+process is never blocked).
+
+- **Storage root:** `~/.gemini/antigravity-cli/` (Linux). macOS path for the
+  CLI is unconfirmed — the `agy` binary and the Antigravity IDE app are
+  separate installs (see §4); do not assume the IDE's `workspaceStorage`
+  holds CLI conversations.
+- **One SQLite database per conversation:** `conversations/<uuid>.db`.
+  Tables observed: `trajectory_meta` (id, cascade_id, type=4, source=17,
+  created/updated timestamps), `steps` (idx, type, status, payload),
+  `gen_metadata`, `executor_metadata`, `parent_references`,
+  `trajectory_metadata_blob` (single `main` row, protobuf),
+  `battle_mode_infos`.
+- **Metadata index:** `conversation_summaries.db` — columns
+  `conversation_id`, `title`, `preview`, `step_count`, `last_modified_time`,
+  `workspace_uris`, `status`, `source`, `agent_name`, `parent_conversation_id`,
+  `nesting_depth`, `battle_id`, `winning_conversation_id`, `not_fully_idle`,
+  `killed`, `last_user_input_time`, `last_user_input_step_index`,
+  `app_data_dir`. Contains IDE sessions; the two standalone CLI conversations
+  observed had **no row here** (project scoping `""`, title `NULL`).
+- **Step records:** `steps` rows ordered by `idx`. `status` 3 = DONE.
+  `type` 14 = user input with text, 15 = follow-up user input with **no**
+  text, 17 = model turn, 98 = context/state row (skipped by the connector).
+- **Payloads are Google cortex protobuf blobs**, decoded with a minimal
+  hand-rolled reader in `antigravity.rs` (no dependencies; raw-slice descent,
+  no string-vs-message guessing). Known offsets, verified against real DBs:
+
+  | Path | Contents |
+  | --- | --- |
+  | `payload.1` | varint step type (mirrors the `steps.type` column) |
+  | `payload.4` | varint status (3 = DONE) |
+  | `payload.5` | StepMetadata: `.5.1.1` / `.5.1.2` = created seconds + nanos (RFC 3339 output) |
+  | `payload.19.2` | user text (step type 14) |
+  | `payload.19.3.1` | fallback user text (input without `2` subfield) |
+  | `payload.24.3.1` | model error message (step type 17) |
+  | `payload.18` (trajectory_metadata_blob `main`) | project id string (`default-cli-project`) |
+
+- **Not yet mapped:** successful model-response text for type 17. Every real
+  step 17 on record was a quota failure, so the text field's location is
+  unknown — decode a successful response once the CLI's model quota resets.
+  The embedded Cortex protos inside
+  `/opt/Antigravity/resources/bin/language_server` may map the remaining
+  payload faster than black-box probing.
+- **Write connector:** pending (read-only by design). Foreign sessions are
+  surfaced *into* other tools; nothing materializes into
+  `conversations/<uuid>.db` yet. The real `.pb` files under the IDE's
+  `~/.gemini/antigravity/conversations/` were checked and are **not**
+  protobuf (wire type 7) — SQLite is the only viable surface.
