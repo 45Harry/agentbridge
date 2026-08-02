@@ -305,6 +305,29 @@ pub fn ensure_thread_rows(
     Ok(report)
 }
 
+/// Remove agentbridge-owned `threads` rows for `session` in `dirs`. Used when
+/// a directory's variant is skipped because the tool already lists the
+/// session there natively — the row would otherwise point at a file that no
+/// longer matches the directory it claims.
+pub fn remove_thread_rows_for(
+    db: &Path,
+    session: &Session,
+    dirs: &[String],
+) -> Result<usize, WriteError> {
+    let conn = Connection::open(db).map_err(|e| WriteError::Sql(e.to_string()))?;
+    let mut removed = 0usize;
+    for dir in dirs {
+        let sid = session_uuid_for_dir(&session.id, dir);
+        removed += conn
+            .execute(
+                "DELETE FROM threads WHERE id = ?1 AND thread_source = ?2",
+                params![sid, MARKER],
+            )
+            .map_err(|e| WriteError::Sql(e.to_string()))?;
+    }
+    Ok(removed)
+}
+
 /// Outcome of an `ensure_thread_rows` call.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ThreadRowReport {

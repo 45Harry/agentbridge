@@ -25,8 +25,24 @@ use std::path::{Path, PathBuf};
 pub const MARKER: &str = "agentbridge";
 
 /// OpenCode requires a non-null `project_id` referencing `project`. `global`
-/// is OpenCode's own catch-all row and is present on a stock install.
+/// is OpenCode's own catch-all row and is present on a stock install; any
+/// other directory that is a known project worktree uses that project's id.
 const PROJECT_ID: &str = "global";
+
+/// Resolve the `project` id OpenCode's picker filters on for `directory`:
+/// the worktree's project row, or the catch-all `global` project (which is
+/// what OpenCode itself uses for sessions outside any worktree).
+fn resolve_project_id(db: &Connection, directory: &str) -> Result<String, WriteError> {
+    match db.query_row(
+        "SELECT id FROM project WHERE worktree = ?1 LIMIT 1",
+        params![directory],
+        |r| r.get::<_, String>(0),
+    ) {
+        Ok(id) => Ok(id),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(PROJECT_ID.to_string()),
+        Err(e) => Err(WriteError::Sql(e.to_string())),
+    }
+}
 
 const VERSION: &str = "1.17.15";
 
@@ -153,11 +169,14 @@ pub fn write_session(
     })
     .to_string();
 
+    let project_id = resolve_project_id(&tx, directory)?;
+
     // Replace wholesale so a re-run refreshes rather than duplicating. The
-    // cascade clears the old messages/parts first.
+    // cascade clears the old messages/parts first. Scoped by directory: the
+    // same session now has one row per directory it should appear in.
     tx.execute(
-        "DELETE FROM session WHERE id = ?1 AND metadata LIKE ?2",
-        params![id, format!("%{}%", MARKER)],
+        "DELETE FROM session WHERE id = ?1 AND directory = ?2 AND metadata LIKE ?3",
+        params![id, directory, format!("%{}%", MARKER)],
     )
     .map_err(|e| WriteError::Sql(e.to_string()))?;
 
@@ -166,7 +185,7 @@ pub fn write_session(
          time_created, time_updated, metadata) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
         params![
             id,
-            PROJECT_ID,
+            project_id,
             slug_of(&title),
             directory,
             title,

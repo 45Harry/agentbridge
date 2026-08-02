@@ -21,6 +21,8 @@ pub struct IndexEntry {
     pub started_at: Option<chrono::DateTime<chrono::Utc>>,
     pub last_event_at: Option<chrono::DateTime<chrono::Utc>>,
     pub title: Option<String>,
+    /// See `RawSession::source`.
+    pub source: Option<String>,
 }
 
 /// Result of a discovery pass.
@@ -77,6 +79,7 @@ pub fn discover(registry: &Registry) -> Index {
                             started_at: raw.started_at,
                             last_event_at: raw.last_event_at,
                             title: raw.title,
+                            source: raw.source,
                         }),
                         // A single malformed session is recorded and skipped;
                         // the rest of the scan continues.

@@ -118,6 +118,7 @@ impl Connector for OpenCodeConnector {
                     started_at: created.and_then(millis_to_dt),
                     last_event_at: updated.and_then(millis_to_dt),
                     title,
+                    source: None,
                     source_path: self.db_path.clone(),
                     body_available: true,
                 })

@@ -308,6 +308,7 @@ impl Iterator for AntigravityScanIter<'_> {
                 started_at,
                 last_event_at,
                 title: if title.is_empty() { None } else { Some(title) },
+                source: None,
                 source_path: db.clone(),
                 body_available: true,
             }));

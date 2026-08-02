@@ -38,6 +38,10 @@ pub struct RawSession {
     /// True last-event timestamp read from *inside* the file, not file mtime.
     pub last_event_at: Option<DateTime<Utc>>,
     pub title: Option<String>,
+    /// Source marker from inside the record (`cli`, `exec`, ...) when the
+    /// tool stamps one — used to tell a session the tool itself lists from
+    /// one it hides (e.g. `codex exec` rollouts do not appear in /resume).
+    pub source: Option<String>,
     pub source_path: PathBuf,
     /// False when the file is missing/corrupt but sidecar metadata let us
     /// still produce this record. `Connector::load` will error if called on

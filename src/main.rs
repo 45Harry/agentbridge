@@ -446,35 +446,46 @@ fn cmd_resume(
         }
         "codex-cli" => {
             let converter = CodexCliConverter::new();
-            match converter.convert(&session, target_dir) {
+            let mut dirs = vec![session.project_path().unwrap_or_default()];
+            if let Ok(home) = std::env::var("HOME") {
+                let home = home.trim_end_matches('/').to_string();
+                if !dirs.contains(&home) {
+                    dirs.push(home);
+                }
+            }
+            match converter.convert_multi(&session, target_dir, &dirs) {
                 Err(e) => Err(e),
                 Ok(written) => {
-                    // Index the rollout in `state_5.sqlite` so it shows up in
-                    // `codex /resume`, not just by id (CONNECTORS.md §2).
+                    // Index each rollout in `state_5.sqlite` so it shows up in
+                    // `codex /resume` from its own directory (CONNECTORS.md §2).
                     if let Some(db) = agentbridge::codex_write::state_db() {
                         match agentbridge::codex_write::ensure_safe_to_write() {
                             Err(e) => eprintln!("  ! {}", e),
                             Ok(()) => {
                                 let _ = agentbridge::codex_write::backup(&db);
-                                let cwd = session.project_path().unwrap_or_default();
-                                let mut dirs = vec![cwd];
-                                if let Ok(home) = std::env::var("HOME") {
-                                    dirs.push(home);
+                                let mut inserted = 0usize;
+                                for (dir, path) in dirs.iter().zip(&written) {
+                                    if let Ok(r) = agentbridge::codex_write::ensure_thread_rows(
+                                        &db, &session, path, std::slice::from_ref(dir),
+                                    ) {
+                                        inserted += r.inserted;
+                                    } else {
+                                        eprintln!("  ! codex threads row failed");
+                                    }
                                 }
-                                match agentbridge::codex_write::ensure_thread_rows(
-                                    &db, &session, &written, &dirs,
-                                ) {
-                                    Ok(r) if r.inserted > 0 => println!(
+                                if inserted > 0 {
+                                    println!(
                                         "  indexed into codex /resume ({} new row(s))",
-                                        r.inserted
-                                    ),
-                                    Ok(_) => {}
-                                    Err(e) => eprintln!("  ! {}", e),
+                                        inserted
+                                    );
                                 }
                             }
                         }
                     }
-                    Ok(written)
+                    written
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| "codex materialization produced no files".to_string())
                 }
             }
         }

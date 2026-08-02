@@ -239,6 +239,10 @@ fn scan_codex_file(path: &Path) -> ConnectorResult<Option<RawSession>> {
 
                 let timestamp = payload
                     .and_then(|p| parse_codex_timestamp(p.get("timestamp")));
+                let source = payload
+                    .and_then(|p| p.get("source"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
 
                 return Ok(Some(RawSession {
                     id,
@@ -247,6 +251,7 @@ fn scan_codex_file(path: &Path) -> ConnectorResult<Option<RawSession>> {
                     started_at: timestamp,
                     last_event_at: timestamp,
                     title: None,
+                    source,
                     source_path: path.to_path_buf(),
                     body_available: true,
                 }));
@@ -270,6 +275,7 @@ fn scan_codex_file(path: &Path) -> ConnectorResult<Option<RawSession>> {
                     started_at: timestamp,
                     last_event_at: timestamp,
                     title,
+                    source: None,
                     source_path: path.to_path_buf(),
                     body_available: true,
                 }));
@@ -456,7 +462,11 @@ fn load_from_path(path: &Path, id: &str) -> ConnectorResult<Session> {
             }
             "event_msg" => {
                 if let Some(p) = payload {
-                    if let Some(msg) = p.get("message") {
+                    // The head-scan preview echo (`payload.message` as a plain
+                    // string, type `user_message`) duplicates the response_item
+                    // that carries the real turn — counting it would invent a
+                    // phantom message. Only the object form is a real message.
+                    if let Some(msg) = p.get("message").filter(|v| v.is_object()) {
                         let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
                         let content = msg.get("content").and_then(|v| v.as_str()).map(|s| s.to_string());
                         let role_enum = if role == "user" { Role::User } else { Role::Assistant };

@@ -19,6 +19,21 @@ const AGENTBRIDGE_NAMESPACE: uuid::Uuid =
 pub trait SessionConverter {
     fn convert(&self, session: &Session, target_dir: &Path) -> Result<PathBuf, String>;
 
+    /// Materialize one artifact per directory in `dirs`, each scoped to its
+    /// own directory, so the session shows up in the target tool's picker no
+    /// matter which of them it is launched from. Codex's resume picker lists
+    /// rollout files whose `session_meta.cwd` matches the launch directory
+    /// (verified in codex-cli 0.146 source), so a single file can only ever
+    /// be visible from one directory. Defaults to a single materialization.
+    fn convert_multi(
+        &self,
+        session: &Session,
+        target_dir: &Path,
+        _dirs: &[String],
+    ) -> Result<Vec<PathBuf>, String> {
+        Ok(vec![self.convert(session, target_dir)?])
+    }
+
     fn resume_cmd(&self, session_path: &Path) -> Vec<String>;
 }
 
@@ -242,6 +257,22 @@ impl CodexCliConverter {
 
 impl SessionConverter for CodexCliConverter {
     fn convert(&self, session: &Session, target_dir: &Path) -> Result<PathBuf, String> {
+        let dirs = vec![session.project_path().unwrap_or_default()];
+        self.convert_multi(session, target_dir, &dirs)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| "codex materialization produced no files".to_string())
+    }
+
+    fn convert_multi(
+        &self,
+        session: &Session,
+        target_dir: &Path,
+        dirs: &[String],
+    ) -> Result<Vec<PathBuf>, String> {
+        if dirs.is_empty() {
+            return Err("codex materialization needs at least one directory".to_string());
+        }
         // Derive the rollout path from the session's own start time, never
         // from `now`: the same session must always map to the same filename,
         // or sync can never be idempotent (it would create a new rollout on
@@ -258,108 +289,141 @@ impl SessionConverter for CodexCliConverter {
             .map_err(|e| format!("failed to create rollout dir: {}", e))?;
 
         let sid = ClaudeCodeConverter::session_uuid(&session.id);
-        let filename = format!("rollout-{}-{}.jsonl", ts_str, sid);
-        let out_path = rollout_dir.join(&filename);
-
-        let mut records = Vec::new();
-        let cwd = session.project_path().unwrap_or_default();
-        let meta_ts = format_timestamp_z(session.started_at);
-
-        // Codex identifies a session by the leading session_meta record; the
-        // real format nests everything under `payload`.
-        records.push(json!({
-            "timestamp": meta_ts,
-            "type": "session_meta",
-            "payload": {
-                "session_id": sid,
-                "id": sid,
-                "timestamp": meta_ts,
-                "cwd": cwd,
-                "originator": "codex-cli",
-                "cli_version": CODEX_CLI_VERSION,
-                "source": "cli",
-                "thread_source": "user",
-            },
-        }));
-
-        // Codex pairs a call with its output by matching call_id, so a
-        // tool result must reuse the id of the call it answers.
-        let mut pending_call_id: Option<String> = None;
-
-        for msg in &session.messages {
-            let ts = format_timestamp_z(msg.timestamp);
-            let payload = match msg.role {
-                Role::User => json!({
-                    "type": "message",
-                    "role": "user",
-                    "content": [{ "type": "input_text", "text": msg.text.clone().unwrap_or_default() }],
-                }),
-                Role::Assistant => {
-                    if let Some(tool) = &msg.tool_name {
-                        let call_id = format!("call_{}", msg.ordinal);
-                        pending_call_id = Some(call_id.clone());
-                        json!({
-                            "type": "function_call",
-                            "name": tool,
-                            "arguments": serde_json::to_string(
-                                &msg.tool_input.clone().unwrap_or(json!({}))
-                            ).unwrap_or_default(),
-                            "call_id": call_id,
-                        })
-                    } else {
-                        json!({
-                            "type": "message",
-                            "role": "assistant",
-                            "content": [{ "type": "output_text", "text": msg.text.clone().unwrap_or_default() }],
-                        })
-                    }
-                }
-                Role::Tool => json!({
-                    "type": "function_call_output",
-                    "call_id": pending_call_id
-                        .take()
-                        .unwrap_or_else(|| format!("call_{}", msg.ordinal)),
-                    "output": tool_result_text(msg.tool_result.as_ref()),
-                }),
-                Role::System => json!({
-                    "type": "message",
-                    "role": "system",
-                    "content": [{ "type": "input_text", "text": msg.text.clone().unwrap_or_default() }],
-                }),
-            };
-
-            records.push(json!({
-                "timestamp": ts,
-                "type": "response_item",
-                "payload": payload,
-            }));
-        }
-
-        // Trailing newline is required, not cosmetic: these files are appended
-        // to by the real tools when a session is continued. Without it the
-        // tool's first new record concatenates onto our last line and corrupts
-        // the session.
-        let mut content: String = records
+        let mut out_paths = Vec::with_capacity(dirs.len());
+        // One user message is echoed as an `event_msg` so Codex's head scan
+        // finds a preview; without it the picker drops the session.
+        let first_user = session
+            .messages
             .iter()
-            .map(|r| serde_json::to_string(r).unwrap_or_default() + "\n")
-            .collect();
-        if content.is_empty() {
-            content.push('\n');
+            .find(|m| m.role == Role::User && m.text.as_deref().is_some_and(|t| !t.is_empty()));
+
+        for cwd in dirs.iter() {
+            // Per-directory variants share the thread id but must not share a
+            // filename: they all land in the same `sessions/<date>/` tree and
+            // the picker reads `session_meta.cwd` from the file itself.
+            let tag = dir_tag(cwd);
+            let filename = format!("rollout-{}-{}-{}.jsonl", ts_str, sid, tag);
+            let out_path = rollout_dir.join(&filename);
+
+            let mut records = Vec::new();
+            let meta_ts = format_timestamp_z(session.started_at);
+
+            // Codex identifies a session by the leading session_meta record; the
+            // real format nests everything under `payload`.
+            records.push(json!({
+                "timestamp": meta_ts,
+                "type": "session_meta",
+                "payload": {
+                    "session_id": sid,
+                    "id": sid,
+                    "timestamp": meta_ts,
+                    "cwd": cwd,
+                    "originator": "codex-cli",
+                    "cli_version": CODEX_CLI_VERSION,
+                    "source": "cli",
+                    "thread_source": "user",
+                },
+            }));
+
+            if let Some(first) = first_user {
+                let ts = format_timestamp_z(first.timestamp);
+                records.push(json!({
+                    "timestamp": ts,
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "user_message",
+                        "message": first.text.clone().unwrap_or_default(),
+                        "images": [],
+                        "local_images": [],
+                        "audio": [],
+                        "local_audio": [],
+                        "text_elements": [],
+                    },
+                }));
+            }
+
+            // Codex pairs a call with its output by matching call_id, so a
+            // tool result must reuse the id of the call it answers.
+            let mut pending_call_id: Option<String> = None;
+
+            for msg in &session.messages {
+                let ts = format_timestamp_z(msg.timestamp);
+                let payload = match msg.role {
+                    Role::User => json!({
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": msg.text.clone().unwrap_or_default() }],
+                    }),
+                    Role::Assistant => {
+                        if let Some(tool) = &msg.tool_name {
+                            let call_id = format!("call_{}", msg.ordinal);
+                            pending_call_id = Some(call_id.clone());
+                            json!({
+                                "type": "function_call",
+                                "name": tool,
+                                "arguments": serde_json::to_string(
+                                    &msg.tool_input.clone().unwrap_or(json!({}))
+                                ).unwrap_or_default(),
+                                "call_id": call_id,
+                            })
+                        } else {
+                            json!({
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [{ "type": "output_text", "text": msg.text.clone().unwrap_or_default() }],
+                            })
+                        }
+                    }
+                    Role::Tool => json!({
+                        "type": "function_call_output",
+                        "call_id": pending_call_id
+                            .take()
+                            .unwrap_or_else(|| format!("call_{}", msg.ordinal)),
+                        "output": tool_result_text(msg.tool_result.as_ref()),
+                    }),
+                    Role::System => json!({
+                        "type": "message",
+                        "role": "system",
+                        "content": [{ "type": "input_text", "text": msg.text.clone().unwrap_or_default() }],
+                    }),
+                };
+
+                records.push(json!({
+                    "timestamp": ts,
+                    "type": "response_item",
+                    "payload": payload,
+                }));
+            }
+
+            // Trailing newline is required, not cosmetic: these files are appended
+            // to by the real tools when a session is continued. Without it the
+            // tool's first new record concatenates onto our last line and corrupts
+            // the session.
+            let mut content: String = records
+                .iter()
+                .map(|r| serde_json::to_string(r).unwrap_or_default() + "\n")
+                .collect();
+            if content.is_empty() {
+                content.push('\n');
+            }
+
+            std::fs::write(&out_path, &content)
+                .map_err(|e| format!("failed to write codex converted session: {}", e))?;
+            out_paths.push(out_path);
         }
 
-        std::fs::write(&out_path, &content)
-            .map_err(|e| format!("failed to write codex converted session: {}", e))?;
-
-        Ok(out_path)
+        Ok(out_paths)
     }
 
     fn resume_cmd(&self, session_path: &Path) -> Vec<String> {
-        // Stem is `rollout-<timestamp>-<uuid>`; the trailing 5 hyphen-separated
-        // groups are the UUID. Taking the whole stem would pass a bogus id.
+        // Stem is `rollout-<timestamp>-<uuid>-<dir tag>`; the 5 hyphen-separated
+        // groups before an optional trailing hex tag are the UUID. Taking the
+        // whole stem would pass a bogus id.
         let stem = session_path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("");
+        let stem = strip_dir_tag(stem);
         let parts: Vec<&str> = stem.split('-').collect();
         let session_id = if parts.len() >= 5 {
             parts[parts.len() - 5..].join("-")
@@ -368,6 +432,29 @@ impl SessionConverter for CodexCliConverter {
         };
         vec!["codex".to_string(), "resume".to_string(), session_id]
     }
+}
+
+/// 8-hex tag derived from the target directory, kept in the rollout filename
+/// so per-directory variants of the same session never collide on disk.
+fn dir_tag(cwd: &str) -> String {
+    uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_URL,
+        format!("agentbridge:cwd:{}", cwd).as_bytes(),
+    )
+    .simple()
+    .to_string()[..8]
+        .to_string()
+}
+
+/// Remove a trailing `-<8 hex>` dir tag from a rollout stem, if present.
+fn strip_dir_tag(stem: &str) -> &str {
+    if stem.len() > 9 {
+        let (base, tail) = stem.split_at(stem.len() - 9);
+        if tail.starts_with('-') && tail[1..].chars().all(|c| c.is_ascii_hexdigit()) {
+            return base;
+        }
+    }
+    stem
 }
 
 pub struct OpenCodeConverter;
@@ -830,10 +917,15 @@ mod tests {
             .convert(&session, tmp.path())
             .expect("conversion should succeed");
 
-        // Date-partitioned path + rollout-<ts>-<uuid> filename.
+        // Date-partitioned path + rollout-<ts>-<uuid>-<dir tag> filename.
         let stem = path.file_stem().unwrap().to_str().unwrap();
         assert!(stem.starts_with("rollout-"), "got {stem}");
-        assert!(stem.ends_with(&session.id), "filename must end with the uuid: {stem}");
+        let tail = &stem[stem.len() - 9..];
+        assert!(tail.starts_with('-'), "filename must carry the dir tag: {stem}");
+        assert!(
+            tail[1..].chars().all(|c| c.is_ascii_hexdigit()),
+            "dir tag must be hex: {stem}"
+        );
         assert!(
             path.parent().unwrap().to_str().unwrap().contains("sessions"),
             "must live under sessions/YYYY/MM/DD"
@@ -849,8 +941,14 @@ mod tests {
         assert_eq!(recs[0]["payload"]["cwd"], "/home/user/test-project");
         assert!(recs[0]["timestamp"].is_string());
 
+        // The first user message is echoed as an event_msg so Codex's head
+        // scan finds a preview; without it the resume picker drops the file.
+        assert_eq!(recs[1]["type"], "event_msg");
+        assert_eq!(recs[1]["payload"]["type"], "user_message");
+        assert_eq!(recs[1]["payload"]["message"], "Hello");
+
         // Turn records are response_item with a payload wrapper.
-        for r in &recs[1..] {
+        for r in &recs[2..] {
             assert_eq!(r["type"], "response_item");
             assert!(r["payload"].is_object(), "payload wrapper is required");
             assert!(r["timestamp"].is_string());
@@ -881,6 +979,57 @@ mod tests {
             .find(|r| r["payload"]["type"] == "function_call_output")
             .expect("a function_call_output");
         assert_eq!(out["payload"]["call_id"], call["payload"]["call_id"]);
+    }
+
+    /// Per-directory materialization: `convert_multi` writes one rollout per
+    /// directory, each with its own cwd in session_meta and a distinct
+    /// filename, so `codex /resume` finds the session from any launch dir.
+    #[test]
+    fn test_codex_convert_multi_writes_one_rollout_per_directory() {
+        let session = test_session();
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = vec![
+            "/home/user/test-project".to_string(),
+            "/home/user".to_string(),
+        ];
+        let paths = CodexCliConverter::new()
+            .convert_multi(&session, tmp.path(), &dirs)
+            .expect("conversion should succeed");
+
+        assert_eq!(paths.len(), 2, "one file per directory");
+        let stems: Vec<String> = paths
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
+            .collect();
+        assert_ne!(stems[0], stems[1], "files must not collide");
+        assert!(
+            stems[0].ends_with("-7305d862.jsonl"),
+            "project dir tag: {}",
+            stems[0]
+        );
+        assert!(
+            stems[1].ends_with("-9e0f0556.jsonl"),
+            "home dir tag: {}",
+            stems[1]
+        );
+
+        for (dir, path) in dirs.iter().zip(&paths) {
+            let recs = records(path);
+            assert_eq!(
+                recs[0]["payload"]["cwd"], dir.as_str(),
+                "session_meta cwd must match the directory"
+            );
+        }
+
+        // Re-running must produce the same filenames (idempotency).
+        let again = CodexCliConverter::new()
+            .convert_multi(&session, tmp.path(), &dirs)
+            .expect("conversion should succeed");
+        let again_stems: Vec<String> = again
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(stems, again_stems, "filenames must be deterministic");
     }
 
     /// `codex resume` takes a bare UUID; the stem is `rollout-<ts>-<uuid>`, so

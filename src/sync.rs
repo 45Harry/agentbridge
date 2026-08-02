@@ -541,6 +541,15 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
                     }),
                     Err(e) => report.errors.push(format!("opencode {}: {}", entry.id, e)),
                 }
+                // OpenCode's picker is scoped to the launch directory, so the
+                // session also gets a row for the home directory (the one
+                // directory a project session is otherwise invisible from).
+                if let Ok(home) = std::env::var("HOME") {
+                    match crate::opencode_write::write_session(&db, &session, &home) {
+                        Ok(_) => {}
+                        Err(e) => report.errors.push(format!("opencode {} (~): {}", entry.id, e)),
+                    }
+                }
                 continue;
             }
 
@@ -548,7 +557,17 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
             let cache = cache_root(target);
             let live = live_root(target).unwrap_or_default();
             let converter = match converter_for(target) { Some(c) => c, None => continue };
-            let artifact = match converter.convert(&session, &cache) {
+            // Codex scopes the resume picker to the rollout's session_meta
+            // cwd, so one file per target directory: the sync project and the
+            // home directory (CONNECTORS.md §2).
+            let mut dirs = vec![session.project_path().unwrap_or_default()];
+            if let Ok(home) = std::env::var("HOME") {
+                let home = home.trim_end_matches('/').to_string();
+                if !dirs.contains(&home) {
+                    dirs.push(home);
+                }
+            }
+            let artifacts = match converter.convert_multi(&session, &cache, &dirs) {
                 Ok(p) => p,
                 Err(e) => {
                     report.errors.push(format!("convert {}: {}", entry.id, e));
@@ -556,50 +575,93 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
                 }
             };
 
-            // Mirror the artifact's layout under the tool's live root.
-            let rel = artifact.strip_prefix(&cache).unwrap_or(&artifact);
-            let dest = live.join(rel);
-
-            if already.iter().any(|(id, d)| id == &entry.id && d == &dest) && dest.exists() {
-                // The artifact was just re-converted and the live copy shares
-                // its inode (hardlink), so the copy *is* refreshed even though
-                // nothing is linked. The manifest count must follow, or the
-                // next pull reads agentbridge's own refresh as tool drift.
-                if let Some(row) = manifest
-                    .iter_mut()
-                    .find(|r| r.session_id == entry.id && r.dest == dest)
+            for (dir, artifact) in dirs.iter().zip(&artifacts) {
+                // A directory whose variant would only duplicate what the
+                // target tool already lists there natively gets none: e.g. a
+                // codex session the user started in $HOME already has its own
+                // rollout file, so our copy would show up twice in /resume.
+                // `codex exec` sessions carry source `exec` and never appear
+                // in the picker, so they still get a variant.
+                if *dir != session.project_path().unwrap_or_default()
+                    && is_codex
+                    && index.entries.iter().any(|e| {
+                        e.provider == entry.provider
+                            && e.id == entry.id
+                            && e.project_path.as_deref() == Some(Path::new(dir.as_str()))
+                            && interactive_source(e.source.as_deref())
+                            && !generated.contains(&e.source_path)
+                    })
                 {
-                    row.message_count = session.messages.len();
-                    manifest_dirty = true;
-                }
-                // A materialized rollout still needs its `threads` row for
-                // `codex /resume`; retry in case the previous run was refused
-                // while Codex was open.
-                if is_codex {
-                    ensure_codex_row(&mut report, &mut codex_backed_up, &session, &dest);
-                }
-                report.unchanged += 1;
-                continue;
-            }
-
-            // Rule 3: presence by hardlink, not copy.
-            match link_or_copy(&artifact, &dest) {
-                Ok(inode) => {
-                    if is_codex {
-                        ensure_codex_row(&mut report, &mut codex_backed_up, &session, &dest);
+                    if let Some(db) = crate::codex_write::state_db()
+                        && crate::codex_write::ensure_safe_to_write().is_ok()
+                    {
+                        let _ = crate::codex_write::remove_thread_rows_for(
+                            &db,
+                            &session,
+                            std::slice::from_ref(dir),
+                        );
                     }
-                    report.created.push(LinkRecord {
-                        dest,
-                        cache: artifact,
-                        session_id: entry.id.clone(),
-                        source_provider: entry.provider.clone(),
-                        target_provider: target.clone(),
-                        project: project.to_path_buf(),
-                        inode,
-                        message_count: session.messages.len(),
-                    });
+                    // A variant materialized before the native-visible check
+                    // existed must not survive next to the tool's own file.
+                    let rel = artifact.strip_prefix(&cache).unwrap_or(artifact);
+                    let stale = live.join(rel);
+                    if stale.exists() {
+                        let _ = fs::remove_file(&stale);
+                    }
+                    if let Some(pos) = manifest
+                        .iter()
+                        .position(|r| r.session_id == entry.id && r.dest == stale)
+                    {
+                        manifest.remove(pos);
+                        manifest_dirty = true;
+                    }
+                    continue;
                 }
-                Err(e) => report.errors.push(format!("link {}: {}", entry.id, e)),
+                // Mirror the artifact's layout under the tool's live root.
+                let rel = artifact.strip_prefix(&cache).unwrap_or(artifact);
+                let dest = live.join(rel);
+
+                if already.iter().any(|(id, d)| id == &entry.id && d == &dest) && dest.exists() {
+                    // The artifact was just re-converted and the live copy shares
+                    // its inode (hardlink), so the copy *is* refreshed even though
+                    // nothing is linked. The manifest count must follow, or the
+                    // next pull reads agentbridge's own refresh as tool drift.
+                    if let Some(row) = manifest
+                        .iter_mut()
+                        .find(|r| r.session_id == entry.id && r.dest == dest)
+                    {
+                        row.message_count = session.messages.len();
+                        manifest_dirty = true;
+                    }
+                    // A materialized rollout still needs its `threads` row for
+                    // `codex /resume`; retry in case the previous run was refused
+                    // while Codex was open.
+                    if is_codex {
+                        ensure_codex_row(&mut report, &mut codex_backed_up, &session, &dest, std::slice::from_ref(dir));
+                    }
+                    report.unchanged += 1;
+                    continue;
+                }
+
+                // Rule 3: presence by hardlink, not copy.
+                match link_or_copy(artifact, &dest) {
+                    Ok(inode) => {
+                        if is_codex {
+                            ensure_codex_row(&mut report, &mut codex_backed_up, &session, &dest, std::slice::from_ref(dir));
+                        }
+                        report.created.push(LinkRecord {
+                            dest,
+                            cache: artifact.clone(),
+                            session_id: entry.id.clone(),
+                            source_provider: entry.provider.clone(),
+                            target_provider: target.clone(),
+                            project: project.to_path_buf(),
+                            inode,
+                            message_count: session.messages.len(),
+                        });
+                    }
+                    Err(e) => report.errors.push(format!("link {}: {}", entry.id, e)),
+                }
             }
         }
     }
@@ -624,6 +686,13 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
     report
 }
 
+/// Sources the Codex resume picker lists (INTERACTIVE_SESSION_SOURCES in the
+/// app-server, verified in codex 0.146 source). `exec` rollouts are indexed
+/// but never listed.
+fn interactive_source(source: Option<&str>) -> bool {
+    matches!(source, Some("cli" | "vscode" | "atlas" | "chatgpt"))
+}
+
 /// Give a materialized Codex rollout its `threads` rows so `codex /resume`
 /// lists it (CONNECTORS.md §2). Guarded and backed up once per run, exactly
 /// like the OpenCode path. Silently skipped when Codex has never run here
@@ -633,6 +702,7 @@ fn ensure_codex_row(
     backed_up: &mut bool,
     session: &crate::model::Session,
     rollout_path: &Path,
+    dirs: &[String],
 ) {
     let Some(db) = crate::codex_write::state_db() else {
         return;
@@ -650,14 +720,7 @@ fn ensure_codex_row(
             }
         }
     }
-    // The picker filters `threads.cwd` by the exact launch directory, so a
-    // session needs one row per directory it should appear in: the sync
-    // project and the home directory.
-    let mut dirs = vec![session.project_path().unwrap_or_default()];
-    if let Ok(home) = std::env::var("HOME") {
-        dirs.push(home);
-    }
-    match crate::codex_write::ensure_thread_rows(&db, session, rollout_path, &dirs) {
+    match crate::codex_write::ensure_thread_rows(&db, session, rollout_path, dirs) {
         Ok(r) => report.codex_indexed += r.inserted,
         Err(e) => report.errors.push(e.to_string()),
     }

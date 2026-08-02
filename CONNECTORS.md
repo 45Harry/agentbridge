@@ -109,22 +109,34 @@ created from the files already present). There is no discovery route: the
 `threads` row that *does* exist for a synced rollout was created by Codex
 itself the one time that session was actually opened.
 
-**Picker visibility is cwd-scoped, verified in codex 0.146 source**
-(`codex-rs/tui/src/resume_picker.rs`, `codex-rs/state/src/runtime/threads.rs`,
-`codex-rs/app-server/src/filters.rs`): the picker filters `threads.cwd`
-against the launch directory with an **exact path match** (`threads.cwd IN
-(…)` after canonicalization). `tui.resume_cwd = "session"` only changes the
-working directory a resumed session runs in — it does *not* affect the list;
-`resume_show_all` is an internal flag (not a CLI/config option); the picker's
-`Filter: [Cwd] All` toggle does show everything but is **not persisted**.
-The list does not exclude `thread_source` values: agentbridge-tagged rows
-(`Feature` sources) list fine alongside `user` rows.
+**Picker visibility is directory-scoped, and it is the *file* that scopes it —
+verified again in codex 0.146 source** (`codex-rs/tui/src/resume_picker.rs`,
+`codex-rs/thread-store/src/local/list_threads.rs`, `codex-rs/rollout/src/recorder.rs`):
+the resume picker loads its initial page with `PageLoadMode::StoreDefault`
+(`use_state_db_only = false`), so the app-server's `LocalThreadStore` lists
+**rollout files from `~/.codex/sessions/`** — each candidate must carry a
+`session_meta` whose `cwd` matches the launch directory (exact match after
+normalization, `paths_match_after_normalization`) and whose `source` is in
+`INTERACTIVE_SESSION_SOURCES` (`cli`, `vscode`, `atlas`, `chatgpt` — an `exec`
+rollout is indexed but never listed), and the head scan (`HEAD_RECORD_LIMIT =
+10`) must find a preview (`event_msg` of type `user_message`). The `threads`
+table is a *side effect*: filesystem hits are read-repaired into it, and it is
+only authoritative for the `StateDbOnly` (archive) paths. `tui.resume_cwd =
+"session"` only changes the working directory a resumed session runs in — it
+does *not* affect the list; `resume_show_all` is an internal flag (not a
+CLI/config option); the picker's `Filter: [Cwd] All` toggle does show
+everything but is **not persisted**.
 
-The writer shipped in `src/codex_write.rs` — one `threads` row **per
-directory** (`session_uuid_for_dir`), defaulting to the sync project and
-`$HOME`, so a session shows up in `codex /resume` from either. Same gates as
-OpenCode: database backed up before the first write of a run, every inserted
-row tagged `thread_source = 'agentbridge'` (real rows use `'user'`,
+The writer shipped in `src/codex_write.rs` therefore materializes **one
+rollout file per directory** (`convert_multi`, defaulting to the sync project
+and `$HOME`; filenames carry a per-directory tag `rollout-<ts>-<id>-<tag>`)
+with that directory in `session_meta.cwd` and a preview `event_msg` after the
+leading `session_meta`, and keeps one `threads` row per `(rollout, directory)`
+(`session_uuid_for_dir`). A session the tool already lists natively in a
+directory gets no variant there (checked via the index's `source` field — a
+`codex exec` session stays invisible natively and still gets one). Same gates
+as OpenCode: database backed up before the first write of a run, every
+inserted row tagged `thread_source = 'agentbridge'` (real rows use `'user'`,
 verified), writes refused while Codex is running, `unsync` removes only
 tagged rows. Rows for directories no longer in the set are deleted on
 re-sync; a genuine Codex row is never duplicated in its own directory (and

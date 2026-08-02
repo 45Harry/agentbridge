@@ -259,6 +259,7 @@ fn scan_file(path: &Path) -> ConnectorResult<Option<RawSession>> {
         started_at: timestamp,
         last_event_at: timestamp,
         title,
+        source: None,
         source_path: path.to_path_buf(),
         body_available: true,
     }))
