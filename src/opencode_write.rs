@@ -15,6 +15,18 @@
 //!
 //! Deleting a tagged session cascades to its messages and parts through the
 //! schema's existing `ON DELETE CASCADE` foreign keys.
+//!
+//! OpenCode's picker lists only sessions of the project it is launched from
+//! (project-scoped query plus an optional launch-directory filter). One row
+//! can therefore only ever be visible from one directory, so every synced
+//! session is materialized once **per target directory** — the sync project,
+//! `$HOME`, and every known project worktree — each with its own id derived
+//! from `(provider, source id, directory)`. Rows for a project worktree show
+//! up from any directory inside that worktree; rows for the `global` project
+//! show up from any non-git directory. The launch-directory filter
+//! (`session_directory_filter_enabled`) is additionally disabled by
+//! [`ensure_any_directory_filter`] so subdirectories and arbitrary non-git
+//! directories list the sessions too.
 
 use crate::model::{Role, Session};
 use rusqlite::{params, Connection};
@@ -96,9 +108,22 @@ pub fn backup(db: &Path) -> Result<PathBuf, WriteError> {
     Ok(dest)
 }
 
-/// Deterministic OpenCode-shaped id for a foreign session, so re-running is
-/// idempotent rather than inserting a duplicate every time.
-pub fn derive_id(source_provider: &str, source_id: &str) -> String {
+/// Deterministic OpenCode-shaped id for a foreign session materialized into
+/// `directory`, so re-running is idempotent rather than inserting a duplicate
+/// every time, and so the per-directory rows never collide on the primary key.
+pub fn derive_id(source_provider: &str, source_id: &str, directory: &str) -> String {
+    let ns = uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_URL,
+        format!("{}:{}:{}", source_provider, source_id, directory).as_bytes(),
+    );
+    format!("ses_ab{}", ns.simple())
+}
+
+/// The id scheme used before per-directory materialization (v0.3.3 and
+/// earlier: one row per session, keyed on `provider:source_id` alone). Those
+/// rows must be migrated away — left in place, a legacy row would duplicate
+/// the new per-directory row in the same project.
+fn legacy_id(source_provider: &str, source_id: &str) -> String {
     let ns = uuid::Uuid::new_v5(
         &uuid::Uuid::NAMESPACE_URL,
         format!("{}:{}", source_provider, source_id).as_bytes(),
@@ -122,6 +147,99 @@ pub fn session_row_exists(db: &Path, id: &str, directory: &str) -> Result<bool, 
         .is_ok())
 }
 
+/// The `session_directory_filter_enabled` key OpenCode's session list reads
+/// (default `true`): when set, the picker only lists sessions whose directory
+/// matches the launch directory, which would hide worktree-root rows from
+/// subdirectories and `global` rows from every non-git directory.
+pub const DIRECTORY_FILTER_KEY: &str = "session_directory_filter_enabled";
+
+/// The OpenCode config directory (`$XDG_CONFIG_HOME/opencode`, or
+/// `~/.config/opencode`).
+fn config_dir() -> PathBuf {
+    std::env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::var("HOME")
+                .map(|h| PathBuf::from(h).join(".config"))
+                .unwrap_or_default()
+        })
+        .join("opencode")
+}
+
+/// Every directory a synced session must be visible from: the sync project,
+/// `$HOME` (the `global` project, covering every non-git directory), and each
+/// project worktree OpenCode already knows about. Duplicates collapse.
+pub fn target_dirs(
+    db: &Path,
+    project_dir: &str,
+    home: Option<&str>,
+) -> Result<Vec<String>, WriteError> {
+    let mut dirs: Vec<String> = Vec::new();
+    let mut push = |d: &str| {
+        let d = d.trim_end_matches('/').to_string();
+        if !d.is_empty() && d != "/" && !dirs.contains(&d) {
+            dirs.push(d);
+        }
+    };
+    push(project_dir);
+    if let Some(h) = home {
+        push(h);
+    }
+    let conn = Connection::open(db).map_err(|e| WriteError::Sql(e.to_string()))?;
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT worktree FROM project WHERE worktree IS NOT NULL AND worktree != ''")
+        .map_err(|e| WriteError::Sql(e.to_string()))?;
+    let rows = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .map_err(|e| WriteError::Sql(e.to_string()))?;
+    for row in rows {
+        push(&row.map_err(|e| WriteError::Sql(e.to_string()))?);
+    }
+    Ok(dirs)
+}
+
+/// Make the picker list sessions from every directory: writes
+/// `session_directory_filter_enabled: false` into the OpenCode config when no
+/// existing config file already sets the key (a user or TUI choice is left
+/// alone). The file OpenCode is already loading is preferred; a fresh
+/// `opencode.json` is created otherwise. Returns the file written. Callers
+/// gate on [`ensure_safe_to_write`] before invoking.
+pub fn ensure_any_directory_filter() -> Result<PathBuf, WriteError> {
+    let dir = config_dir();
+    let json = dir.join("opencode.json");
+    let jsonc = dir.join("opencode.jsonc");
+    for existing in [&json, &jsonc] {
+        if existing.exists()
+            && let Ok(txt) = std::fs::read_to_string(existing)
+            && txt.contains(DIRECTORY_FILTER_KEY)
+        {
+            return Ok(existing.clone());
+        }
+    }
+    if jsonc.exists() {
+        let txt = std::fs::read_to_string(&jsonc).map_err(|e| WriteError::Sql(e.to_string()))?;
+        let mut value: serde_json::Value =
+            serde_json::from_str(&txt).map_err(|e| WriteError::Sql(e.to_string()))?;
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert(DIRECTORY_FILTER_KEY.to_string(), serde_json::Value::Bool(false));
+        }
+        let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S");
+        std::fs::copy(
+            &jsonc,
+            jsonc.with_extension(format!("agentbridge-backup-{}.jsonc", stamp)),
+        )
+        .map_err(|e| WriteError::Backup(e.to_string()))?;
+        std::fs::write(&jsonc, serde_json::to_string_pretty(&value).map_err(|e| WriteError::Sql(e.to_string()))?)
+            .map_err(|e| WriteError::Sql(e.to_string()))?;
+        Ok(jsonc)
+    } else {
+        std::fs::create_dir_all(&dir).map_err(|e| WriteError::Sql(e.to_string()))?;
+        let body = format!("{{\n  \"{DIRECTORY_FILTER_KEY}\": false\n}}\n");
+        std::fs::write(&json, body).map_err(|e| WriteError::Sql(e.to_string()))?;
+        Ok(json)
+    }
+}
+
 fn slug_of(title: &str) -> String {
     let s: String = title
         .to_lowercase()
@@ -139,7 +257,7 @@ fn slug_of(title: &str) -> String {
 /// The statements that would materialize `session` into `directory`.
 /// Rendered for `--dry-run`; the executed path uses bound parameters.
 pub fn plan(session: &Session, directory: &str) -> Vec<String> {
-    let id = derive_id(&session.provider, &session.id);
+    let id = derive_id(&session.provider, &session.id, directory);
     let mut out = vec![format!(
         "INSERT OR REPLACE INTO session (id, project_id, slug, directory, title, version, \
          time_created, time_updated, metadata) VALUES ('{}', '{}', '{}', '{}', '{}', '{}', …, \
@@ -169,7 +287,7 @@ pub fn write_session(
     let mut conn = Connection::open(db).map_err(|e| WriteError::Sql(e.to_string()))?;
     let tx = conn.transaction().map_err(|e| WriteError::Sql(e.to_string()))?;
 
-    let id = derive_id(&session.provider, &session.id);
+    let id = derive_id(&session.provider, &session.id, directory);
     let created = session.started_at.map(|t| t.timestamp_millis()).unwrap_or(0);
     let updated = session
         .last_event_at
@@ -215,13 +333,26 @@ pub fn write_session(
     )
     .map_err(|e| WriteError::Sql(e.to_string()))?;
 
+    // Migrate pre-v0.3.4 rows: one row per session keyed on
+    // `provider:source_id` alone. Left in place, such a row duplicates this
+    // session's per-directory row in the same project's picker, so once the
+    // new rows exist the old one is removed (cascade drops its messages).
+    let legacy = legacy_id(&session.provider, &session.id);
+    if legacy != id {
+        tx.execute(
+            "DELETE FROM session WHERE id = ?1 AND metadata LIKE ?2",
+            params![legacy, format!("%{}%", MARKER)],
+        )
+        .map_err(|e| WriteError::Sql(e.to_string()))?;
+    }
+
     // OpenCode's message ids encode a time-ordered counter and its session
     // loop picks the "latest" message by comparing id strings. Foreign ids
     // must sort below anything OpenCode generates (`msg_f…`), so the
     // `msg_0` prefix is what keeps continuation working.
     let ns = uuid::Uuid::new_v5(
         &uuid::Uuid::NAMESPACE_URL,
-        format!("{}:{}", session.provider, session.id).as_bytes(),
+        format!("{}:{}:{}", session.provider, session.id, directory).as_bytes(),
     );
     let id_hex: String = ns.simple().to_string();
 
@@ -535,10 +666,140 @@ mod tests {
 
     #[test]
     fn test_derive_id_is_deterministic_and_shaped_like_opencodes() {
-        let a = derive_id("claude-code", "abc");
-        assert_eq!(a, derive_id("claude-code", "abc"));
-        assert_ne!(a, derive_id("codex-cli", "abc"));
+        let a = derive_id("claude-code", "abc", "/p");
+        assert_eq!(a, derive_id("claude-code", "abc", "/p"));
+        assert_ne!(a, derive_id("codex-cli", "abc", "/p"));
+        assert_ne!(a, derive_id("claude-code", "abc", "/other"));
         assert!(a.starts_with("ses_ab"));
+    }
+
+    /// The same session must be materializable into several directories at
+    /// once — the whole point of "visible from any directory" — without
+    /// colliding on the primary key.
+    #[test]
+    fn test_write_session_can_materialize_into_multiple_directories() {
+        let (_t, db) = db_with_schema();
+        write_session(&db, &a_session(), "/home/u/p").unwrap();
+        write_session(&db, &a_session(), "/home/u").unwrap();
+        write_session(&db, &a_session(), "/home/u/other").unwrap();
+
+        assert_eq!(count_written(&db), 3, "one row per directory");
+        let conn = Connection::open(&db).unwrap();
+        for dir in ["/home/u/p", "/home/u", "/home/u/other"] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM session WHERE directory=?1 AND metadata LIKE ?2",
+                    params![dir, format!("%{}%", MARKER)],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "exactly one row for {}", dir);
+        }
+    }
+
+    /// Pre-v0.3.4 syncs wrote one row per session keyed on
+    /// `provider:source_id` alone; a refresh must migrate those away or the
+    /// same session would appear twice in one project's picker.
+    #[test]
+    fn test_write_migrates_legacy_single_directory_row() {
+        let (_t, db) = db_with_schema();
+        let conn = Connection::open(&db).unwrap();
+        let legacy = legacy_id("claude-code", "7a65dbea-9780-46be-b7b4-a5e5e948abbf");
+        conn.execute(
+            "INSERT INTO session (id, project_id, slug, directory, title, version, \
+             time_created, time_updated, metadata) VALUES (?1,'global','old','/home/u/p',\
+             'Old','1.17.15',1,2,?2)",
+            params![
+                legacy,
+                format!("{{\"{}\":true,\"source_provider\":\"claude-code\",\"source_id\":\"7a65dbea-9780-46be-b7b4-a5e5e948abbf\"}}", MARKER)
+            ],
+        )
+        .unwrap();
+
+        write_session(&db, &a_session(), "/home/u/p").unwrap();
+        assert_eq!(
+            count_written(&db),
+            1,
+            "legacy row must be replaced by the per-directory row"
+        );
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session WHERE id=?1",
+                params![legacy],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    /// `target_dirs` covers the project, $HOME, and every known worktree,
+    /// collapsing duplicates.
+    #[test]
+    fn test_target_dirs_covers_project_home_and_worktrees() {
+        let (_t, db) = db_with_schema();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            r#"
+            INSERT INTO project VALUES ('p1','/work/one',0,0,'[]');
+            INSERT INTO project VALUES ('p2','/work/one',0,0,'[]');
+            INSERT INTO project VALUES ('p3','/',0,0,'[]');
+            INSERT INTO project VALUES ('p4','',0,0,'[]');
+            "#,
+        )
+        .unwrap();
+
+        let dirs = target_dirs(&db, "/work/one", Some("/home/u")).unwrap();
+        assert_eq!(
+            dirs,
+            vec!["/work/one", "/home/u"],
+            "worktree dedup collapses and '/' is skipped"
+        );
+        let dirs = target_dirs(&db, "/fresh/project", Some("/home/u")).unwrap();
+        assert_eq!(
+            dirs,
+            vec!["/fresh/project", "/home/u", "/work/one"],
+            "sync project first, then home, then worktrees"
+        );
+    }
+
+    /// The any-directory config write is one-shot: an existing key (user or
+    /// TUI choice) is respected and never overwritten.
+    #[test]
+    fn test_ensure_any_directory_filter_respects_existing_choice() {
+        let prev = std::env::var("XDG_CONFIG_HOME").ok();
+        let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: test-only env mutation, restored before returning.
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+        }
+        let result = std::panic::catch_unwind(|| {
+            std::fs::create_dir_all(tmp.path().join("opencode")).unwrap();
+            let jsonc = tmp.path().join("opencode").join("opencode.jsonc");
+            std::fs::write(&jsonc, "{ \"session_directory_filter_enabled\": true }").unwrap();
+
+            let written = ensure_any_directory_filter().unwrap();
+            assert_eq!(written, jsonc);
+            let txt = std::fs::read_to_string(&jsonc).unwrap();
+            assert!(txt.contains("\"session_directory_filter_enabled\": true"));
+
+            // A config dir without any config gets a fresh opencode.json.
+            let tmp2 = tempfile::tempdir().unwrap();
+            // SAFETY: test-only env mutation.
+            unsafe {
+                std::env::set_var("XDG_CONFIG_HOME", tmp2.path());
+            }
+            let written = ensure_any_directory_filter().unwrap();
+            let txt = std::fs::read_to_string(&written).unwrap();
+            assert!(txt.contains("\"session_directory_filter_enabled\": false"));
+        });
+        // SAFETY: restoring the caller's environment.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+        assert!(result.is_ok());
     }
 
     #[test]

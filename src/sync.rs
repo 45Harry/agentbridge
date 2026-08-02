@@ -394,6 +394,7 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
 
     // Back up OpenCode's database once per run, before any INSERT.
     let mut opencode_backed_up = false;
+    let mut opencode_any_dir_mode = false;
     // Same for Codex's index (`state_5.sqlite`).
     let mut codex_backed_up = false;
 
@@ -513,25 +514,44 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
                     report.errors.push(e.to_string());
                     continue;
                 }
+                // OpenCode's picker is scoped to the launch directory: one row
+                // per directory it should surface in. The project directory,
+                // $HOME (the `global` project, covering every non-git
+                // directory), and every known project worktree.
+                let home = std::env::var("HOME")
+                    .ok()
+                    .map(|h| h.trim_end_matches('/').to_string());
+                let dirs = match crate::opencode_write::target_dirs(
+                    &db,
+                    &project.to_string_lossy(),
+                    home.as_deref(),
+                ) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        report.errors.push(e.to_string());
+                        continue;
+                    }
+                };
+                // Disable the launch-directory filter so the rows surface
+                // from subdirectories and arbitrary non-git directories too.
+                if !opencode_any_dir_mode {
+                    match crate::opencode_write::ensure_any_directory_filter() {
+                        Ok(_) => opencode_any_dir_mode = true,
+                        Err(e) => report.errors.push(e.to_string()),
+                    }
+                }
                 if !opencode_backed_up {
-                    let id = crate::opencode_write::derive_id(&session.provider, &entry.id);
-                    let project_dir = project.to_string_lossy();
-                    let home = std::env::var("HOME")
-                        .ok()
-                        .map(|h| h.trim_end_matches('/').to_string());
                     // A run that would only refresh rows agentbridge already
                     // wrote needs no backup; one that inserts a new row does.
-                    let will_insert = crate::opencode_write::session_row_exists(&db, &id, &project_dir)
+                    let will_insert = dirs.iter().any(|d| {
+                        crate::opencode_write::session_row_exists(
+                            &db,
+                            &crate::opencode_write::derive_id(&session.provider, &entry.id, d),
+                            d,
+                        )
                         .map(|e| !e)
                         .unwrap_or(true)
-                        || home
-                            .as_deref()
-                            .map(|h| {
-                                crate::opencode_write::session_row_exists(&db, &id, h)
-                                    .map(|e| !e)
-                                    .unwrap_or(true)
-                            })
-                            .unwrap_or(false);
+                    });
                     if will_insert {
                         match crate::opencode_write::backup(&db) {
                             Ok(_) => opencode_backed_up = true,
@@ -542,32 +562,30 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
                         }
                     }
                 }
-                match crate::opencode_write::write_session(
-                    &db,
-                    &session,
-                    &project.to_string_lossy(),
-                ) {
-                    Ok((new_id, written)) => report.created.push(LinkRecord {
-                        dest: db.clone(),
-                        cache: PathBuf::from(new_id),
-                        session_id: entry.id.clone(),
-                        source_provider: entry.provider.clone(),
-                        target_provider: target.clone(),
-                        project: project.to_path_buf(),
-                        inode: 0,
-                        // True row count, not session.messages.len(): a
-                        // placeholder turn may have been inserted.
-                        message_count: written,
-                    }),
-                    Err(e) => report.errors.push(format!("opencode {}: {}", entry.id, e)),
-                }
-                // OpenCode's picker is scoped to the launch directory, so the
-                // session also gets a row for the home directory (the one
-                // directory a project session is otherwise invisible from).
-                if let Ok(home) = std::env::var("HOME") {
-                    match crate::opencode_write::write_session(&db, &session, &home) {
-                        Ok(_) => {}
-                        Err(e) => report.errors.push(format!("opencode {} (~): {}", entry.id, e)),
+                let mut reported = false;
+                for dir in &dirs {
+                    match crate::opencode_write::write_session(&db, &session, dir) {
+                        Ok((new_id, written)) => {
+                            if !reported {
+                                reported = true;
+                                report.created.push(LinkRecord {
+                                    dest: db.clone(),
+                                    cache: PathBuf::from(new_id),
+                                    session_id: entry.id.clone(),
+                                    source_provider: entry.provider.clone(),
+                                    target_provider: target.clone(),
+                                    project: project.to_path_buf(),
+                                    inode: 0,
+                                    // True row count, not session.messages.len():
+                                    // a placeholder turn may have been inserted.
+                                    message_count: written,
+                                });
+                            }
+                        }
+                        Err(e) => report.errors.push(format!(
+                            "opencode {} ({}): {}",
+                            entry.id, dir, e
+                        )),
                     }
                 }
                 continue;
