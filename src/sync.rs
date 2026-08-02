@@ -514,11 +514,31 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
                     continue;
                 }
                 if !opencode_backed_up {
-                    match crate::opencode_write::backup(&db) {
-                        Ok(_) => opencode_backed_up = true,
-                        Err(e) => {
-                            report.errors.push(e.to_string());
-                            continue;
+                    let id = crate::opencode_write::derive_id(&session.provider, &entry.id);
+                    let project_dir = project.to_string_lossy();
+                    let home = std::env::var("HOME")
+                        .ok()
+                        .map(|h| h.trim_end_matches('/').to_string());
+                    // A run that would only refresh rows agentbridge already
+                    // wrote needs no backup; one that inserts a new row does.
+                    let will_insert = crate::opencode_write::session_row_exists(&db, &id, &project_dir)
+                        .map(|e| !e)
+                        .unwrap_or(true)
+                        || home
+                            .as_deref()
+                            .map(|h| {
+                                crate::opencode_write::session_row_exists(&db, &id, h)
+                                    .map(|e| !e)
+                                    .unwrap_or(true)
+                            })
+                            .unwrap_or(false);
+                    if will_insert {
+                        match crate::opencode_write::backup(&db) {
+                            Ok(_) => opencode_backed_up = true,
+                            Err(e) => {
+                                report.errors.push(e.to_string());
+                                continue;
+                            }
                         }
                     }
                 }
@@ -712,11 +732,21 @@ fn ensure_codex_row(
         return;
     }
     if !*backed_up {
-        match crate::codex_write::backup(&db) {
-            Ok(_) => *backed_up = true,
-            Err(e) => {
-                report.errors.push(e.to_string());
-                return;
+        // Refreshing rows agentbridge already wrote is idempotent; only an
+        // INSERT of a new row justifies the one-per-run database backup.
+        let will_insert = dirs.iter().any(|d| {
+            let sid = crate::codex_write::session_uuid_for_dir(&session.id, d);
+            crate::codex_write::thread_row_exists(&db, &sid)
+                .map(|e| !e)
+                .unwrap_or(true)
+        });
+        if will_insert {
+            match crate::codex_write::backup(&db) {
+                Ok(_) => *backed_up = true,
+                Err(e) => {
+                    report.errors.push(e.to_string());
+                    return;
+                }
             }
         }
     }

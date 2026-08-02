@@ -462,7 +462,16 @@ fn cmd_resume(
                         match agentbridge::codex_write::ensure_safe_to_write() {
                             Err(e) => eprintln!("  ! {}", e),
                             Ok(()) => {
-                                let _ = agentbridge::codex_write::backup(&db);
+                                let will_insert = dirs.iter().any(|d| {
+                                    let sid =
+                                        agentbridge::codex_write::session_uuid_for_dir(&session.id, d);
+                                    agentbridge::codex_write::thread_row_exists(&db, &sid)
+                                        .map(|e| !e)
+                                        .unwrap_or(true)
+                                });
+                                if will_insert {
+                                    let _ = agentbridge::codex_write::backup(&db);
+                                }
                                 let mut inserted = 0usize;
                                 for (dir, path) in dirs.iter().zip(&written) {
                                     if let Ok(r) = agentbridge::codex_write::ensure_thread_rows(
@@ -494,11 +503,17 @@ fn cmd_resume(
             match agentbridge::opencode_write::ensure_safe_to_write() {
                 Err(e) => Err(e.to_string()),
                 Ok(()) => {
-                    let backed = agentbridge::opencode_write::backup(&db);
-                    if let Err(e) = backed {
+                    let dir = session.project_path().unwrap_or_default();
+                    let id = agentbridge::opencode_write::derive_id(&session.provider, &session.id);
+                    // The row is already ours: the write below only refreshes
+                    // it, which needs no backup. A new row gets one first.
+                    let exists = agentbridge::opencode_write::session_row_exists(&db, &id, &dir)
+                        .unwrap_or(false);
+                    if !exists
+                        && let Err(e) = agentbridge::opencode_write::backup(&db)
+                    {
                         Err(format!("opencode backup failed: {}", e))
                     } else {
-                        let dir = session.project_path().unwrap_or_default();
                         match agentbridge::opencode_write::write_session(&db, &session, &dir) {
                             Ok((id, _)) => Ok(PathBuf::from(id)),
                             Err(e) => Err(e.to_string()),

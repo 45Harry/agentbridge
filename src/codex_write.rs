@@ -1,22 +1,24 @@
 //! Materializing sessions **into** Codex CLI's index (`state_5.sqlite`).
 //!
-//! Codex lists sessions in `/resume` from the `threads` table, not by
-//! scanning `~/.codex/sessions/` (CONNECTORS.md §2). Its disk backfill is a
-//! one-time migration — `backfill_state` = 'complete' on the operator's
-//! machine, verified 2026-08-01 — so a rollout dropped into `sessions/` is
-//! never discovered. Picker presence therefore means `INSERT` into `threads`,
-//! the same treatment OpenCode's database gets (`opencode_write.rs`), with
-//! the same gates:
+//! The resume picker in codex 0.146 lists rollout **files** from
+//! `~/.codex/sessions/` whose `session_meta.cwd` matches the launch
+//! directory (verified in source: `thread-store/src/local/list_threads.rs`,
+//! `rollout/src/recorder.rs`); `threads` is a side effect read-repaired from
+//! those files. The files are materialized by `convert.rs` (`convert_multi`,
+//! one rollout per directory); what lives here is the `threads` rows that
+//! follow those files, written with the same gates OpenCode's database gets:
 //!
-//! 1. The database is backed up before the first write of a run.
+//! 1. The database is backed up before the first write of a run that
+//!    actually inserts something new — idempotent refreshes of rows
+//!    agentbridge itself wrote take no backup.
 //! 2. Every inserted row is tagged in the `thread_source` column (real rows
 //!    use "user"), so removal can target exactly agentbridge's rows.
 //! 3. Writing is refused while Codex is running.
 //! 4. `--dry-run` renders the statement without executing it.
 //!
-//! Inserts are keyed on `id` — the deterministic UUID v5 of the source
-//! session, shared with the rollout filename — so a row that already exists
-//! (a genuine Codex session, or a previous run of ours) is never touched.
+//! Rows are keyed on `id` — the deterministic UUID v5 of the source session
+//! and directory (`session_uuid_for_dir`) — so a row that already exists (a
+//! genuine Codex session, or a previous run of ours) is never duplicated.
 
 use crate::convert::CODEX_CLI_VERSION;
 use crate::model::{Role, Session};
@@ -89,6 +91,22 @@ pub fn backup(db: &Path) -> Result<PathBuf, WriteError> {
     let dest = db.with_extension(format!("agentbridge-backup-{}.db", stamp));
     std::fs::copy(db, &dest).map_err(|e| WriteError::Backup(e.to_string()))?;
     Ok(dest)
+}
+
+/// Whether agentbridge already owns a `threads` row for this id. A re-sync
+/// that would only refresh our own rows (idempotent upserts of data
+/// agentbridge wrote) does not need a database backup; an INSERT of a new
+/// row does. Used by the sync loop to decide whether to take the one-per-run
+/// backup.
+pub fn thread_row_exists(db: &Path, sid: &str) -> Result<bool, WriteError> {
+    let conn = Connection::open(db).map_err(|e| WriteError::Sql(e.to_string()))?;
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM threads WHERE id = ?1 AND thread_source = ?2 LIMIT 1",
+            params![sid, MARKER],
+            |_| Ok(()),
+        )
+        .is_ok())
 }
 
 /// The `sandbox_policy` value Codex writes for a session rooted at `cwd`:
@@ -644,6 +662,17 @@ mod tests {
         let conn = Connection::open(&b).unwrap();
         let n: usize = conn.query_row("SELECT COUNT(*) FROM threads", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn test_thread_row_exists_sees_only_our_rows() {
+        let (_tmp, db) = db_with_schema();
+        let s = a_session();
+        let dirs = vec!["/home/harry/work".to_string()];
+        ensure_thread_rows(&db, &s, Path::new("/ours.jsonl"), &dirs).unwrap();
+        let sid = session_uuid_for_dir(&s.id, "/home/harry/work");
+        assert!(thread_row_exists(&db, &sid).unwrap());
+        assert!(!thread_row_exists(&db, "missing-id").unwrap());
     }
 
     #[test]

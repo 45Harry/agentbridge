@@ -5,7 +5,9 @@
 //! This is the only place agentbridge writes into another tool's real data,
 //! so every operation here is gated (`DESIGN.md` §5):
 //!
-//! 1. The database is backed up before the first write of a run.
+//! 1. The database is backed up before the first write of a run that
+//!    actually inserts something new — idempotent refreshes of rows
+//!    agentbridge itself wrote take no backup.
 //! 2. Every inserted row is tagged in the unused `metadata` column, so
 //!    removal can target exactly agentbridge's rows and nothing else.
 //! 3. Writing is refused while OpenCode is running.
@@ -102,6 +104,22 @@ pub fn derive_id(source_provider: &str, source_id: &str) -> String {
         format!("{}:{}", source_provider, source_id).as_bytes(),
     );
     format!("ses_ab{}", ns.simple())
+}
+
+/// Whether agentbridge already owns the row for `id` in `directory`. A
+/// re-sync that would only refresh our own rows (idempotent delete-then-
+/// reinsert of data agentbridge wrote) does not need a database backup; an
+/// INSERT of a new row does. Used by the sync loop to decide whether to take
+/// the one-per-run backup.
+pub fn session_row_exists(db: &Path, id: &str, directory: &str) -> Result<bool, WriteError> {
+    let conn = Connection::open(db).map_err(|e| WriteError::Sql(e.to_string()))?;
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM session WHERE id = ?1 AND directory = ?2 AND metadata LIKE ?3 LIMIT 1",
+            params![id, directory, format!("%{}%", MARKER)],
+            |_| Ok(()),
+        )
+        .is_ok())
 }
 
 fn slug_of(title: &str) -> String {
@@ -532,6 +550,26 @@ mod tests {
             std::fs::metadata(&b).unwrap().len(),
             std::fs::metadata(&db).unwrap().len()
         );
+    }
+
+    #[test]
+    fn test_session_row_exists_sees_only_our_rows() {
+        let (_t, db) = db_with_schema();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute(
+            "INSERT INTO session (id, project_id, slug, directory, title, version, \
+             time_created, time_updated, metadata) \
+             VALUES ('ses_own','global','own','/p','own','1.17.15',0,0,?1)",
+            params![format!("{{\"{}\":true}}", MARKER)],
+        )
+        .unwrap();
+        assert!(session_row_exists(&db, "ses_own", "/p").unwrap());
+        assert!(!session_row_exists(&db, "ses_own", "/other").unwrap());
+        assert!(
+            !session_row_exists(&db, "ses_real", "/home/u/p").unwrap(),
+            "OpenCode's own row carries no marker"
+        );
+        assert!(!session_row_exists(&db, "ses_missing", "/p").unwrap());
     }
 
     #[test]
