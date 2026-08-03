@@ -504,11 +504,13 @@ fn cmd_resume(
                 Err(e) => Err(e.to_string()),
                 Ok(()) => {
                     let dir = session.project_path().unwrap_or_default();
-                    let id = agentbridge::opencode_write::derive_id(&session.provider, &session.id);
                     // The row is already ours: the write below only refreshes
                     // it, which needs no backup. A new row gets one first.
-                    let exists = agentbridge::opencode_write::session_row_exists(&db, &id, &dir)
-                        .unwrap_or(false);
+                    let exists = !agentbridge::opencode_write::will_insert(
+                        &db,
+                        &session,
+                        std::slice::from_ref(&dir),
+                    );
                     if !exists
                         && let Err(e) = agentbridge::opencode_write::backup(&db)
                     {

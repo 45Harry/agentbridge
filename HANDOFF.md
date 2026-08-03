@@ -4,18 +4,18 @@ Pick this project up cold — new machine, new session, no memory of prior
 conversation. Read this, then `DESIGN.md` (architecture and why), then
 `CONNECTORS.md` (each tool's on-disk format).
 
-**Last updated:** 2026-08-01.
+**Last updated:** 2026-08-03.
 
 ## 0. Start here
 
 ```bash
 git clone git@github.com:45Harry/agentbridge.git
 cd agentbridge
-cargo build && cargo test      # 63 tests pass (+2 ignored: live-verification suites)
+cargo build && cargo test      # 78 tests pass (+2 ignored: live-verification suites)
 cargo run -- init              # read-only: what's on this machine
 ```
 
-Requires Rust edition 2024. Binary version is 0.2.0.
+Requires Rust edition 2024. Binary version is 0.3.3.
 
 ## 1. What this is
 
@@ -68,6 +68,54 @@ one tool are pulled into the overlay and republished. See DECISIONS.md
 - `start`/`inject` (cross-tool brief injection) exist; the brief builder is
   unit-tested, live-agent launch verification is light.
 - Redaction (`SPEC.md` §3) not implemented.
+
+## 2a. Cross-tool folder visibility — measured live 2026-08-03
+
+The question this round answered: **does a synced session actually show up in
+any folder, in Claude Code and OpenCode?** Measured on the operator's machine
+against the real binaries (claude 2.x, opencode 1.17.15). Answer: *it shows up
+in the folders sync was pointed at, not everywhere* — and OpenCode's half was
+broken outright. What was established:
+
+- **The installed binary was 0.1.0 while the repo was at 0.3.3.** Every
+  database write path (OpenCode rows, Codex `threads`) shipped after 0.1.0, so
+  none of them had ever run here: `opencode.db` held **0** agentbridge rows and
+  `state_5.sqlite` **0** tagged threads, while the manifest claimed 487
+  materializations. `cargo install --path .` after code changes is not
+  optional — check `agentbridge --version` before believing any live result.
+- **OpenCode's picker filters by `project_id`, not by `directory`.** The
+  `directory` column is metadata. A folder resolves to the `project` row whose
+  `worktree` matches it, else to the catch-all `global`. Consequence: one row
+  in `global` is visible from *every* folder that is not a worktree of its own,
+  and a git repo with its own project row sees only rows carrying that id.
+  Verified: a session written with `directory=…/ab-crosstest` listed from
+  `/Users/harry`, `/tmp` and `/Users/harry/Documents`, and **not** from
+  `/Users/harry/Documents/agentbridge`.
+- **Claude Code is strictly per-directory**, no catch-all. A session is
+  listed/resumable exactly in the directories whose encoded folder holds a copy
+  (`~/.claude/projects/-Users-harry-Documents-ab-crosstest/…`). Verified: the
+  same id loaded from `ab-crosstest` and `$HOME`, and returned
+  `No conversation found` from `/Users/harry/Documents` and `/tmp`.
+- **Both directions of the cross-tool hop work.** An OpenCode session
+  (`ses_04e603643ffe…`) materialized into Claude Code in a folder that had
+  never held a session, and `claude --resume` continued it. A Claude Code
+  session (`c6f114a0-…`) materialized into OpenCode and appears in OpenCode's
+  own `opencode session list`, titled `claude-code session c6f114a0-…`.
+
+Two real bugs fell out, both fixed in this commit but **not yet re-verified
+live** (see §6.0):
+
+1. `UNIQUE constraint failed: session.id` — `derive_id` hashed only
+   (provider, source id), so one session could own exactly one row for the
+   whole machine. The second directory's write always failed, and sync
+   swallowed it into `report.errors`. OpenCode multi-directory visibility has
+   therefore never worked. Ids (and message/part ids) are now per **project**:
+   the minimum for visibility everywhere, and the maximum before the picker
+   lists the same conversation twice.
+2. `append_manifest` deduped by `dest` alone. Every OpenCode row shares one
+   dest (the database), so a whole run's rows collapsed into a single manifest
+   entry and `status`/`pull` tracked one session out of hundreds. The key is
+   now (dest, row id) for OpenCode, unchanged for file targets.
 
 ## 3. Architecture in one page
 
@@ -165,7 +213,13 @@ no cost):
 - Codex: `codex delete <id> --force` → `Deleted session` means recognized;
   `Error: failed to delete session` means not. (Destructive — synthetic files
   only.)
-- Wrap CLI probes in a timeout; macOS has no GNU `timeout`.
+- OpenCode: `opencode session list` **from the folder under test** prints the
+  picker's own view — non-interactive, no model call, and the only honest check
+  that a row is visible where you think it is. `grep -c <id>` on it also catches
+  the double-listing a second row in the same project would cause.
+- Wrap CLI probes in a timeout; macOS has no GNU `timeout` (`scripts`-free
+  stand-in: run the command in the background and `kill -9` it from a
+  `sleep` subshell).
 
 ## 5. Running the loop on a real machine
 
@@ -186,27 +240,58 @@ reads it fine).
 
 ## 6. Next steps, in order
 
-1. **Durable marker in generated files** so orphans can never be mistaken for
+0. **Re-verify the 2026-08-03 OpenCode fix live — do this first.** The
+   per-project id + manifest key changes pass 78 unit tests and nothing else;
+   §4's first line applies. The exact sequence that failed before:
+
+   ```bash
+   cargo install --path . && agentbridge --version     # must print 0.3.3+
+   agentbridge resume c6f114a0-3e7b-40c4-9d55-64df6b468426 opencode \
+     --project /Users/harry/Documents/ab-crosstest       # → global project
+   agentbridge resume c6f114a0-3e7b-40c4-9d55-64df6b468426 opencode \
+     --project /Users/harry/Documents/agentbridge        # → own worktree; this
+                                                         #   died on UNIQUE
+   cd /Users/harry/Documents/agentbridge && opencode session list  # expect 1 hit
+   cd /tmp && opencode session list                                # expect 1 hit
+   ```
+
+   Then check the same session is listed **once**, not twice, from a `global`
+   folder, and that the pre-0.3.4 row (`ses_ab…` keyed on the session alone)
+   was reclaimed rather than left beside the new ones. `/Users/harry/Documents/
+   ab-crosstest` is the throwaway folder used for the 08-03 run; it and the
+   probe rows come out with `agentbridge unsync` (never `rm -rf`).
+
+1. **Decide the folder-coverage story** — the open product question behind
+   §2a. Today a session reaches a folder only when sync was pointed at it
+   (`sync --project X`, or the shell hook running `agentbridge sync` in each
+   new shell), plus `$HOME` — which for OpenCode means every non-worktree
+   folder for free, and for Claude Code means only `$HOME` itself. Options:
+   fan out to every known project directory (cheap for Claude Code — hardlinks,
+   same inode; expensive for OpenCode — each row duplicates every message and
+   part row, and the database is already 278 MB for 148 sessions), or keep the
+   shell hook as the answer and document it. Not decided.
+
+2. **Durable marker in generated files** so orphans can never be mistaken for
    real sessions (the §4 footgun).
-2. **Antigravity write path + model-text mapping** — post-quota: map
+3. **Antigravity write path + model-text mapping** — post-quota: map
    successful type-17 response text (error text is `.24.3.1`; success location
    unknown), then materialize foreign sessions into
    `~/.gemini/antigravity-cli/conversations/`. Re-read `CONNECTORS.md` §7
    before starting; the embedded Cortex protos in
    `/opt/Antigravity/resources/bin/language_server` may map payloads faster
    than black-box probing.
-3. **Redaction** (`src/redact.rs`, doesn't exist) — `SPEC.md` §3 requires it
+4. **Redaction** (`src/redact.rs`, doesn't exist) — `SPEC.md` §3 requires it
    before anything is written or sent. Fail closed.
-4. **Kilo Code / other connectors** — as requested, on their own
+5. **Kilo Code / other connectors** — as requested, on their own
    `CONNECTORS.md` sections with verified formats first.
-5. **Live verification of `start`/`inject`** against a real agent launch.
-6. Topic threading — grouping sessions across tools by subject rather than
+6. **Live verification of `start`/`inject`** against a real agent launch.
+7. Topic threading — grouping sessions across tools by subject rather than
    project path (`DESIGN.md` §10).
 
 ## 7. Repo hygiene
 
 - Public: `https://github.com/45Harry/agentbridge`, branch `master`.
-- Keep tests green (63 + 2 ignored); add a regression test for every bug, and
+- Keep tests green (78 + 2 ignored); add a regression test for every bug, and
   verify format changes against the real binary before believing them.
 - Never commit session data. `~/.agentbridge` is never the source of fixtures.
 - Ignored tests are the real-data checks: run them explicitly after any

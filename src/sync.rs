@@ -360,13 +360,27 @@ fn append_manifest(records: &[LinkRecord]) -> std::io::Result<()> {
     // last write wins on disk, so earlier rows describing the same dest would
     // report stale counts as drift on the next pull. Keep only the last row
     // per dest.
-    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    //
+    // OpenCode is the exception: its dest is one database holding every
+    // session, so the row id (kept in `cache`) is what makes an entry unique.
+    // Keyed on dest alone a whole run's OpenCode rows collapse into a single
+    // manifest entry and `status`/`pull` lose sight of every session but one.
+    let key = |r: &LinkRecord| -> (PathBuf, Option<PathBuf>) {
+        if r.target_provider == "opencode" {
+            (r.dest.clone(), Some(r.cache.clone()))
+        } else {
+            (r.dest.clone(), None)
+        }
+    };
+    let mut seen: std::collections::HashSet<(PathBuf, Option<PathBuf>)> =
+        std::collections::HashSet::new();
     let mut kept: Vec<&LinkRecord> = Vec::new();
     for r in records {
-        if seen.contains(&r.dest) {
-            kept.retain(|k| k.dest != r.dest);
+        let k = key(r);
+        if seen.contains(&k) {
+            kept.retain(|x| key(x) != k);
         }
-        seen.insert(r.dest.clone());
+        seen.insert(k);
         kept.push(r);
     }
     let mut existing = fs::read_to_string(&path).unwrap_or_default();
@@ -513,62 +527,41 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
                     report.errors.push(e.to_string());
                     continue;
                 }
-                if !opencode_backed_up {
-                    let id = crate::opencode_write::derive_id(&session.provider, &entry.id);
-                    let project_dir = project.to_string_lossy();
-                    let home = std::env::var("HOME")
-                        .ok()
-                        .map(|h| h.trim_end_matches('/').to_string());
+                // The sync directory, plus `$HOME` — which resolves to the
+                // `global` project and so carries the session into every
+                // folder that is not a project worktree of its own.
+                let dirs = target_dirs(project, &session);
+                if !opencode_backed_up
+                    && crate::opencode_write::will_insert(&db, &session, &dirs)
+                {
                     // A run that would only refresh rows agentbridge already
                     // wrote needs no backup; one that inserts a new row does.
-                    let will_insert = crate::opencode_write::session_row_exists(&db, &id, &project_dir)
-                        .map(|e| !e)
-                        .unwrap_or(true)
-                        || home
-                            .as_deref()
-                            .map(|h| {
-                                crate::opencode_write::session_row_exists(&db, &id, h)
-                                    .map(|e| !e)
-                                    .unwrap_or(true)
-                            })
-                            .unwrap_or(false);
-                    if will_insert {
-                        match crate::opencode_write::backup(&db) {
-                            Ok(_) => opencode_backed_up = true,
-                            Err(e) => {
-                                report.errors.push(e.to_string());
-                                continue;
-                            }
+                    match crate::opencode_write::backup(&db) {
+                        Ok(_) => opencode_backed_up = true,
+                        Err(e) => {
+                            report.errors.push(e.to_string());
+                            continue;
                         }
                     }
                 }
-                match crate::opencode_write::write_session(
-                    &db,
-                    &session,
-                    &project.to_string_lossy(),
-                ) {
-                    Ok((new_id, written)) => report.created.push(LinkRecord {
+                let (rows, errors) =
+                    crate::opencode_write::write_sessions(&db, &session, &dirs);
+                for e in errors {
+                    report.errors.push(format!("opencode {}", e));
+                }
+                for row in rows {
+                    report.created.push(LinkRecord {
                         dest: db.clone(),
-                        cache: PathBuf::from(new_id),
+                        cache: PathBuf::from(row.id),
                         session_id: entry.id.clone(),
                         source_provider: entry.provider.clone(),
                         target_provider: target.clone(),
-                        project: project.to_path_buf(),
+                        project: PathBuf::from(row.directory),
                         inode: 0,
                         // True row count, not session.messages.len(): a
                         // placeholder turn may have been inserted.
-                        message_count: written,
-                    }),
-                    Err(e) => report.errors.push(format!("opencode {}: {}", entry.id, e)),
-                }
-                // OpenCode's picker is scoped to the launch directory, so the
-                // session also gets a row for the home directory (the one
-                // directory a project session is otherwise invisible from).
-                if let Ok(home) = std::env::var("HOME") {
-                    match crate::opencode_write::write_session(&db, &session, &home) {
-                        Ok(_) => {}
-                        Err(e) => report.errors.push(format!("opencode {} (~): {}", entry.id, e)),
-                    }
+                        message_count: row.messages,
+                    });
                 }
                 continue;
             }
@@ -580,13 +573,7 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
             // Codex scopes the resume picker to the rollout's session_meta
             // cwd, so one file per target directory: the sync project and the
             // home directory (CONNECTORS.md §2).
-            let mut dirs = vec![session.project_path().unwrap_or_default()];
-            if let Ok(home) = std::env::var("HOME") {
-                let home = home.trim_end_matches('/').to_string();
-                if !dirs.contains(&home) {
-                    dirs.push(home);
-                }
-            }
+            let dirs = target_dirs(project, &session);
             let artifacts = match converter.convert_multi(&session, &cache, &dirs) {
                 Ok(p) => p,
                 Err(e) => {
@@ -704,6 +691,26 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
     }
 
     report
+}
+
+/// The directories one sync pass makes `session` visible in. Every tool here
+/// scopes its picker to the directory you launch it from, so presence has to
+/// be materialized per directory: the directory being synced, plus `$HOME` —
+/// the one directory every tool can be started from, and (for OpenCode) the
+/// `global` project that covers any folder that is not a worktree of its own.
+fn target_dirs(project: &Path, session: &crate::model::Session) -> Vec<String> {
+    let mut dirs = vec![
+        session
+            .project_path()
+            .unwrap_or_else(|| project.to_string_lossy().to_string()),
+    ];
+    if let Ok(home) = std::env::var("HOME") {
+        let home = home.trim_end_matches('/').to_string();
+        if !dirs.contains(&home) {
+            dirs.push(home);
+        }
+    }
+    dirs
 }
 
 /// Sources the Codex resume picker lists (INTERACTIVE_SESSION_SOURCES in the

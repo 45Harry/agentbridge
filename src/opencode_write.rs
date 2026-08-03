@@ -96,9 +96,26 @@ pub fn backup(db: &Path) -> Result<PathBuf, WriteError> {
     Ok(dest)
 }
 
-/// Deterministic OpenCode-shaped id for a foreign session, so re-running is
-/// idempotent rather than inserting a duplicate every time.
-pub fn derive_id(source_provider: &str, source_id: &str) -> String {
+/// Deterministic OpenCode-shaped id for a foreign session **in one project**,
+/// so re-running is idempotent rather than inserting a duplicate every time.
+///
+/// Keyed on the project, not the directory: OpenCode's picker filters by
+/// `project_id` (verified live — a session whose `directory` is `$HOME` lists
+/// from any other directory that also resolves to `global`), while `id` is the
+/// table's primary key. One row per project is therefore both the minimum for
+/// visibility everywhere and the maximum before the picker lists the same
+/// session twice.
+pub fn derive_id(source_provider: &str, source_id: &str, project_id: &str) -> String {
+    let ns = uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_URL,
+        format!("{}:{}:{}", source_provider, source_id, project_id).as_bytes(),
+    );
+    format!("ses_ab{}", ns.simple())
+}
+
+/// The pre-0.3.4 id: one row per session for the whole machine. Rows under it
+/// are agentbridge's own and are replaced by the per-project scheme.
+fn legacy_id(source_provider: &str, source_id: &str) -> String {
     let ns = uuid::Uuid::new_v5(
         &uuid::Uuid::NAMESPACE_URL,
         format!("{}:{}", source_provider, source_id).as_bytes(),
@@ -106,20 +123,46 @@ pub fn derive_id(source_provider: &str, source_id: &str) -> String {
     format!("ses_ab{}", ns.simple())
 }
 
-/// Whether agentbridge already owns the row for `id` in `directory`. A
-/// re-sync that would only refresh our own rows (idempotent delete-then-
-/// reinsert of data agentbridge wrote) does not need a database backup; an
-/// INSERT of a new row does. Used by the sync loop to decide whether to take
-/// the one-per-run backup.
-pub fn session_row_exists(db: &Path, id: &str, directory: &str) -> Result<bool, WriteError> {
+/// Whether agentbridge already owns the row for `id`. A re-sync that would
+/// only refresh our own rows (idempotent delete-then-reinsert of data
+/// agentbridge wrote) does not need a database backup; an INSERT of a new row
+/// does. Used by the sync loop to decide whether to take the one-per-run
+/// backup.
+pub fn session_row_exists(db: &Path, id: &str) -> Result<bool, WriteError> {
     let conn = Connection::open(db).map_err(|e| WriteError::Sql(e.to_string()))?;
     Ok(conn
         .query_row(
-            "SELECT 1 FROM session WHERE id = ?1 AND directory = ?2 AND metadata LIKE ?3 LIMIT 1",
-            params![id, directory, format!("%{}%", MARKER)],
+            "SELECT 1 FROM session WHERE id = ?1 AND metadata LIKE ?2 LIMIT 1",
+            params![id, format!("%{}%", MARKER)],
             |_| Ok(()),
         )
         .is_ok())
+}
+
+/// True when materializing `session` into `dirs` would INSERT at least one row
+/// that is not already there — the sync loop's cue to back the database up
+/// first. Unreadable database ⇒ assume yes: a backup is the cheap side.
+pub fn will_insert(db: &Path, session: &Session, dirs: &[String]) -> bool {
+    let Ok(conn) = Connection::open(db) else {
+        return true;
+    };
+    for dir in dirs {
+        let Ok(project_id) = resolve_project_id(&conn, dir) else {
+            return true;
+        };
+        let id = derive_id(&session.provider, &session.id, &project_id);
+        let exists = conn
+            .query_row(
+                "SELECT 1 FROM session WHERE id = ?1 AND metadata LIKE ?2 LIMIT 1",
+                params![id, format!("%{}%", MARKER)],
+                |_| Ok(()),
+            )
+            .is_ok();
+        if !exists {
+            return true;
+        }
+    }
+    false
 }
 
 fn slug_of(title: &str) -> String {
@@ -139,7 +182,7 @@ fn slug_of(title: &str) -> String {
 /// The statements that would materialize `session` into `directory`.
 /// Rendered for `--dry-run`; the executed path uses bound parameters.
 pub fn plan(session: &Session, directory: &str) -> Vec<String> {
-    let id = derive_id(&session.provider, &session.id);
+    let id = derive_id(&session.provider, &session.id, PROJECT_ID);
     let mut out = vec![format!(
         "INSERT OR REPLACE INTO session (id, project_id, slug, directory, title, version, \
          time_created, time_updated, metadata) VALUES ('{}', '{}', '{}', '{}', '{}', '{}', …, \
@@ -159,6 +202,62 @@ pub fn plan(session: &Session, directory: &str) -> Vec<String> {
     out
 }
 
+/// One materialized row: which directory asked for it, which project it landed
+/// in, the OpenCode id it got, and how many messages were written.
+#[derive(Debug, Clone)]
+pub struct RowWritten {
+    pub directory: String,
+    pub project_id: String,
+    pub id: String,
+    pub messages: usize,
+}
+
+/// Materialize `session` once per *project* that `dirs` resolve to, so it is
+/// listed in OpenCode's picker from every one of them. Directories sharing a
+/// project collapse to a single row — two rows in one project would list the
+/// same conversation twice.
+///
+/// Errors are per-row: one unwritable project must not cost the others.
+pub fn write_sessions(
+    db: &Path,
+    session: &Session,
+    dirs: &[String],
+) -> (Vec<RowWritten>, Vec<String>) {
+    let mut rows = Vec::new();
+    let mut errors = Vec::new();
+    let mut done: Vec<String> = Vec::new();
+
+    for dir in dirs {
+        let project_id = match Connection::open(db)
+            .map_err(|e| WriteError::Sql(e.to_string()))
+            .and_then(|c| resolve_project_id(&c, dir))
+        {
+            Ok(p) => p,
+            Err(e) => {
+                errors.push(format!("{} ({}): {}", session.id, dir, e));
+                continue;
+            }
+        };
+        if done.contains(&project_id) {
+            continue;
+        }
+        match write_session(db, session, dir) {
+            Ok((id, messages)) => {
+                done.push(project_id.clone());
+                rows.push(RowWritten {
+                    directory: dir.clone(),
+                    project_id,
+                    id,
+                    messages,
+                });
+            }
+            Err(e) => errors.push(format!("{} ({}): {}", session.id, dir, e)),
+        }
+    }
+
+    (rows, errors)
+}
+
 /// Insert (or refresh) `session` so it appears in OpenCode's own picker for
 /// `directory`. Returns the OpenCode session id used.
 pub fn write_session(
@@ -169,7 +268,8 @@ pub fn write_session(
     let mut conn = Connection::open(db).map_err(|e| WriteError::Sql(e.to_string()))?;
     let tx = conn.transaction().map_err(|e| WriteError::Sql(e.to_string()))?;
 
-    let id = derive_id(&session.provider, &session.id);
+    let project_id = resolve_project_id(&tx, directory)?;
+    let id = derive_id(&session.provider, &session.id, &project_id);
     let created = session.started_at.map(|t| t.timestamp_millis()).unwrap_or(0);
     let updated = session
         .last_event_at
@@ -187,16 +287,30 @@ pub fn write_session(
     })
     .to_string();
 
-    let project_id = resolve_project_id(&tx, directory)?;
-
     // Replace wholesale so a re-run refreshes rather than duplicating. The
-    // cascade clears the old messages/parts first. Scoped by directory: the
-    // same session now has one row per directory it should appear in.
+    // cascade clears the old messages/parts first. Matched on the id alone,
+    // never on the directory: the id already scopes the row to one project,
+    // and a project's representative directory changes between runs (sync
+    // passes whichever folder you are standing in). Scoping the DELETE by
+    // directory left the old row in place and the INSERT then died on
+    // `UNIQUE constraint failed: session.id`.
     tx.execute(
-        "DELETE FROM session WHERE id = ?1 AND directory = ?2 AND metadata LIKE ?3",
-        params![id, directory, format!("%{}%", MARKER)],
+        "DELETE FROM session WHERE id = ?1 AND metadata LIKE ?2",
+        params![id, format!("%{}%", MARKER)],
     )
     .map_err(|e| WriteError::Sql(e.to_string()))?;
+
+    // Migration: the pre-0.3.4 row was keyed on the session alone, so it
+    // occupied the id a per-project row needs and would list a stale copy
+    // beside the new one. It is ours (marker-checked), so it goes.
+    let legacy = legacy_id(&session.provider, &session.id);
+    if legacy != id {
+        tx.execute(
+            "DELETE FROM session WHERE id = ?1 AND metadata LIKE ?2",
+            params![legacy, format!("%{}%", MARKER)],
+        )
+        .map_err(|e| WriteError::Sql(e.to_string()))?;
+    }
 
     tx.execute(
         "INSERT INTO session (id, project_id, slug, directory, title, version, \
@@ -218,10 +332,12 @@ pub fn write_session(
     // OpenCode's message ids encode a time-ordered counter and its session
     // loop picks the "latest" message by comparing id strings. Foreign ids
     // must sort below anything OpenCode generates (`msg_f…`), so the
-    // `msg_0` prefix is what keeps continuation working.
+    // `msg_0` prefix is what keeps continuation working. The hash carries the
+    // project too — message ids are primary keys as well, so the same session
+    // in two projects must not reuse them.
     let ns = uuid::Uuid::new_v5(
         &uuid::Uuid::NAMESPACE_URL,
-        format!("{}:{}", session.provider, session.id).as_bytes(),
+        format!("{}:{}:{}", session.provider, session.id, project_id).as_bytes(),
     );
     let id_hex: String = ns.simple().to_string();
 
@@ -496,6 +612,93 @@ mod tests {
         assert_eq!(parts, 2);
     }
 
+    /// The picker filters by project and `session.id` is the primary key, so a
+    /// session that must show up in two projects needs two rows. Under the old
+    /// directory-independent id the second write died on `UNIQUE constraint
+    /// failed: session.id` — found live on 2026-08-03 materializing one
+    /// session into a second folder.
+    #[test]
+    fn test_two_projects_each_get_their_own_row() {
+        let (_t, db) = db_with_schema();
+        Connection::open(&db)
+            .unwrap()
+            .execute("INSERT INTO project VALUES ('proj_a','/work/a',0,0,'[]')", [])
+            .unwrap();
+
+        let (rows, errors) =
+            write_sessions(&db, &a_session(), &["/work/a".into(), "/home/u/p".into()]);
+
+        assert!(errors.is_empty(), "both writes must succeed: {:?}", errors);
+        assert_eq!(rows.len(), 2, "one row per project");
+        assert_ne!(rows[0].id, rows[1].id, "ids must differ or the PK collides");
+        assert_eq!(rows[0].project_id, "proj_a");
+        assert_eq!(rows[1].project_id, "global", "unknown worktree ⇒ catch-all");
+        assert_eq!(count_written(&db), 2);
+
+        // Each row carries its own messages — message ids are primary keys too.
+        let conn = Connection::open(&db).unwrap();
+        for r in &rows {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM message WHERE session_id=?1",
+                    params![r.id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 2, "{} lost its messages", r.id);
+        }
+    }
+
+    /// Two directories inside one project are one picker entry. Writing a row
+    /// each would list the same conversation twice from either of them.
+    #[test]
+    fn test_directories_sharing_a_project_collapse_to_one_row() {
+        let (_t, db) = db_with_schema();
+
+        let (rows, errors) =
+            write_sessions(&db, &a_session(), &["/home/u/p".into(), "/home/u".into()]);
+
+        assert!(errors.is_empty(), "{:?}", errors);
+        assert_eq!(rows.len(), 1, "both resolve to `global` ⇒ a single row");
+        assert_eq!(count_written(&db), 1);
+    }
+
+    /// A machine synced by an older build carries one directory-independent
+    /// row per session. It occupies an id the per-project scheme needs, so the
+    /// write must reclaim it rather than fail or list a stale copy beside it.
+    #[test]
+    fn test_legacy_directory_independent_row_is_reclaimed() {
+        let (_t, db) = db_with_schema();
+        let s = a_session();
+        let legacy = legacy_id(&s.provider, &s.id);
+        Connection::open(&db)
+            .unwrap()
+            .execute(
+                "INSERT INTO session (id, project_id, slug, directory, title, version, \
+                 time_created, time_updated, metadata) \
+                 VALUES (?1,'global','old','/somewhere','Old','1.17.15',1,1,?2)",
+                params![legacy, format!("{{\"{}\":true}}", MARKER)],
+            )
+            .unwrap();
+
+        let (rows, errors) = write_sessions(&db, &s, &["/home/u/p".into()]);
+
+        assert!(errors.is_empty(), "{:?}", errors);
+        assert_eq!(rows.len(), 1);
+        assert_ne!(rows[0].id, legacy);
+        assert_eq!(count_written(&db), 1, "the legacy row must not survive");
+        let gone: bool = Connection::open(&db)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM session WHERE id=?1",
+                params![legacy],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+            == 0;
+        assert!(gone, "legacy row still present");
+    }
+
     /// Re-running must refresh, never accumulate duplicates.
     #[test]
     fn test_write_is_idempotent() {
@@ -535,9 +738,14 @@ mod tests {
 
     #[test]
     fn test_derive_id_is_deterministic_and_shaped_like_opencodes() {
-        let a = derive_id("claude-code", "abc");
-        assert_eq!(a, derive_id("claude-code", "abc"));
-        assert_ne!(a, derive_id("codex-cli", "abc"));
+        let a = derive_id("claude-code", "abc", "global");
+        assert_eq!(a, derive_id("claude-code", "abc", "global"));
+        assert_ne!(a, derive_id("codex-cli", "abc", "global"));
+        assert_ne!(
+            a,
+            derive_id("claude-code", "abc", "proj_a"),
+            "one row per project means one id per project"
+        );
         assert!(a.starts_with("ses_ab"));
     }
 
@@ -563,13 +771,12 @@ mod tests {
             params![format!("{{\"{}\":true}}", MARKER)],
         )
         .unwrap();
-        assert!(session_row_exists(&db, "ses_own", "/p").unwrap());
-        assert!(!session_row_exists(&db, "ses_own", "/other").unwrap());
+        assert!(session_row_exists(&db, "ses_own").unwrap());
         assert!(
-            !session_row_exists(&db, "ses_real", "/home/u/p").unwrap(),
+            !session_row_exists(&db, "ses_real").unwrap(),
             "OpenCode's own row carries no marker"
         );
-        assert!(!session_row_exists(&db, "ses_missing", "/p").unwrap());
+        assert!(!session_row_exists(&db, "ses_missing").unwrap());
     }
 
     #[test]
