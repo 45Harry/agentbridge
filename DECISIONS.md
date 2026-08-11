@@ -170,3 +170,34 @@ mirrors the OpenCode treatment exactly: backup before first write, rows tagged
 UUID v5 (genuine rows never touched), refuse-while-running guard, `unsync`
 removes tagged rows only, `--dry-run` untouched. Verified against the real
 binary: `codex delete <id> --force` → `Deleted session` for an inserted row.
+
+---
+
+## 2026-08-03 — OpenCode: one row per *project*, not per directory
+
+Measuring cross-tool visibility from arbitrary folders (HANDOFF §2a) turned up
+the fact the OpenCode write path was built on the wrong key: its picker filters
+sessions by `project_id` — the `project` row whose `worktree` matches the launch
+directory, or the catch-all `global` — and `session.directory` is only metadata.
+agentbridge derived one id per (provider, source id) for the whole machine, so
+the second directory's write hit `UNIQUE constraint failed: session.id` and was
+swallowed into `report.errors`. The `$HOME` fan-out added in 0.3.x had therefore
+never landed a row.
+
+**Decision:** the unit of OpenCode materialization is the **project**, not the
+directory. `derive_id` (and the message/part id namespace) hashes the project id
+too; `write_sessions` resolves each requested directory to its project and
+writes one row per distinct project — the minimum for visibility everywhere, and
+the maximum before the same conversation is listed twice in one picker. Rows
+under the pre-0.3.4 directory-independent id are reclaimed on write (they carry
+the marker, so they are ours to replace).
+
+Two consequences worth keeping in mind:
+
+- Syncing `$HOME` covers **every** folder that is not a worktree of its own,
+  because they all resolve to `global`. A git repo with its own project row is
+  reached only by syncing that repo.
+- Rows are not free the way Claude Code hardlinks are: each one duplicates every
+  message and part row. Fanning out to all known projects is a real decision
+  about database size (278 MB for 148 native sessions today), not a cheap win —
+  see HANDOFF §6.1, still open.
