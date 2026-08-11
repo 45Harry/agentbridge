@@ -504,61 +504,23 @@ fn cmd_resume(
                 Err(e) => Err(e.to_string()),
                 Ok(()) => {
                     let dir = session.project_path().unwrap_or_default();
-                    let home = std::env::var("HOME")
-                        .ok()
-                        .map(|h| h.trim_end_matches('/').to_string());
-                    // The picker is scoped to the launch directory: write one
-                    // row per directory — the session's own, $HOME, and every
-                    // known project worktree — so it surfaces anywhere.
-                    let mut outcome: Result<PathBuf, String> = Ok(PathBuf::new());
-                    let dirs = agentbridge::opencode_write::target_dirs(
+                    // The row is already ours: the write below only refreshes
+                    // it, which needs no backup. A new row gets one first.
+                    let exists = !agentbridge::opencode_write::will_insert(
                         &db,
-                        &dir,
-                        home.as_deref(),
-                    )
-                    .unwrap_or_else(|e| {
-                        outcome = Err(e.to_string());
-                        Vec::new()
-                    });
-                    let _ = agentbridge::opencode_write::ensure_any_directory_filter();
-                    // Only rows agentbridge doesn't already own need a backup.
-                    let needs_backup = dirs.iter().any(|d| {
-                        !agentbridge::opencode_write::session_row_exists(
-                            &db,
-                            &agentbridge::opencode_write::derive_id(
-                                &session.provider,
-                                &session.id,
-                                d,
-                            ),
-                            d,
-                        )
-                        .unwrap_or(false)
-                    });
-                    if needs_backup
+                        &session,
+                        std::slice::from_ref(&dir),
+                    );
+                    if !exists
                         && let Err(e) = agentbridge::opencode_write::backup(&db)
                     {
-                        outcome = Err(format!("opencode backup failed: {}", e));
-                    }
-                    if outcome.is_ok() {
-                        let mut first: Option<String> = None;
-                        for d in &dirs {
-                            match agentbridge::opencode_write::write_session(&db, &session, d) {
-                                Ok((new_id, _)) => {
-                                    if first.is_none() {
-                                        first = Some(new_id);
-                                    }
-                                }
-                                Err(e) => {
-                                    outcome = Err(format!("opencode ({}): {}", d, e));
-                                    break;
-                                }
-                            }
-                        }
-                        if let Some(id) = first {
-                            outcome = Ok(PathBuf::from(id));
+                        Err(format!("opencode backup failed: {}", e))
+                    } else {
+                        match agentbridge::opencode_write::write_session(&db, &session, &dir) {
+                            Ok((id, _)) => Ok(PathBuf::from(id)),
+                            Err(e) => Err(e.to_string()),
                         }
                     }
-                    outcome
                 }
             }
         }
