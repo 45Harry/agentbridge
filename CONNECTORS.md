@@ -186,27 +186,6 @@ any other directory via the picker's `All` filter.
   subcommands — no need to hit the SQLite file directly for the connector's
   `scan()`, though `load()` may still want direct DB access for full
   `message`/`part` bodies if the CLI's own output is lossy.
-- **Picker visibility is project-scoped (verified in the 1.18.11 binary):** the
-  TUI session list queries `session.list`, which always filters
-  `WHERE project_id = <project of the launch directory>`, plus an optional
-  launch-directory filter (`session_directory_filter_enabled`, default on)
-  that narrows the project's sessions to the exact launch directory. A row is
-  therefore only ever visible from one directory — so agentbridge materializes
-  each synced session **once per target directory** (`target_dirs`: the sync
-  project, `$HOME`, and every worktree in the `project` table), each row with
-  its own id derived from `(provider, source id, directory)` so the primary
-  key never collides. Rows under a git project's worktree list from any
-  directory inside that worktree; rows under the `global` project (i.e.
-  `$HOME`) list from any non-git directory. To make subdirectories and
-  arbitrary non-git directories list the sessions too, sync also writes
-  `session_directory_filter_enabled: false` into the OpenCode config
-  (`ensure_any_directory_filter`, one-shot, respecting an existing user/TUI
-  choice). Legacy single-directory rows (pre-0.3.4 ids) are migrated away on
-  the first refresh so the same session never appears twice in one picker.
-- **Continuation is per-directory:** messages are replayed into each row with
-  ids derived from the same `(provider, source id, directory)` namespace, so
-  resuming a session in one project continues that project's copy
-  (`msg_0…` ids sort below OpenCode's own so the loop picks them up).
 
 ## 4. Antigravity CLI (`agy`)
 

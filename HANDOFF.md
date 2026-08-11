@@ -15,7 +15,7 @@ cargo build && cargo test      # 78 tests pass (+2 ignored: live-verification su
 cargo run -- init              # read-only: what's on this machine
 ```
 
-Requires Rust edition 2024. Binary version is 0.3.3.
+Requires Rust edition 2024. Binary version is 0.3.4.
 
 ## 1. What this is
 
@@ -102,8 +102,12 @@ broken outright. What was established:
   session (`c6f114a0-…`) materialized into OpenCode and appears in OpenCode's
   own `opencode session list`, titled `claude-code session c6f114a0-…`.
 
-Two real bugs fell out, both fixed in this commit but **not yet re-verified
-live** (see §6.0):
+Two real bugs fell out, both fixed in this commit. **Sandbox-verified
+2026-08-11** against a copy of the real `opencode.db` (project table intact)
+with the real `opencode session list` binary — the session lists exactly once
+from `/tmp`, `$HOME`, `ab-crosstest` (all `global`) and from the agentbridge
+worktree (its own project), and the legacy `ses_ab…` row was reclaimed. The
+final live pass with OpenCode closed still stands (see §6.0):
 
 1. `UNIQUE constraint failed: session.id` — `derive_id` hashed only
    (provider, source id), so one session could own exactly one row for the
@@ -242,10 +246,13 @@ reads it fine).
 
 0. **Re-verify the 2026-08-03 OpenCode fix live — do this first.** The
    per-project id + manifest key changes pass 78 unit tests and nothing else;
-   §4's first line applies. The exact sequence that failed before:
+   §4's first line applies. (The 2026-08-11 sandbox pass above proved the
+   write path and picker visibility against real DB bytes and the real binary;
+   what remains is the same run against the live database with OpenCode
+   closed.) The exact sequence that failed before:
 
    ```bash
-   cargo install --path . && agentbridge --version     # must print 0.3.3+
+   cargo install --path . && agentbridge --version     # must print 0.3.4+
    agentbridge resume c6f114a0-3e7b-40c4-9d55-64df6b468426 opencode \
      --project /Users/harry/Documents/ab-crosstest       # → global project
    agentbridge resume c6f114a0-3e7b-40c4-9d55-64df6b468426 opencode \
