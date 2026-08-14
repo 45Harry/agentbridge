@@ -11,7 +11,7 @@ conversation. Read this, then `DESIGN.md` (architecture and why), then
 ```bash
 git clone git@github.com:45Harry/agentbridge.git
 cd agentbridge
-cargo build && cargo test      # 90 tests pass (+2 ignored: live-verification suites)
+cargo build && cargo test      # 91 tests pass (+2 ignored: live-verification suites)
 cargo run -- init              # read-only: what's on this machine
 ```
 
@@ -285,6 +285,67 @@ Operator follow-up: "what about codex?" §2c had explicitly left Codex's
   directory + `$HOME`, not every directory a session was ever materialized
   into — re-sync each directory to refresh it).
 
+## 2e. §2b's fix flooded 705 false "renames" outside the sandbox — fixed 2026-08-14
+
+The operator asked to install and test the title-sync work against real
+machine data (not synthetic fixtures) — real risk, since this machine's real
+manifest tracks ~19,000 rows across ~4,500 sessions. Found a real, machine-
+scale bug immediately:
+
+**`agentbridge pull` reported 705 "renames"** on the very first run against
+real data, for sessions nobody had touched. Root cause: `LinkRecord.title`
+was recorded as the raw `session.title` — which is `None` for the (very
+common) case of an untitled session — while `opencode_write::write_session`
+always persists *something* (falling back to `"{provider} session {id}"`
+when `session.title` is `None`). Once that fallback round-trips through
+`load_from_db` on the next `pull`, it is indistinguishable from a real title:
+`rec.title` (`None`) no longer matches what's actually in the row (the
+fallback text), so every untitled OpenCode-materialized session looked
+"renamed" — not a one-time transition cost as the original `LinkRecord.title`
+doc comment assumed, but a permanent, ongoing false positive for any session
+without an explicit title. The same class of bug existed for Codex's
+`threads.title` (also always falls back to a message preview or "New
+conversation") — though in practice it couldn't manifest as a `pull_back`
+false positive there, since `load_materialized("codex-cli", …)` reads the
+rollout *file*, which never carries title data in the modern format, so a
+codex-side mismatch could never be observed through that read path either
+way (harmless, but the same principle applies if that ever changes).
+
+**Fixed**: both `opencode_write::RowWritten` and `codex_write::ThreadRowReport`
+now return the title actually persisted, and `sync.rs` records *that* — not
+`session.title` — as `LinkRecord.title` for OpenCode (Codex's `LinkRecord.title`
+deliberately still tracks `session.title` directly, matching what its
+file-based read path can ever observe — see the code comment at the
+`ensure_codex_row` call sites). Regression tests:
+`test_untitled_session_fallback_title_is_not_a_false_rename`, and the two
+existing OpenCode pull tests now assert `report.renamed.is_empty()`
+explicitly instead of only checking message counts.
+
+**Cleanup performed on this operator's real machine** (no other remediation
+needed — nothing had been synced with the bad data yet, since `pull` only
+writes to `~/.agentbridge/overlay/` and `manifest.jsonl`, never a materialized
+copy directly):
+1. Deleted all 212 unique spurious `~/.agentbridge/overlay/*.title` files
+   (all timestamped from this session — the title-overlay feature didn't
+   exist before today, so there was nothing legitimate to lose).
+2. Left the stale-but-self-consistent `rec.title` values already written into
+   `manifest.jsonl` alone — they match what's currently in each OpenCode row,
+   so they cannot trigger another false positive, and self-heal the next time
+   `sync` touches each session (fresh `LinkRecord`s are written unconditionally
+   for every OpenCode target).
+3. Verified with the fixed binary: `agentbridge pull --dry-run` now reports
+   **0** renames against the same real data that produced 705 before.
+4. `~/.agentbridge/manifest.jsonl` confirmed structurally intact throughout
+   (19,106 lines, all valid JSON) — this was a false-positive bug, not data
+   corruption.
+
+This is exactly the class of bug §4's "unit tests mean nothing here" doctrine
+exists for: `test_pull_back_recovers_a_rename` and
+`test_recovered_rename_propagates_to_other_tools` (added when §2b landed)
+both passed the whole time, because they only ever exercised a *titled*
+fixture session — the untitled-session path was never touched until this
+outside-the-sandbox pass forced it.
+
 ## 3. Architecture in one page
 
 Full detail in `DESIGN.md`; the three rules that matter:
@@ -503,7 +564,7 @@ invariant 2, `ClaudeCodeConverter::convert_multi`, and the Codex
 ## 7. Repo hygiene
 
 - Public: `https://github.com/45Harry/agentbridge`, branch `master`.
-- Keep tests green (90 + 2 ignored); add a regression test for every bug, and
+- Keep tests green (91 + 2 ignored); add a regression test for every bug, and
   verify format changes against the real binary before believing them.
 - Never commit session data. `~/.agentbridge` is never the source of fixtures.
 - Ignored tests are the real-data checks: run them explicitly after any

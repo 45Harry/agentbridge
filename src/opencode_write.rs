@@ -210,6 +210,14 @@ pub struct RowWritten {
     pub project_id: String,
     pub id: String,
     pub messages: usize,
+    /// The title actually persisted into the row — `session.title` when set,
+    /// else the fallback `write_session` derives. Callers must use this, not
+    /// `session.title`, when recording what was written: round-tripping the
+    /// fallback back through `load_from_db` makes it indistinguishable from
+    /// a real title, so treating a bare `session.title` (often `None`) as
+    /// "what we wrote" makes every untitled session look renamed on the next
+    /// `pull` (regression caught 2026-08-14 live-testing outside the sandbox).
+    pub title: String,
 }
 
 /// Materialize `session` once per *project* that `dirs` resolve to, so it is
@@ -242,13 +250,14 @@ pub fn write_sessions(
             continue;
         }
         match write_session(db, session, dir) {
-            Ok((id, messages)) => {
+            Ok((id, messages, title)) => {
                 done.push(project_id.clone());
                 rows.push(RowWritten {
                     directory: dir.clone(),
                     project_id,
                     id,
                     messages,
+                    title,
                 });
             }
             Err(e) => errors.push(format!("{} ({}): {}", session.id, dir, e)),
@@ -264,7 +273,7 @@ pub fn write_session(
     db: &Path,
     session: &Session,
     directory: &str,
-) -> Result<(String, usize), WriteError> {
+) -> Result<(String, usize, String), WriteError> {
     let mut conn = Connection::open(db).map_err(|e| WriteError::Sql(e.to_string()))?;
     let tx = conn.transaction().map_err(|e| WriteError::Sql(e.to_string()))?;
 
@@ -481,7 +490,7 @@ pub fn write_session(
     }
 
     tx.commit().map_err(|e| WriteError::Sql(e.to_string()))?;
-    Ok((id, idx))
+    Ok((id, idx, title))
 }
 
 /// Remove every session agentbridge inserted — matched by the marker, so rows

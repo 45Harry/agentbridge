@@ -235,6 +235,7 @@ pub fn ensure_thread_rows(
         _ if !first_user.is_empty() => clip(&first_user, PREVIEW_MAX),
         _ => "New conversation".to_string(),
     };
+    report.title = title.clone();
     let has_user = if session.messages.iter().any(|m| m.role == Role::User) { 1 } else { 0 };
 
     for cwd in dirs {
@@ -351,12 +352,24 @@ pub fn remove_thread_rows_for(
 }
 
 /// Outcome of an `ensure_thread_rows` call.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ThreadRowReport {
     /// Rows created (each is one directory the session is now visible from).
     pub inserted: usize,
     /// Rows refreshed (values rewritten, same id — not new visibility).
     pub updated: usize,
+    /// The title actually persisted into every row this call touched (same
+    /// value for all of them — computed once, before the per-directory
+    /// loop). Callers recording "what we wrote" (sync.rs's `LinkRecord`)
+    /// must use this, not `session.title`: this always has a value (falling
+    /// back to a message preview or "New conversation" for an untitled
+    /// session), and round-tripping that fallback back through
+    /// `load_materialized` makes it indistinguishable from a real title —
+    /// recording a bare `session.title` here would make every untitled
+    /// session look renamed on the next `pull` (regression caught
+    /// 2026-08-14 live-testing outside the sandbox, alongside the identical
+    /// OpenCode gap — see `opencode_write::RowWritten::title`).
+    pub title: String,
 }
 
 /// Remove every row agentbridge inserted — matched by the marker, so

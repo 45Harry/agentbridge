@@ -733,7 +733,14 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
                         // True row count, not session.messages.len(): a
                         // placeholder turn may have been inserted.
                         message_count: row.messages,
-                        title: session.title.clone(),
+                        // The title actually persisted, not session.title —
+                        // OpenCode always writes something (falling back to
+                        // a derived name for an untitled session), and that
+                        // fallback text is what a later pull will read back.
+                        // Recording the source's often-`None` title here
+                        // would make every untitled session look renamed on
+                        // the next pull (see RowWritten::title).
+                        title: Some(row.title),
                     });
                 }
                 continue;
@@ -806,11 +813,18 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
                     // its inode (hardlink), so the copy *is* refreshed even though
                     // nothing is linked. The manifest count must follow, or the
                     // next pull reads agentbridge's own refresh as tool drift.
+                    //
+                    // Title tracks session.title here, unlike the OpenCode branch
+                    // below: `load_materialized` for codex-cli reads the rollout
+                    // *file*, which never carries a title in the modern format —
+                    // never `ensure_codex_row`'s DB-side fallback, which pull_back
+                    // can never observe through that read path anyway.
                     if let Some(row) = manifest
                         .iter_mut()
                         .find(|r| r.session_id == entry.id && r.dest == dest)
                     {
                         row.message_count = session.messages.len();
+                        row.title = session.title.clone();
                         manifest_dirty = true;
                     }
                     // A materialized rollout still needs its `threads` row for
@@ -898,19 +912,22 @@ fn interactive_source(source: Option<&str>) -> bool {
 /// lists it (CONNECTORS.md §2). Guarded and backed up once per run, exactly
 /// like the OpenCode path. Silently skipped when Codex has never run here
 /// (no `state_5.sqlite` to index into) or while Codex is open.
+/// Returns the title actually persisted into the `threads` row(s) touched,
+/// when the write happened at all — `None` when skipped (no state_5.sqlite,
+/// Codex running, or an error, all already reported). Callers must record
+/// this as `LinkRecord.title`, not `session.title` (see
+/// `ThreadRowReport::title`).
 fn ensure_codex_row(
     report: &mut SyncReport,
     backed_up: &mut bool,
     session: &crate::model::Session,
     rollout_path: &Path,
     dirs: &[String],
-) {
-    let Some(db) = crate::codex_write::state_db() else {
-        return;
-    };
+) -> Option<String> {
+    let db = crate::codex_write::state_db()?;
     if let Err(e) = crate::codex_write::ensure_safe_to_write() {
         report.errors.push(e.to_string());
-        return;
+        return None;
     }
     if !*backed_up {
         // Refreshing rows agentbridge already wrote is idempotent; only an
@@ -926,14 +943,20 @@ fn ensure_codex_row(
                 Ok(_) => *backed_up = true,
                 Err(e) => {
                     report.errors.push(e.to_string());
-                    return;
+                    return None;
                 }
             }
         }
     }
     match crate::codex_write::ensure_thread_rows(&db, session, rollout_path, dirs) {
-        Ok(r) => report.codex_indexed += r.inserted,
-        Err(e) => report.errors.push(e.to_string()),
+        Ok(r) => {
+            report.codex_indexed += r.inserted;
+            Some(r.title)
+        }
+        Err(e) => {
+            report.errors.push(e.to_string());
+            None
+        }
     }
 }
 
@@ -1632,22 +1655,33 @@ mod tests {
             .expect("claude fixture")
             .load("normal-multi-turn")
             .expect("fixture loads");
-        let (oc_id, written) =
+        let (oc_id, written, written_title) =
             crate::opencode_write::write_session(&db, &source, "/tmp/some-project").unwrap();
+        // Regression: recording anything other than the title actually
+        // written (e.g. the source's raw, often-`None` title) here makes the
+        // very first `pull_back` below misread OpenCode's own fallback text
+        // as a rename nobody made (found live, outside the sandbox,
+        // 2026-08-14 — see RowWritten::title).
         append_manifest(&[LinkRecord {
             dest: db.clone(),
             cache: PathBuf::from(&oc_id),
             session_id: source.id.clone(),
             source_provider: "claude-code".into(),
             target_provider: "opencode".into(),
-            title: None,
+            title: Some(written_title),
             project: PathBuf::from("/tmp/some-project"),
             inode: 0,
             message_count: written,
         }])
         .unwrap();
 
-        assert!(pull_back(false).pulled.is_empty(), "no new turns yet");
+        let first = pull_back(false);
+        assert!(first.pulled.is_empty(), "no new turns yet");
+        assert!(
+            first.renamed.is_empty(),
+            "recording the title actually written must not look like a rename: {:?}",
+            first.renamed
+        );
 
         // OpenCode appended a turn of its own: rows addressed with its own
         // id scheme (sorts after agentbridge's `msg_0…`), a fresh timestamp.
@@ -1674,6 +1708,11 @@ mod tests {
         let report = pull_back(false);
         let got: usize = report.pulled.iter().map(|(_, n)| n).sum();
         assert_eq!(got, 1, "the opencode-appended turn must be recovered");
+        assert!(
+            report.renamed.is_empty(),
+            "an appended turn is not a rename: {:?}",
+            report.renamed
+        );
 
         let overlay = overlay_messages(&source.id);
         assert!(
@@ -1683,6 +1722,82 @@ mod tests {
             "overlay must hold the opencode turn"
         );
     }
+
+    /// The exact bug found live 2026-08-14: an *untitled* session gets some
+    /// derived fallback text written into OpenCode (`write_session`'s
+    /// `"{provider} session {id}"`), and that fallback is indistinguishable
+    /// from a real title once round-tripped through the database. Recording
+    /// the source's raw title (`None`) as `LinkRecord.title` instead of what
+    /// was actually written made every untitled session look renamed on the
+    /// very next pull — at machine scale, hundreds of false positives from a
+    /// single `pull` run.
+    #[test]
+    fn test_untitled_session_fallback_title_is_not_a_false_rename() {
+        let _sb = Sandbox::new();
+        let home = PathBuf::from(std::env::var("HOME").unwrap());
+        let db = home.join(".local/share/opencode/opencode.db");
+        fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            r#"
+            PRAGMA foreign_keys = ON;
+            CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT NOT NULL,
+                time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+                sandboxes TEXT NOT NULL);
+            CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                parent_id TEXT, slug TEXT NOT NULL, directory TEXT NOT NULL,
+                title TEXT NOT NULL, version TEXT NOT NULL,
+                time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+                metadata TEXT,
+                FOREIGN KEY (project_id) REFERENCES project(id) ON DELETE CASCADE);
+            CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES session(id) ON DELETE CASCADE);
+            CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL,
+                session_id TEXT NOT NULL, time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL, data TEXT NOT NULL,
+                FOREIGN KEY (message_id) REFERENCES message(id) ON DELETE CASCADE);
+            INSERT INTO project VALUES ('global','/',0,0,'[]');
+            "#,
+        )
+        .unwrap();
+        drop(conn);
+
+        let registry = crate::connectors::all_for_testing(&fixture_root());
+        let source = registry
+            .by_id("claude-code")
+            .expect("claude fixture")
+            .load("tool-calls-large-output")
+            .expect("fixture loads");
+        assert!(source.title.is_none(), "fixture must be untitled for this test to mean anything");
+
+        let (oc_id, written, written_title) =
+            crate::opencode_write::write_session(&db, &source, "/tmp/some-project").unwrap();
+        assert!(!written_title.is_empty(), "write_session must fall back to something");
+        append_manifest(&[LinkRecord {
+            dest: db.clone(),
+            cache: PathBuf::from(&oc_id),
+            session_id: source.id.clone(),
+            source_provider: "claude-code".into(),
+            target_provider: "opencode".into(),
+            title: Some(written_title),
+            project: PathBuf::from("/tmp/some-project"),
+            inode: 0,
+            message_count: written,
+        }])
+        .unwrap();
+
+        let report = pull_back(false);
+        assert!(
+            report.renamed.is_empty(),
+            "the fallback title round-tripping through OpenCode must not look like a rename: {:?}",
+            report.renamed
+        );
+    }
+
     #[test]
     fn test_sync_does_not_feed_on_its_own_output() {
         let _sb = Sandbox::new();

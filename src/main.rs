@@ -585,7 +585,7 @@ fn cmd_resume(
                         Err(format!("opencode backup failed: {}", e))
                     } else {
                         match agentbridge::opencode_write::write_session(&db, &session, &dir) {
-                            Ok((id, _)) => Ok(PathBuf::from(id)),
+                            Ok((id, _, _)) => Ok(PathBuf::from(id)),
                             Err(e) => Err(e.to_string()),
                         }
                     }
