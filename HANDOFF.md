@@ -11,7 +11,7 @@ conversation. Read this, then `DESIGN.md` (architecture and why), then
 ```bash
 git clone git@github.com:45Harry/agentbridge.git
 cd agentbridge
-cargo build && cargo test      # 87 tests pass (+2 ignored: live-verification suites)
+cargo build && cargo test      # 89 tests pass (+2 ignored: live-verification suites)
 cargo run -- init              # read-only: what's on this machine
 ```
 
@@ -194,6 +194,57 @@ Test coverage added this round (see `cargo test`, now 87 + 2 ignored):
 `test_converted_claude_file_mtime_matches_session_last_event`,
 `test_codex_convert_multi_mtime_matches_session_last_event`.
 
+## 2c. §2b re-verified live, and a second bug found — 2026-08-14
+
+Ran the §6 "START HERE" checklist against the real `claude` (2.1.232), `opencode`
+(1.18.15) and `codex` (0.147.0) binaries, in a sandbox (fake `HOME`, real
+binaries, per §4 — never on the operator's own data). Found and fixed one more
+bug; everything else confirmed working:
+
+- **`ClaudeCodeConverter` had no real `convert_multi`.** It used the
+  `SessionConverter` trait's default (`convert()` once, `dirs` argument
+  discarded), while `sync_into`'s per-directory loop does
+  `dirs.iter().zip(&artifacts)` — with only one artifact ever produced, `zip`
+  silently truncated to the first directory and dropped every other one,
+  including the `$HOME` fallback `target_dirs()` computes. In practice: a
+  Claude-Code-native session synced from directory B only ever got a copy in
+  B, never in `$HOME` too — contrary to what this doc claimed in §6 item 1.
+  Fixed by giving `ClaudeCodeConverter` a real `convert_multi` (one session
+  variant per directory, `project_id` swapped per copy, each through the
+  existing single-directory `convert()`), mirroring how `CodexCliConverter`
+  already does it. Regression tests:
+  `test_claude_convert_multi_writes_one_file_per_directory` (`convert.rs`),
+  `test_sync_materializes_claude_session_into_project_and_home` (`sync.rs`).
+  This was very likely compounding the original "renamed in OpenCode, not
+  showing in Claude Code" report: even after §2b's title-overlay fix, the
+  directory the operator happened to be checking may simply never have had a
+  Claude Code copy at all.
+- **Title write-back confirmed end-to-end, real binaries.** Built a native
+  Claude Code session (accepted by the real `claude --resume`, verified via
+  the zero-cost "No deferred tool marker found" signal from §4), synced it
+  into OpenCode (row visible in real `opencode session list`), renamed it via
+  a direct `UPDATE session SET title=…` — the same mutation OpenCode's own
+  rename does — reconfirmed via `opencode session list`, then `agentbridge
+  pull` (reported the rename), then `agentbridge sync --project <a directory
+  that never held a copy>`. The new Claude Code copy there carried the
+  renamed title in a real `custom-title`/`agent-name` record and was accepted
+  by `claude --resume` (same zero-cost signal) — a rename made through
+  OpenCode's real database reached a directory that had never seen this
+  session before, through a real Claude Code file. The session's actual
+  native file was never given a `custom-title` record by agentbridge (still
+  none there) — invariant 2 held.
+- **mtime fix confirmed**, isolated from the run above (which got a stray
+  real edit from an unrelated auth-failed `claude -p` probe and briefly
+  looked like it hadn't): a clean session with content timestamped
+  `2020-01-01` produced a materialized copy with that exact mtime, not the
+  sync wall-clock time.
+- **Not exercised live**: Codex's `threads.title` upsert. `codex_write.rs`
+  only activates once `~/.codex/state_5.sqlite` already exists, which the
+  real `codex` binary only creates on first authenticated use — out of scope
+  for a sandbox run. Already covered by `codex_write.rs`'s own unit tests
+  against the reverse-engineered real schema (`REAL_SCHEMA` in its test
+  module); still worth a real pass per §4's doctrine when convenient.
+
 ## 3. Architecture in one page
 
 Full detail in `DESIGN.md`; the three rules that matter:
@@ -317,29 +368,30 @@ reads it fine).
 
 ## 6. Next steps, in order
 
-**⚠️ START HERE — re-verify the §2b title/mtime fix against the real
-binaries.** It only has unit-test coverage (87 passing tests) — per §4,
-that has meant nothing here three times before. Concretely:
+**§2b/§2c done — re-verified live 2026-08-14** (sandbox, real `claude`/
+`opencode`/`codex` binaries): title write-back, mtime, invariant 2, and the
+`ClaudeCodeConverter::convert_multi` fix all confirmed. **Still open, next in
+line:**
 
-```bash
-cargo install --path . && agentbridge --version   # must print the new build
-```
-
-1. Rename a real session in OpenCode (`opencode`, in-app rename or
-   equivalent), `agentbridge sync`, then `agentbridge pull` and confirm
-   `PullReport.renamed` fires and `agentbridge sync` again pushes the new
-   title into the Claude Code copy — `claude --resume <id>` should show it,
-   and the file's `custom-title`/`agent-name` records should carry it.
-2. Do the same starting from a Claude Code in-session rename (`/rename` or
-   whatever the real UI action is) propagating out to the Codex/OpenCode
-   copies — check the `threads.title` / `session.title` columns directly.
-3. Confirm the mtime fix: after `sync`, a months-old session's materialized
-   Claude Code file should **not** sort to the top of `claude --resume`'s
-   picker — `stat` the file and diff against the session's real last-activity
-   timestamp.
-4. Confirm invariant 2 still holds: renaming in a *non-native* copy must never
-   touch the session's real origin file unless that session opted into
-   `resume --merge`.
+1. **Codex title upsert (`threads.title`) live pass.** §2c's sandbox run
+   couldn't exercise this — `codex_write.rs` only activates once
+   `~/.codex/state_5.sqlite` exists, and the real `codex` binary only creates
+   it on first authenticated use. Only unit-tested (against a
+   reverse-engineered schema) so far; do a real pass when convenient — rename
+   a session natively in Codex, `pull`, `sync` into Claude Code/OpenCode,
+   check the title lands, then rename in one of *those* and confirm
+   `codex resume`'s picker (or `SELECT title FROM threads`) picks it up.
+2. **`agentbridge list`'s title lag.** Documented in §2b as a narrower,
+   known gap: `scan()` stops at the first `cwd`-bearing record, so a
+   mid-conversation rename won't show in `list` until `load()` runs (sync/pull
+   are unaffected). Worth deciding whether that's acceptable long-term or
+   `list` needs its own fix.
+3. Now that `ClaudeCodeConverter` has a real `convert_multi`, check whether
+   Claude Code needs the same per-directory "already natively visible, don't
+   duplicate" guard Codex has (the `is_codex`-specific block in
+   `sync_into`) — not proven necessary yet (Claude Code sessions don't
+   multi-file the way Codex rollouts can), but worth a second look now that
+   more directories actually get copies.
 
 0. **Re-verify the 2026-08-03 OpenCode fix live.** The
    per-project id + manifest key changes pass 78 unit tests and nothing else;
@@ -395,7 +447,7 @@ cargo install --path . && agentbridge --version   # must print the new build
 ## 7. Repo hygiene
 
 - Public: `https://github.com/45Harry/agentbridge`, branch `master`.
-- Keep tests green (87 + 2 ignored); add a regression test for every bug, and
+- Keep tests green (89 + 2 ignored); add a regression test for every bug, and
   verify format changes against the real binary before believing them.
 - Never commit session data. `~/.agentbridge` is never the source of fixtures.
 - Ignored tests are the real-data checks: run them explicitly after any

@@ -1297,6 +1297,51 @@ mod tests {
         );
     }
 
+    /// Regression: a Claude-Code-native session synced while standing in a
+    /// *different* directory must reach both that directory and `$HOME`
+    /// (`target_dirs()`'s documented fallback, HANDOFF.md §6 item 1) — before
+    /// `ClaudeCodeConverter::convert_multi` was implemented, the trait's
+    /// default silently dropped every directory past the first.
+    #[test]
+    fn test_sync_materializes_claude_session_into_project_and_home() {
+        let _sb = Sandbox::new();
+        let live = live_root("claude-code").unwrap();
+        let native_project = PathBuf::from("/tmp/merge-project");
+        write_native_claude_session(&live, native_project.to_str().unwrap());
+        let registry = native_registry(live);
+
+        // Sync while standing somewhere other than the session's own project.
+        let elsewhere = PathBuf::from("/tmp/some-other-project");
+        let report = sync_into(&registry, &elsewhere, false);
+
+        let claude_links: Vec<&LinkRecord> =
+            report.created.iter().filter(|r| r.target_provider == "claude-code").collect();
+        assert_eq!(claude_links.len(), 2, "must materialize into both the sync project and $HOME");
+        let elsewhere_tag =
+            crate::convert::ClaudeCodeConverter::encode_project_dir(elsewhere.to_str().unwrap());
+        let home = std::env::var("HOME").unwrap();
+        let home_tag = crate::convert::ClaudeCodeConverter::encode_project_dir(&home);
+        assert!(
+            claude_links.iter().any(|r| r.dest.to_string_lossy().contains(&elsewhere_tag)),
+            "missing a copy under the sync project"
+        );
+        assert!(
+            claude_links.iter().any(|r| r.dest.to_string_lossy().contains(&home_tag)),
+            "missing a copy under $HOME"
+        );
+
+        // The session's own native file must still be untouched (invariant 2)
+        // — neither of the two new dests is the native path itself.
+        let native_file = live_root("claude-code")
+            .unwrap()
+            .join(crate::convert::ClaudeCodeConverter::encode_project_dir(native_project.to_str().unwrap()))
+            .join(format!("{}.jsonl", NATIVE_UUID));
+        assert!(
+            claude_links.iter().all(|r| r.dest != native_file),
+            "must never write onto the session's own native path"
+        );
+    }
+
     #[test]
     fn test_sync_dry_run_writes_nothing() {
         let _sb = Sandbox::new();
