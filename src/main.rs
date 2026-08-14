@@ -3,6 +3,7 @@ use agentbridge::connectors;
 use agentbridge::convert::{ClaudeCodeConverter, CodexCliConverter, SessionConverter};
 use agentbridge::model::Session;
 use clap::{Parser, Subcommand};
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -109,6 +110,14 @@ enum Commands {
         /// Dry run (show what would happen without doing it)
         #[arg(long)]
         dry_run: bool,
+
+        /// Merge turns back into the origin file (skip the prompt)
+        #[arg(long, conflicts_with = "copy")]
+        merge: bool,
+
+        /// Copy only — leave the origin file untouched (skip the prompt)
+        #[arg(long, conflicts_with = "merge")]
+        copy: bool,
     },
 
     /// Inject session context into an agent's startup
@@ -167,8 +176,8 @@ fn main() {
         Commands::Start { provider, passthrough, dry_run } => {
             cmd_start(&registry, &provider, &passthrough, dry_run)
         }
-        Commands::Resume { session_id, target, project, dry_run } => {
-            cmd_resume(&registry, &session_id, &target, project.as_deref(), dry_run)
+        Commands::Resume { session_id, target, project, dry_run, merge, copy } => {
+            cmd_resume(&registry, &session_id, &target, project.as_deref(), dry_run, merge, copy)
         }
         Commands::Inject { provider, session_ids, dry_run } => {
             cmd_inject(&registry, &provider, &session_ids, dry_run)
@@ -373,6 +382,8 @@ fn cmd_resume(
     target: &str,
     project: Option<&str>,
     dry_run: bool,
+    merge: bool,
+    copy: bool,
 ) {
     let source_session = find_session(registry, session_id);
     let mut session = match source_session {
@@ -401,10 +412,67 @@ fn cmd_resume(
 
     println!("Resuming session {} from {} into {}...", session.id, session.provider, target);
 
+    // Cross-tool access: the session originated in another tool. Ask what the
+    // user wants done with the origin file instead of silently choosing for
+    // them. `--merge`/`--copy` skip the prompt for scripts; non-TTY stdin
+    // (pipes) defaults to copy, leaving any previous choice in place.
+    if session.provider != target {
+        let choice = if merge {
+            Some(true)
+        } else if copy {
+            Some(false)
+        } else if std::io::stdin().is_terminal() {
+            use std::io::{BufRead, Write};
+            println!(
+                "This session is native to {}. When you continue it here, what should happen to the original {} file?",
+                session.provider, session.provider
+            );
+            println!("  [m] Merge back — new turns also get written into the original file");
+            println!("  [c] Copy only — origin file stays untouched (default)");
+            print!("Choice (m/c) [c]: ");
+            let _ = std::io::stdout().flush();
+            let mut line = String::new();
+            match std::io::stdin().lock().read_line(&mut line) {
+                Ok(_) => matches!(line.trim().to_lowercase().as_str(), "m" | "merge").then_some(true),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
+        match choice {
+            Some(true) => {
+                if let Err(e) = agentbridge::sync::set_merge(&session.id) {
+                    eprintln!("  ! could not record merge choice: {}", e);
+                } else {
+                    println!(
+                        "  Merge-back ON: new turns in {} will also update the original {} session file",
+                        target, session.provider
+                    );
+                }
+            }
+            Some(false) => {
+                agentbridge::sync::clear_merge(&session.id);
+                println!(
+                    "  Copy only: the original {} file stays untouched; new turns live in {}'s copy",
+                    session.provider, target
+                );
+            }
+            None => {
+                println!(
+                    "  Defaulting to copy-only (origin file untouched). Use --merge to opt in."
+                );
+            }
+        }
+    }
+
     let target_dirs = match target {
         "claude-code" => {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-            vec![PathBuf::from(&home).join(".claude").join("projects")]
+            let root = agentbridge::sync::claude_live_root().unwrap_or_else(|| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                PathBuf::from(&home).join(".claude").join("projects")
+            });
+            vec![root]
         }
         "codex-cli" => {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
@@ -697,6 +765,12 @@ fn cmd_sync(registry: &agentbridge::connector::Registry, project: Option<&str>, 
     if report.skipped_native > 0 {
         println!("  skipped   {} (already native here)", report.skipped_native);
     }
+    if report.merged_native > 0 {
+        println!(
+            "  merged    {} (opt-in merge-back: origin files updated)",
+            report.merged_native
+        );
+    }
     for e in report.errors.iter().take(10) {
         eprintln!("  ! {}", e);
     }
@@ -739,10 +813,20 @@ fn cmd_pull(dry_run: bool) {
     for (id, n) in &report.pulled {
         println!("  {:<40} +{} turn(s)", id, n);
     }
+    if !report.renamed.is_empty() {
+        println!(
+            "{} rename(s){}:",
+            report.renamed.len(),
+            if dry_run { " [dry-run]" } else { "" }
+        );
+        for (id, title) in &report.renamed {
+            println!("  {:<40} -> {}", id, title);
+        }
+    }
     for e in report.errors.iter().take(10) {
         eprintln!("  ! {}", e);
     }
-    if !dry_run && total > 0 {
+    if !dry_run && (total > 0 || !report.renamed.is_empty()) {
         println!();
         println!("Run `agentbridge sync` to push these to every other tool.");
     }

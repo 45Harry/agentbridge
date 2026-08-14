@@ -19,6 +19,13 @@ fn default_codex_dir() -> Option<PathBuf> {
     dirs_home().map(|h| h.join(".codex"))
 }
 
+/// The resolved codex home (`CODEX_HOME` override or the default), exposed
+/// for the sync write path so materialized copies land where this same
+/// connector reads from — see `sync::live_root`.
+pub(crate) fn config_home() -> Option<PathBuf> {
+    CODEX_HOME.clone()
+}
+
 fn dirs_home() -> Option<PathBuf> {
     std::env::var("HOME").ok().map(PathBuf::from)
 }

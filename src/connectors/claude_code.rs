@@ -19,6 +19,26 @@ fn default_claude_dir() -> Option<PathBuf> {
     dirs_home().map(|h| h.join(".claude").join("projects"))
 }
 
+/// The base config directory (`CLAUDE_CONFIG_DIR` override, or `~/.claude`
+/// by default) — always the parent of `projects/`, regardless of source.
+fn config_base() -> Option<PathBuf> {
+    std::env::var("CLAUDE_CONFIG_DIR")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| dirs_home().map(|h| h.join(".claude")))
+}
+
+/// Where materialized session copies must be written for the real Claude
+/// Code binary's `projects/<encoded-dir>/<uuid>.jsonl` convention to find
+/// them, honoring `CLAUDE_CONFIG_DIR` the same way reads do. Unlike
+/// `CLAUDE_CONFIG_DIR`/`roots()` (which point at the raw override and rely
+/// on `scan()`'s recursive walk to find `projects/` underneath it), this
+/// always appends `projects` explicitly — used by `sync::live_root`, never
+/// by `scan()`.
+pub(crate) fn write_root() -> Option<PathBuf> {
+    config_base().map(|b| b.join("projects"))
+}
+
 fn dirs_home() -> Option<PathBuf> {
     std::env::var("HOME").ok().map(PathBuf::from)
 }
@@ -240,7 +260,12 @@ fn scan_file(path: &Path) -> ConnectorResult<Option<RawSession>> {
         if timestamp.is_none() {
             timestamp = extract_cc_timestamp(&val);
         }
-        if title.is_none() {
+        // `-n/--name` (and in-session rename) write a dedicated record, not a
+        // field on a turn — the last one wins, since a later rename replaces
+        // an earlier one (see extract_cc_custom_title).
+        if let Some(t) = extract_cc_custom_title(event_type, &val) {
+            title = Some(t);
+        } else if title.is_none() {
             title = val.get("title").and_then(|v| v.as_str()).map(|s| s.to_string());
             if title.is_none() {
                 title = extract_cc_title(&val);
@@ -293,6 +318,19 @@ fn extract_cc_title(val: &Value) -> Option<String> {
         .and_then(|m| m.get("title"))
         .and_then(|t| t.as_str())
         .map(|s| s.to_string())
+}
+
+/// `-n/--name` and in-session rename write a dedicated record — never a field
+/// on a turn — so the generic title extractors above never see it:
+/// `{"type":"custom-title","customTitle":"…"}` (preferred) or
+/// `{"type":"agent-name","agentName":"…"}` (fallback, same value in practice
+/// but a distinct field name).
+fn extract_cc_custom_title(event_type: &str, val: &Value) -> Option<String> {
+    match event_type {
+        "custom-title" => val.get("customTitle").and_then(|t| t.as_str()).map(|s| s.to_string()),
+        "agent-name" => val.get("agentName").and_then(|t| t.as_str()).map(|s| s.to_string()),
+        _ => None,
+    }
 }
 
 /// Read a session from an explicit path rather than by id.
@@ -369,7 +407,12 @@ fn load_from_path(path: &Path, id: &str) -> ConnectorResult<Session> {
                 .map(|s| s.to_string());
         }
 
-        if title.is_none() {
+        // Last one wins: a later rename replaces an earlier one, and unlike
+        // `scan_file` this reads the whole file, so a rename anywhere in the
+        // session is seen (see extract_cc_custom_title).
+        if let Some(t) = extract_cc_custom_title(event_type, &val) {
+            title = Some(t);
+        } else if title.is_none() {
             title = extract_cc_title(&val);
             if title.is_none() {
                 title = val.get("title").and_then(|v| v.as_str()).map(|s| s.to_string());

@@ -127,6 +127,29 @@ mod tests {
             session.messages.len());
     }
 
+    /// `-n/--name` and in-session rename write dedicated `custom-title`/
+    /// `agent-name` records, not a field on a turn — `load()` (full session,
+    /// what sync/pull actually use) must see the last rename, not the
+    /// original `conversation_start` title.
+    ///
+    /// `scan()` is a different story: it stops at the first record carrying
+    /// `cwd` (RawSession's contract is "cheap, no full-file read" — see
+    /// `model.rs`), so a rename recorded *after* that point is invisible to
+    /// it until `load()` is used. That only affects `agentbridge list`'s
+    /// display, not sync/pull-back, which always goes through `load()`.
+    #[test]
+    fn test_claude_code_title_prefers_last_custom_title_record() {
+        let registry = all_for_testing(&fixture_root());
+        let cc = registry.by_id("claude-code").unwrap();
+
+        let results: Vec<_> = cc.scan().unwrap().filter_map(|r| r.ok()).collect();
+        let raw = results.iter().find(|r| r.id == "renamed-session").expect("should find renamed-session");
+        assert_eq!(raw.title.as_deref(), Some("Original title"), "scan() stops at the first cwd, before the rename");
+
+        let session = cc.load("renamed-session").unwrap();
+        assert_eq!(session.title.as_deref(), Some("Final rename"), "load() reads the whole file, so it sees the rename");
+    }
+
     #[test]
     fn test_codex_cli_scan_finds_sessions() {
         let registry = all_for_testing(&fixture_root());

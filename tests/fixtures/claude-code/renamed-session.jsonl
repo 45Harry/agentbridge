@@ -1,0 +1,6 @@
+{"uuid":"11111111-1111-1111-1111-111111111111","type":"conversation_start","cwd":"/home/user/project","timestamp":"2026-07-10T09:00:00Z","title":"Original title"}
+{"uuid":"22222222-2222-2222-2222-222222222222","type":"user_message","cwd":"/home/user/project","timestamp":"2026-07-10T09:00:05Z","content":"Let's get started"}
+{"type":"custom-title","customTitle":"First rename","sessionId":"renamed-session"}
+{"uuid":"33333333-3333-3333-3333-333333333333","type":"assistant_message","cwd":"/home/user/project","timestamp":"2026-07-10T09:00:10Z","content":"Sure thing"}
+{"type":"agent-name","agentName":"Stale fallback name","sessionId":"renamed-session"}
+{"type":"custom-title","customTitle":"Final rename","sessionId":"renamed-session"}

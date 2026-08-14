@@ -38,12 +38,24 @@ pub struct LinkRecord {
     /// existed.
     #[serde(default)]
     pub message_count: usize,
+    /// Title agentbridge last wrote into this copy (`None` when the source
+    /// session had none). Lets `pull_back` tell "the tool renamed it" apart
+    /// from "we never had a title to begin with" — the title equivalent of
+    /// `message_count`. Defaults to `None` for manifests written before
+    /// title tracking existed, which costs at most one spurious "renamed"
+    /// report on the first pull after upgrading.
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Default)]
 pub struct PullReport {
     /// (session id, number of new messages recovered)
     pub pulled: Vec<(String, usize)>,
+    /// (session id, new title) recovered from a rename made in a non-native
+    /// copy. Independent of `pulled` — a rename with no new turns still ends
+    /// up here.
+    pub renamed: Vec<(String, String)>,
     pub errors: Vec<String>,
 }
 
@@ -81,6 +93,27 @@ fn message_key(m: &crate::model::Message) -> String {
         m.text.as_deref().unwrap_or(""),
         m.tool_name.as_deref().unwrap_or(""),
     )
+}
+
+fn overlay_title_path(session_id: &str) -> PathBuf {
+    overlay_dir().join(format!("{}.title", session_id))
+}
+
+/// A rename recovered from a non-native copy (write-back). Mirrors
+/// `overlay_messages` but for the one-value title case: `pull_back` writes it
+/// here when a materialized copy's title no longer matches what agentbridge
+/// last wrote, and `fold_overlay` applies it on top of the native title
+/// before the next sync re-materializes every copy.
+pub fn overlay_title(session_id: &str) -> Option<String> {
+    fs::read_to_string(overlay_title_path(session_id))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn set_overlay_title(session_id: &str, title: &str) -> std::io::Result<()> {
+    fs::create_dir_all(overlay_dir())?;
+    fs::write(overlay_title_path(session_id), title)
 }
 
 fn append_overlay(session_id: &str, messages: &[crate::model::Message]) -> std::io::Result<usize> {
@@ -193,6 +226,27 @@ pub fn pull_back(dry_run: bool) -> PullReport {
             continue;
         };
 
+        // Title drift, checked independent of message drift below: a rename
+        // with no new turns (or vice versa) must still be recovered.
+        if let Some(new_title) = &session.title
+            && rec.title.as_deref() != Some(new_title.as_str())
+        {
+            if dry_run {
+                report.renamed.push((rec.session_id.clone(), new_title.clone()));
+            } else {
+                match set_overlay_title(&rec.session_id, new_title) {
+                    Ok(()) => {
+                        report.renamed.push((rec.session_id.clone(), new_title.clone()));
+                        rec.title = Some(new_title.clone());
+                        changed = true;
+                    }
+                    Err(e) => report
+                        .errors
+                        .push(format!("overlay title {}: {}", rec.session_id, e)),
+                }
+            }
+        }
+
         // Anything past what we wrote is the tool's own new work.
         if session.messages.len() <= rec.message_count {
             continue;
@@ -236,6 +290,10 @@ pub struct SyncReport {
     /// Skipped because the session is already native to that tool *in this
     /// directory*; agentbridge must not touch a tool's own sessions.
     pub skipped_native: usize,
+    /// Native origin files updated in place because the session opted into
+    /// merge-back (`agentbridge resume --merge`); turns pulled from other
+    /// tools' copies were appended to the tool's own session file.
+    pub merged_native: usize,
     /// Codex `threads` rows inserted so the materialized rollouts show up in
     /// `codex /resume` (CONNECTORS.md §2).
     pub codex_indexed: usize,
@@ -270,20 +328,55 @@ fn manifest_path() -> PathBuf {
     data_dir().join("manifest.jsonl")
 }
 
-/// Where a target tool keeps its sessions.
+/// Per-session opt-in to merge-back: when a session carries a marker, turns
+/// pulled from *other* tools' copies are also appended to the session's own
+/// native file during sync. Without a marker, invariant 2 applies and the
+/// origin file is never touched. The marker is set interactively by
+/// `agentbridge resume` when the user chooses merge across tools.
+fn merge_marker_path(session_id: &str) -> PathBuf {
+    data_dir().join("merge").join(session_id)
+}
+
+pub fn set_merge(session_id: &str) -> std::io::Result<()> {
+    let p = merge_marker_path(session_id);
+    if let Some(parent) = p.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&p, b"merge\n")
+}
+
+pub fn is_merge(session_id: &str) -> bool {
+    merge_marker_path(session_id).exists()
+}
+
+pub fn clear_merge(session_id: &str) {
+    let _ = fs::remove_file(merge_marker_path(session_id));
+}
+
+/// Where a target tool keeps its sessions. Must track the same
+/// `CLAUDE_CONFIG_DIR`/`CODEX_HOME` overrides the read connectors use
+/// (`connectors::claude_code::config_root`, `connectors::codex_cli::config_home`)
+/// — otherwise materialized copies land in the default `~/.claude` or
+/// `~/.codex` even when the real tool has been redirected elsewhere, and the
+/// tool never sees them.
 fn live_root(target: &str) -> Option<PathBuf> {
     match target {
-        "claude-code" => Some(home().join(".claude").join("projects")),
-        "codex-cli" => Some(home().join(".codex")),
+        "claude-code" => crate::connectors::claude_code::write_root(),
+        "codex-cli" => crate::connectors::codex_cli::config_home(),
         // OpenCode stores rows in SQLite, not files — it cannot be hardlinked
         // into and is handled separately (DESIGN.md §5).
         _ => None,
     }
 }
 
+/// Public accessor for `resume`'s claude-code target: the same redirected
+/// root sync materializes into (honors `CLAUDE_CONFIG_DIR`).
+pub fn claude_live_root() -> Option<PathBuf> {
+    live_root("claude-code")
+}
+
 /// OpenCode's database, when present.
-fn opencode_db() -> Option<PathBuf> {
-    let p = if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+fn opencode_db() -> Option<PathBuf> {    let p = if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
         PathBuf::from(xdg).join("opencode").join("opencode.db")
     } else {
         home().join(".local").join("share").join("opencode").join("opencode.db")
@@ -395,6 +488,85 @@ fn append_manifest(records: &[LinkRecord]) -> std::io::Result<()> {
 /// file-based tool.
 ///
 /// `dry_run` plans without touching the filesystem.
+/// Fold turns other tools appended into a session (write-back). Dedup by turn
+/// identity: a source session may already contain them if the user also
+/// continued it in its own tool.
+fn fold_overlay(session: &mut crate::model::Session, session_id: &str) {
+    let overlay = overlay_messages(session_id);
+    if !overlay.is_empty() {
+        let have: std::collections::HashSet<String> =
+            session.messages.iter().map(message_key).collect();
+        for m in overlay {
+            if !have.contains(&message_key(&m)) {
+                session.messages.push(m);
+            }
+        }
+        session
+            .messages
+            .sort_by_key(|m| m.timestamp.map(|t| t.timestamp_millis()).unwrap_or(0));
+        for (i, m) in session.messages.iter_mut().enumerate() {
+            m.ordinal = i as u64;
+        }
+    }
+
+    // A rename made in a non-native copy overrides the native title the same
+    // way appended turns override the native message list — the native file
+    // itself is never touched (invariant 2), so this overlay is the only
+    // record of the rename until/unless the session opts into merge-back.
+    if let Some(t) = overlay_title(session_id) {
+        session.title = Some(t);
+    }
+}
+
+/// Write turns pulled from other tools back into the session's own native
+/// file (opt-in merge-back, `resume --merge`). The claude-code variant
+/// re-converts directly into the live root — the converter derives the same
+/// `<encoded-project>/<uuid>.jsonl` path the native file lives at, so the
+/// file is refreshed in place. The codex variant re-converts to cache and
+/// copies the artifact over the native rollout, whose own filename derives
+/// from the same session data and therefore matches.
+fn merge_back_native(
+    registry: &Registry,
+    entry: &crate::index::IndexEntry,
+) -> Result<(), String> {
+    let Some(source) = registry.by_id(&entry.provider) else {
+        return Err(format!("merge-back: no connector for {}", entry.provider));
+    };
+    let mut session = match source.load(&entry.id) {
+        Ok(s) => s,
+        Err(e) => return Err(format!("merge-back load {}: {}", entry.id, e)),
+    };
+    fold_overlay(&mut session, &entry.id);
+
+    match entry.provider.as_str() {
+        "claude-code" => {
+            let Some(live) = live_root("claude-code") else {
+                return Err("merge-back: no claude-code live root".to_string());
+            };
+            ClaudeCodeConverter::new()
+                .convert(&session, &live)
+                .map(|_| ())
+        }
+        "codex-cli" => {
+            let Some(live) = live_root("codex-cli") else {
+                return Err("merge-back: no codex-cli live root".to_string());
+            };
+            let cache = cache_root("codex-cli");
+            let dir = session.project_path().unwrap_or_default();
+            let artifact = CodexCliConverter::new()
+                .convert_multi(&session, &cache, std::slice::from_ref(&dir))?
+                .into_iter()
+                .next()
+                .ok_or_else(|| "merge-back: codex produced no artifact".to_string())?;
+            let rel = artifact.strip_prefix(&cache).unwrap_or(&artifact);
+            let dest = live.join(rel);
+            link_or_copy(&artifact, &dest).map_err(|e| format!("merge-back write: {}", e))?;
+            Ok(())
+        }
+        other => Err(format!("merge-back not supported for {}", other)),
+    }
+}
+
 pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncReport {
     let index: Index = discover(registry);
     let mut report = SyncReport::default();
@@ -456,9 +628,23 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
         }
         for target in &targets {
             // A session already native to this tool *in this directory* is
-            // left strictly alone (invariant 2).
+            // left strictly alone (invariant 2) — unless the user opted the
+            // session into merge-back (`resume --merge`), in which case turns
+            // pulled from other tools' copies are appended to the tool's own
+            // file instead.
             if &entry.provider == target && entry.project_path.as_deref() == Some(project) {
-                report.skipped_native += 1;
+                if !dry_run
+                    && is_merge(&entry.id)
+                    && !overlay_messages(&entry.id).is_empty()
+                    && entry.provider != "opencode"
+                {
+                    match merge_back_native(registry, entry) {
+                        Ok(()) => report.merged_native += 1,
+                        Err(e) => report.errors.push(e),
+                    }
+                } else {
+                    report.skipped_native += 1;
+                }
                 continue;
             }
 
@@ -485,22 +671,7 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
             // Fold in turns other tools appended (write-back). Dedup by turn
             // identity: a source session may already contain them if the user
             // also continued it in its own tool.
-            let overlay = overlay_messages(&entry.id);
-            if !overlay.is_empty() {
-                let have: std::collections::HashSet<String> =
-                    session.messages.iter().map(message_key).collect();
-                for m in overlay {
-                    if !have.contains(&message_key(&m)) {
-                        session.messages.push(m);
-                    }
-                }
-                session
-                    .messages
-                    .sort_by_key(|m| m.timestamp.map(|t| t.timestamp_millis()).unwrap_or(0));
-                for (i, m) in session.messages.iter_mut().enumerate() {
-                    m.ordinal = i as u64;
-                }
-            }
+            fold_overlay(&mut session, &entry.id);
 
             if dry_run {
                 report.created.push(LinkRecord {
@@ -516,6 +687,7 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
                     project: project.to_path_buf(),
                     inode: 0,
                     message_count: session.messages.len(),
+                    title: session.title.clone(),
                 });
                 continue;
             }
@@ -561,6 +733,7 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
                         // True row count, not session.messages.len(): a
                         // placeholder turn may have been inserted.
                         message_count: row.messages,
+                        title: session.title.clone(),
                     });
                 }
                 continue;
@@ -665,6 +838,7 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
                             project: project.to_path_buf(),
                             inode,
                             message_count: session.messages.len(),
+                            title: session.title.clone(),
                         });
                     }
                     Err(e) => report.errors.push(format!("link {}: {}", entry.id, e)),
@@ -881,6 +1055,13 @@ mod tests {
             unsafe {
                 std::env::set_var("HOME", tmp.path());
                 std::env::set_var("AGENTBRIDGE_DATA_DIR", tmp.path().join(".agentbridge"));
+                // live_root() now honors these overrides the same way the
+                // read connectors do (regression: it used to hardcode
+                // ~/.claude and ~/.codex) — sandbox them too, or a sandboxed
+                // test run under an operator's own overridden shell would
+                // write into their real session store instead of tmp.
+                std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path().join(".claude"));
+                std::env::set_var("CODEX_HOME", tmp.path().join(".codex"));
             }
             Sandbox { _tmp: tmp, _guard: guard }
         }
@@ -959,14 +1140,161 @@ mod tests {
             project: tmp.path().to_path_buf(),
             inode: 999_999_999,
             message_count: 0,
+            title: None,
         };
         append_manifest(&[rec]).unwrap();
 
         let report = unsync(false);
-
         assert!(foreign.exists(), "must not delete a file it did not create");
         assert_eq!(report.removed.len(), 0);
         assert_eq!(report.kept_foreign.len(), 1);
+    }
+
+    /// Regression: `live_root` used to hardcode `~/.claude` and `~/.codex`,
+    /// ignoring `CLAUDE_CONFIG_DIR`/`CODEX_HOME`. On a machine where either
+    /// is redirected (e.g. a non-default Claude Code install), materialized
+    /// copies silently went to the default path instead — invisible to the
+    /// tool that actually reads from the override.
+    #[test]
+    fn test_live_root_honors_config_dir_overrides() {
+        let _sb = Sandbox::new();
+        let custom = tempfile::tempdir().unwrap();
+        let claude_dir = custom.path().join("custom-claude-home");
+        let codex_dir = custom.path().join("custom-codex-home");
+        unsafe {
+            std::env::set_var("CLAUDE_CONFIG_DIR", &claude_dir);
+            std::env::set_var("CODEX_HOME", &codex_dir);
+        }
+
+        assert_eq!(
+            live_root("claude-code"),
+            Some(claude_dir.join("projects")),
+            "must honor CLAUDE_CONFIG_DIR, not hardcode ~/.claude/projects"
+        );
+        assert_eq!(
+            live_root("codex-cli"),
+            Some(codex_dir),
+            "must honor CODEX_HOME, not hardcode ~/.codex"
+        );
+    }
+
+    const NATIVE_UUID: &str = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
+
+    /// A native Claude Code session file in the sandboxed live root, its cwd
+    /// pointed at `project` so discovery treats it as native *there*.
+    fn write_native_claude_session(root: &Path, project: &str) {
+        let encoded = crate::convert::ClaudeCodeConverter::encode_project_dir(project);
+        let dir = root.join(&encoded);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(format!("{}.jsonl", NATIVE_UUID));
+        let body = format!(
+            "{{\"uuid\":\"{}\",\"type\":\"conversation_start\",\"cwd\":\"{}\",\"timestamp\":\"2026-07-01T12:00:00Z\",\"title\":\"Merge test\"}}\n\
+             {{\"uuid\":\"b2c3d4e5-f6a7-8901-bcde-f12345678901\",\"parentUuid\":\"{}\",\"type\":\"user_message\",\"cwd\":\"{}\",\"timestamp\":\"2026-07-01T12:00:05Z\",\"content\":\"first question\"}}\n",
+            NATIVE_UUID, project, NATIVE_UUID, project
+        );
+        fs::write(file, body).unwrap();
+    }
+
+    fn native_registry(root: PathBuf) -> crate::connector::Registry {
+        crate::connector::Registry::new(vec![Box::new(
+            crate::connectors::claude_code::TestClaudeCode::new(root),
+        )])
+    }
+
+    #[test]
+    fn test_merge_marker_roundtrip() {
+        let _sb = Sandbox::new();
+        assert!(!is_merge("some-session"));
+        set_merge("some-session").unwrap();
+        assert!(is_merge("some-session"));
+        clear_merge("some-session");
+        assert!(!is_merge("some-session"));
+    }
+
+    /// Merge-back: a session the user opted into (`resume --merge`) gets the
+    /// turns pulled from other tools appended to its own native file during
+    /// sync — even though invariant 2 would normally skip it.
+    #[test]
+    fn test_sync_merges_overlay_into_native_file_when_opted_in() {
+        let _sb = Sandbox::new();
+        let live = live_root("claude-code").unwrap();
+        let project = PathBuf::from("/tmp/merge-project");
+        write_native_claude_session(&live, project.to_str().unwrap());
+        let registry = native_registry(live.clone());
+
+        // A turn another tool (e.g. opencode) appended to its copy.
+        let overlay_msg = crate::model::Message {
+            session_id: NATIVE_UUID.into(),
+            ordinal: 0,
+            role: crate::model::Role::User,
+            timestamp: Some(chrono::DateTime::from_timestamp(1783000000, 0).unwrap()),
+            text: Some("answered in opencode".into()),
+            tool_name: None,
+            tool_input: None,
+            tool_result: None,
+            parent_ordinal: None,
+        };
+        append_overlay(NATIVE_UUID, &[overlay_msg]).unwrap();
+        set_merge(NATIVE_UUID).unwrap();
+
+        let report = sync_into(&registry, &project, false);
+
+        assert_eq!(report.merged_native, 1, "opted-in native session must be merged back");
+        assert_eq!(report.skipped_native, 0);
+        assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+
+        let session = crate::connectors::claude_code::load_file(
+            &live.join(crate::convert::ClaudeCodeConverter::encode_project_dir(project.to_str().unwrap()))
+                .join(format!("{}.jsonl", NATIVE_UUID)),
+            NATIVE_UUID,
+        )
+        .unwrap();
+        assert!(
+            session.messages.iter().any(|m| m.text.as_deref() == Some("answered in opencode")),
+            "native file must now contain the turn pulled from the other tool"
+        );
+        assert!(
+            session.messages.iter().any(|m| m.text.as_deref() == Some("first question")),
+            "original turns must be preserved"
+        );
+    }
+
+    /// Without the opt-in marker, invariant 2 still holds: the native file is
+    /// never modified, even when other tools appended turns.
+    #[test]
+    fn test_sync_leaves_native_file_untouched_without_merge_marker() {
+        let _sb = Sandbox::new();
+        let live = live_root("claude-code").unwrap();
+        let project = PathBuf::from("/tmp/merge-project");
+        write_native_claude_session(&live, project.to_str().unwrap());
+        let registry = native_registry(live.clone());
+        let native_file = live
+            .join(crate::convert::ClaudeCodeConverter::encode_project_dir(project.to_str().unwrap()))
+            .join(format!("{}.jsonl", NATIVE_UUID));
+        let before = fs::read_to_string(&native_file).unwrap();
+
+        let overlay_msg = crate::model::Message {
+            session_id: NATIVE_UUID.into(),
+            ordinal: 0,
+            role: crate::model::Role::User,
+            timestamp: Some(chrono::DateTime::from_timestamp(1783000000, 0).unwrap()),
+            text: Some("from another tool".into()),
+            tool_name: None,
+            tool_input: None,
+            tool_result: None,
+            parent_ordinal: None,
+        };
+        append_overlay(NATIVE_UUID, &[overlay_msg]).unwrap();
+
+        let report = sync_into(&registry, &project, false);
+
+        assert_eq!(report.merged_native, 0);
+        assert_eq!(report.skipped_native, 1, "without marker the session is still skipped");
+        assert_eq!(
+            fs::read_to_string(&native_file).unwrap(),
+            before,
+            "native file must remain byte-identical without the merge marker"
+        );
     }
 
     #[test]
@@ -1028,6 +1356,22 @@ mod tests {
             "version": "2.1.220",
             "gitBranch": "",
             "message": { "role": "user", "content": text },
+        }).to_string());
+        body.push('\n');
+        fs::write(dest, body).unwrap();
+    }
+
+    /// Mirrors what a real in-session rename (or `-n/--name`) writes: a
+    /// dedicated `custom-title` record, not a field on a turn.
+    fn rename_claude_session(dest: &Path, sid: &str, title: &str) {
+        let mut body = fs::read_to_string(dest).unwrap();
+        if !body.ends_with('\n') {
+            body.push('\n');
+        }
+        body.push_str(&serde_json::json!({
+            "type": "custom-title",
+            "customTitle": title,
+            "sessionId": sid,
         }).to_string());
         body.push('\n');
         fs::write(dest, body).unwrap();
@@ -1117,6 +1461,64 @@ mod tests {
         );
     }
 
+    /// A rename made in a non-native copy must be recovered the same way an
+    /// appended turn is — this is the fix for "renamed a session in one tool,
+    /// the other tool never saw it."
+    #[test]
+    fn test_pull_back_recovers_a_rename() {
+        let _sb = Sandbox::new();
+        let registry = crate::connectors::all_for_testing(&fixture_root());
+        let project = PathBuf::from("/tmp/some-project");
+
+        let synced = sync_into(&registry, &project, false);
+        let link = first_claude_link(&synced);
+
+        assert!(pull_back(false).renamed.is_empty(), "no rename yet");
+
+        rename_claude_session(&link.dest, &link.session_id, "renamed-in-claude-code");
+
+        let report = pull_back(false);
+        assert_eq!(
+            report.renamed,
+            vec![(link.session_id.clone(), "renamed-in-claude-code".to_string())]
+        );
+        assert_eq!(
+            overlay_title(&link.session_id).as_deref(),
+            Some("renamed-in-claude-code")
+        );
+
+        // Pulling again with no further rename must not report it a second time.
+        assert!(pull_back(false).renamed.is_empty(), "re-pulling must not repeat a rename");
+    }
+
+    /// The point of write-back for titles: a rename made in one tool reaches
+    /// every other tool's copy on the next sync.
+    #[test]
+    fn test_recovered_rename_propagates_to_other_tools() {
+        let _sb = Sandbox::new();
+        let registry = crate::connectors::all_for_testing(&fixture_root());
+        let project = PathBuf::from("/tmp/some-project");
+        let synced = sync_into(&registry, &project, false);
+        let link = first_claude_link(&synced);
+
+        rename_claude_session(&link.dest, &link.session_id, "renamed-in-claude-code");
+        pull_back(false);
+
+        unsync(false);
+        let resynced = sync_into(&registry, &project, false);
+        let codex = resynced
+            .created
+            .iter()
+            .find(|r| r.target_provider == "codex-cli" && r.session_id == link.session_id)
+            .expect("a codex link for the same session");
+
+        // Codex keeps title in its `threads` SQLite index, not the rollout
+        // file body (that upsert has its own coverage in codex_write.rs) — so
+        // the LinkRecord is the observable point here: it carries the title
+        // that will be written into that index (`ensure_codex_row`).
+        assert_eq!(codex.title.as_deref(), Some("renamed-in-claude-code"));
+    }
+
     /// The overlay is the ONLY durable copy of turns added in a materialized
     /// session — `unsync` deletes the materialized files, so destroying the
     /// overlay with them would lose real work.
@@ -1193,6 +1595,7 @@ mod tests {
             session_id: source.id.clone(),
             source_provider: "claude-code".into(),
             target_provider: "opencode".into(),
+            title: None,
             project: PathBuf::from("/tmp/some-project"),
             inode: 0,
             message_count: written,
@@ -1301,6 +1704,7 @@ mod tests {
             project: PathBuf::from("/p"),
             inode: 0,
             message_count: 812,
+            title: None,
         };
         let fresh = LinkRecord {
             dest,
@@ -1311,6 +1715,7 @@ mod tests {
             project: PathBuf::from("/p"),
             inode: 0,
             message_count: 1202,
+            title: None,
         };
         append_manifest(&[stale, fresh]).unwrap();
 

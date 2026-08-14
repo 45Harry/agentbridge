@@ -58,7 +58,7 @@ impl ClaudeCodeConverter {
     /// Note: this encoding is lossy and is only ever used to *write* into the
     /// directory Claude Code will look in. The project path itself is always
     /// read from the `cwd` field inside records, never decoded from here.
-    fn encode_project_dir(path: &str) -> String {
+    pub(crate) fn encode_project_dir(path: &str) -> String {
         path.chars()
             .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
             .collect()
@@ -96,6 +96,22 @@ impl SessionConverter for ClaudeCodeConverter {
         let cwd = session.project_path().unwrap_or_default();
         let version = CLAUDE_CODE_VERSION;
         let mut records = Vec::new();
+
+        // `-n/--name` (and in-session rename) live in a dedicated pair of
+        // records, not a field on a turn — real sessions carry them first,
+        // before even the mode/permission-mode records below.
+        if let Some(title) = &session.title {
+            records.push(json!({
+                "type": "custom-title",
+                "customTitle": title,
+                "sessionId": sid,
+            }));
+            records.push(json!({
+                "type": "agent-name",
+                "agentName": title,
+                "sessionId": sid,
+            }));
+        }
 
         // Claude Code's own sessions always open with these two control
         // records; its resume path expects them before any turn records.
@@ -227,6 +243,7 @@ impl SessionConverter for ClaudeCodeConverter {
 
         std::fs::write(&out_path, &content)
             .map_err(|e| format!("failed to write converted session: {}", e))?;
+        set_mtime_from_session(&out_path, session);
 
         Ok(out_path)
     }
@@ -239,6 +256,26 @@ impl SessionConverter for ClaudeCodeConverter {
             .to_string();
         vec!["claude".to_string(), "--resume".to_string(), session_id]
     }
+}
+
+/// A materialized artifact's mtime otherwise defaults to "now" (the moment
+/// `sync` ran), which sorts a months-old conversation to the top of any
+/// picker that orders by file mtime instead of parsing content — confusing,
+/// since Claude Code's own picker does exactly that (CONNECTORS.md §1: no
+/// separate index, filesystem-scanned). Set it to the session's own last
+/// activity instead, so a synced copy sorts where the real conversation
+/// happened, not where the sync happened.
+fn set_mtime_from_session(path: &Path, session: &Session) {
+    let Some(dt) = session.last_event_at.or(session.started_at) else {
+        return;
+    };
+    let Ok(file) = std::fs::File::options().write(true).open(path) else {
+        return;
+    };
+    let secs = dt.timestamp().max(0) as u64;
+    let nanos = dt.timestamp_subsec_nanos();
+    let time = std::time::UNIX_EPOCH + std::time::Duration::new(secs, nanos);
+    let _ = file.set_modified(time);
 }
 
 pub struct CodexCliConverter;
@@ -409,6 +446,7 @@ impl SessionConverter for CodexCliConverter {
 
             std::fs::write(&out_path, &content)
                 .map_err(|e| format!("failed to write codex converted session: {}", e))?;
+            set_mtime_from_session(&out_path, session);
             out_paths.push(out_path);
         }
 
@@ -737,11 +775,20 @@ mod tests {
 
         let recs = records(&path);
 
+        // Title records (custom-title + agent-name) come first when the
+        // session has one — real sessions carry them before the control
+        // records (CONNECTORS.md §6).
+        let offset = if session.title.is_some() { 2 } else { 0 };
+        if offset > 0 {
+            assert_eq!(recs[0]["type"], "custom-title");
+            assert_eq!(recs[1]["type"], "agent-name");
+        }
+
         // Control records, in order, before any turn records.
-        assert_eq!(recs[0]["type"], "mode");
-        assert_eq!(recs[0]["mode"], "normal");
-        assert_eq!(recs[1]["type"], "permission-mode");
-        assert_eq!(recs[1]["permissionMode"], "default");
+        assert_eq!(recs[offset]["type"], "mode");
+        assert_eq!(recs[offset]["mode"], "normal");
+        assert_eq!(recs[offset + 1]["type"], "permission-mode");
+        assert_eq!(recs[offset + 1]["permissionMode"], "default");
 
         // Every record must carry sessionId, or resume cannot match the file.
         for (i, r) in recs.iter().enumerate() {
@@ -1032,6 +1079,20 @@ mod tests {
         assert_eq!(stems, again_stems, "filenames must be deterministic");
     }
 
+    /// Same "current time" confusion fix as the Claude Code converter, for
+    /// the Codex rollout files `convert_multi` writes.
+    #[test]
+    fn test_codex_convert_multi_mtime_matches_session_last_event() {
+        let session = test_session();
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = vec!["/home/user/test-project".to_string()];
+        let paths = CodexCliConverter::new().convert_multi(&session, tmp.path(), &dirs).unwrap();
+
+        let mtime = std::fs::metadata(&paths[0]).unwrap().modified().unwrap();
+        let expected: std::time::SystemTime = session.last_event_at.unwrap().into();
+        assert_eq!(mtime, expected, "mtime must be the session's last activity, not sync time");
+    }
+
     /// `codex resume` takes a bare UUID; the stem is `rollout-<ts>-<uuid>`, so
     /// naively using the whole stem passes a bogus id.
     #[test]
@@ -1045,6 +1106,22 @@ mod tests {
         assert_eq!(cmd[0], "codex");
         assert_eq!(cmd[1], "resume");
         assert_eq!(cmd[2], session.id, "must be the bare uuid, not the rollout stem");
+    }
+
+    /// A materialized file's mtime defaulting to "now" (sync time) sorts a
+    /// months-old conversation to the top of Claude Code's own resume picker,
+    /// which orders by filesystem mtime, not content — the "current time"
+    /// confusion this fix addresses. mtime must instead match the session's
+    /// own last activity.
+    #[test]
+    fn test_converted_claude_file_mtime_matches_session_last_event() {
+        let session = test_session();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = ClaudeCodeConverter::new().convert(&session, tmp.path()).unwrap();
+
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let expected: std::time::SystemTime = session.last_event_at.unwrap().into();
+        assert_eq!(mtime, expected, "mtime must be the session's last activity, not sync time");
     }
 
     /// Self-consistency: a file written by the Claude Code converter must be

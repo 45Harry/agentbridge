@@ -4,14 +4,14 @@ Pick this project up cold — new machine, new session, no memory of prior
 conversation. Read this, then `DESIGN.md` (architecture and why), then
 `CONNECTORS.md` (each tool's on-disk format).
 
-**Last updated:** 2026-08-03.
+**Last updated:** 2026-08-14.
 
 ## 0. Start here
 
 ```bash
 git clone git@github.com:45Harry/agentbridge.git
 cd agentbridge
-cargo build && cargo test      # 78 tests pass (+2 ignored: live-verification suites)
+cargo build && cargo test      # 87 tests pass (+2 ignored: live-verification suites)
 cargo run -- init              # read-only: what's on this machine
 ```
 
@@ -120,6 +120,79 @@ final live pass with OpenCode closed still stands (see §6.0):
    dest (the database), so a whole run's rows collapsed into a single manifest
    entry and `status`/`pull` tracked one session out of hundreds. The key is
    now (dest, row id) for OpenCode, unchanged for file targets.
+
+## 2b. Session titles didn't sync, and mtime confused pickers — fixed 2026-08-14
+
+Operator report, live: rename a session in OpenCode (`claude-opencode-funny-
+joke-code`), it never shows up back in Claude Code. Root-caused and fixed —
+**unit-tested only, not yet re-verified against the real binaries** (§4
+applies: that has bitten this project three times already). This is the
+single most important next step; see the flagged item at the top of §6.
+
+**Bug 1 — `live_root()` ignored `CLAUDE_CONFIG_DIR`/`CODEX_HOME`.** Found
+first, while chasing the title bug. `sync.rs::live_root()` hardcoded
+`~/.claude/projects` / `~/.codex`, while the read connectors already honored
+the env var overrides. On this operator's machine
+(`CLAUDE_CONFIG_DIR=/Users/harry/.claude-mantra`), materialized copies were
+silently landing in `~/.claude` — a directory the real, redirected Claude Code
+install never reads. Fixed via `write_root()`/`config_home()` helpers shared
+with the read side; 1352 stray files this had produced were manually removed
+(matched against `manifest.jsonl`, not a blanket `unsync`; the 190 unrelated
+pre-existing files at that path were left alone).
+
+**Bug 2 — Claude Code never parsed its own title.** `-n/--name` and in-session
+rename write dedicated `{"type":"custom-title","customTitle":"…"}` /
+`{"type":"agent-name","agentName":"…"}` records — not a field on a turn — so
+`claude_code.rs` had nothing to feed the sync/write-back machinery even though
+Codex (`threads.title`) and OpenCode (`session.title`) were already wired
+correctly. Fixed:
+
+- `connectors/claude_code.rs`: both `scan_file()` and `load_from_path()` now
+  recognize `custom-title`/`agent-name`, last-one-wins (a later rename
+  replaces an earlier one).
+- `convert.rs::ClaudeCodeConverter`: emits both records (before even the
+  `mode`/`permission-mode` control records, matching real files) when
+  materializing a session that has a title.
+- `sync.rs`: new **title overlay**, symmetric to the existing message
+  overlay — `LinkRecord` gained a `title: Option<String>` field so
+  `pull_back()` can tell "the tool renamed it" from "we never wrote a title
+  here." A rename detected in a materialized copy (title in the file/DB no
+  longer matches what agentbridge last wrote) is written to
+  `~/.agentbridge/overlay/<session>.title` and reported in `PullReport.renamed`
+  (printed by `agentbridge pull`); `fold_overlay()` applies it on top of the
+  native title before the next `sync` re-materializes every other copy.
+
+**Known limitation, by design, unchanged from the message case (invariant
+2):** a rename recovered from a non-native copy propagates to every *other*
+materialized copy, but never back into the session's true origin file — same
+rule that already blocks message write-back into the origin file. Same escape
+hatch: `agentbridge resume --merge` opts a session into merge-back, which
+folds recovered turns (and now titles) into the native file too.
+
+**Narrower limitation:** `agentbridge list`'s title column comes from
+`scan()`, which stops reading at the first record carrying `cwd` (RawSession
+is meant to be cheap — no full-file read, see `model.rs`). A rename recorded
+*after* that point (mid-conversation, not at session start) is invisible to
+`list` until the fuller `load()` path runs (which sync/pull always use, so
+propagation itself is unaffected — only the CLI's own listing can lag).
+Covered by `test_claude_code_title_prefers_last_custom_title_record`
+(`src/connectors/mod.rs`), which asserts the split explicitly.
+
+**Bug 3 — "current time" confusion.** Reported alongside the title bug:
+synced sessions look freshly active. Materializing a file via `fs::write`
+leaves its mtime at "now" (sync time), and Claude Code's own resume picker is
+filesystem-scanned with no separate index (`CONNECTORS.md` §1) — so it sorts
+by that mtime, putting a months-old conversation at the top. Fixed: both
+`ClaudeCodeConverter::convert()` and `CodexCliConverter::convert_multi()` now
+call a new `set_mtime_from_session()` (`convert.rs`) right after writing the
+file, setting mtime to the session's own `last_event_at` (falling back to
+`started_at`) via `File::set_modified()`.
+
+Test coverage added this round (see `cargo test`, now 87 + 2 ignored):
+`test_pull_back_recovers_a_rename`, `test_recovered_rename_propagates_to_other_tools`,
+`test_claude_code_title_prefers_last_custom_title_record`,
+`test_converted_claude_file_mtime_matches_session_last_event`,
+`test_codex_convert_multi_mtime_matches_session_last_event`.
 
 ## 3. Architecture in one page
 
@@ -244,7 +317,31 @@ reads it fine).
 
 ## 6. Next steps, in order
 
-0. **Re-verify the 2026-08-03 OpenCode fix live — do this first.** The
+**⚠️ START HERE — re-verify the §2b title/mtime fix against the real
+binaries.** It only has unit-test coverage (87 passing tests) — per §4,
+that has meant nothing here three times before. Concretely:
+
+```bash
+cargo install --path . && agentbridge --version   # must print the new build
+```
+
+1. Rename a real session in OpenCode (`opencode`, in-app rename or
+   equivalent), `agentbridge sync`, then `agentbridge pull` and confirm
+   `PullReport.renamed` fires and `agentbridge sync` again pushes the new
+   title into the Claude Code copy — `claude --resume <id>` should show it,
+   and the file's `custom-title`/`agent-name` records should carry it.
+2. Do the same starting from a Claude Code in-session rename (`/rename` or
+   whatever the real UI action is) propagating out to the Codex/OpenCode
+   copies — check the `threads.title` / `session.title` columns directly.
+3. Confirm the mtime fix: after `sync`, a months-old session's materialized
+   Claude Code file should **not** sort to the top of `claude --resume`'s
+   picker — `stat` the file and diff against the session's real last-activity
+   timestamp.
+4. Confirm invariant 2 still holds: renaming in a *non-native* copy must never
+   touch the session's real origin file unless that session opted into
+   `resume --merge`.
+
+0. **Re-verify the 2026-08-03 OpenCode fix live.** The
    per-project id + manifest key changes pass 78 unit tests and nothing else;
    §4's first line applies. (The 2026-08-11 sandbox pass above proved the
    write path and picker visibility against real DB bytes and the real binary;
@@ -298,7 +395,7 @@ reads it fine).
 ## 7. Repo hygiene
 
 - Public: `https://github.com/45Harry/agentbridge`, branch `master`.
-- Keep tests green (78 + 2 ignored); add a regression test for every bug, and
+- Keep tests green (87 + 2 ignored); add a regression test for every bug, and
   verify format changes against the real binary before believing them.
 - Never commit session data. `~/.agentbridge` is never the source of fixtures.
 - Ignored tests are the real-data checks: run them explicitly after any
