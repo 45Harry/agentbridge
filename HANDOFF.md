@@ -11,7 +11,7 @@ conversation. Read this, then `DESIGN.md` (architecture and why), then
 ```bash
 git clone git@github.com:45Harry/agentbridge.git
 cd agentbridge
-cargo build && cargo test      # 89 tests pass (+2 ignored: live-verification suites)
+cargo build && cargo test      # 90 tests pass (+2 ignored: live-verification suites)
 cargo run -- init              # read-only: what's on this machine
 ```
 
@@ -245,6 +245,46 @@ bug; everything else confirmed working:
   against the reverse-engineered real schema (`REAL_SCHEMA` in its test
   module); still worth a real pass per §4's doctrine when convenient.
 
+## 2d. Codex never showed a rename either — third bug, fixed 2026-08-14
+
+Operator follow-up: "what about codex?" §2c had explicitly left Codex's
+`threads.title` unverified live (state_5.sqlite needs a real authenticated
+`codex` run to bootstrap). Two findings from actually chasing that down:
+
+- **`CODEX_HOME` is not fully honored by the real `codex` binary.** Sandboxing
+  `codex exec` with `CODEX_HOME=<sandbox>` still touched the operator's real
+  `~/.codex/state_5.sqlite` (confirmed by mtime, moments after the sandboxed
+  run) — the sessions themselves went into the sandboxed dir correctly, but
+  something about opening the state DB reached the default location instead.
+  No corruption resulted (row count unchanged, no new/bogus rows — it looks
+  like an open/checkpoint touch, not a write of new data), but **do not
+  invoke the real `codex` binary against a `CODEX_HOME` override expecting
+  full isolation** — it does not give you one, unlike `claude`/`opencode`,
+  which respected their equivalent overrides throughout all of §2c's testing.
+  Safe alternative used here instead: copy the operator's real
+  `state_5.sqlite` (schema + realistic prior rows) into a sandboxed
+  `CODEX_HOME`, then let *agentbridge itself* (not the real `codex` binary)
+  write into it — that fully respects `CODEX_HOME` since it's our own code.
+- **The real bug**: `codex_write.rs::ensure_thread_rows` computed `threads.title`
+  as `if first_user.is_empty() { session.title } else { clip(first_user) }` —
+  i.e. it used the first-user-message preview whenever one existed
+  (virtually always), and only fell back to `session.title` for a session
+  with zero user turns. An explicit title — a real Codex rename, or one
+  recovered from Claude Code/OpenCode via §2b's title overlay — was silently
+  discarded every time. Fixed to prefer `session.title` whenever set,
+  falling back to the preview only for an unnamed session (matching Codex's
+  own default-before-rename behavior). This predates §2b/§2c entirely — a
+  rename made *natively in Codex itself* was just as broken, since
+  `session.title` there passed straight through the same code path.
+  Regression test: `test_explicit_title_beats_first_message_preview`
+  (`codex_write.rs`). Verified against a copy of the operator's real
+  `state_5.sqlite` schema (not the original — see the `CODEX_HOME` note
+  above): a fresh row picked up the recovered title correctly; existing rows
+  from directories not touched by that particular `sync --project` run kept
+  their old title, exactly as expected (a sync only refreshes the project
+  directory + `$HOME`, not every directory a session was ever materialized
+  into — re-sync each directory to refresh it).
+
 ## 3. Architecture in one page
 
 Full detail in `DESIGN.md`; the three rules that matter:
@@ -368,19 +408,19 @@ reads it fine).
 
 ## 6. Next steps, in order
 
-**§2b/§2c done — re-verified live 2026-08-14** (sandbox, real `claude`/
-`opencode`/`codex` binaries): title write-back, mtime, invariant 2, and the
-`ClaudeCodeConverter::convert_multi` fix all confirmed. **Still open, next in
-line:**
+**§2b/§2c/§2d done — re-verified live 2026-08-14** (sandbox, real `claude`/
+`opencode`/`codex` binaries, plus a copy of the operator's real
+`state_5.sqlite` schema for the Codex title upsert): title write-back, mtime,
+invariant 2, `ClaudeCodeConverter::convert_multi`, and the Codex
+`threads.title` fix all confirmed. **Still open, next in line:**
 
-1. **Codex title upsert (`threads.title`) live pass.** §2c's sandbox run
-   couldn't exercise this — `codex_write.rs` only activates once
-   `~/.codex/state_5.sqlite` exists, and the real `codex` binary only creates
-   it on first authenticated use. Only unit-tested (against a
-   reverse-engineered schema) so far; do a real pass when convenient — rename
-   a session natively in Codex, `pull`, `sync` into Claude Code/OpenCode,
-   check the title lands, then rename in one of *those* and confirm
-   `codex resume`'s picker (or `SELECT title FROM threads`) picks it up.
+1. **A real `codex resume` picker pass**, once convenient — §2d verified the
+   `threads.title` column directly via SQL against a copy of the schema (safe,
+   given the `CODEX_HOME` isolation gap §2d documents); nobody has yet
+   confirmed the real picker UI actually renders that column as the
+   displayed title rather than `preview`/`first_user_message`. Needs a real
+   authenticated `codex` session (state_5.sqlite only fully initializes on
+   one) — do this on the operator's own machine, not a fresh sandbox.
 2. **`agentbridge list`'s title lag.** Documented in §2b as a narrower,
    known gap: `scan()` stops at the first `cwd`-bearing record, so a
    mid-conversation rename won't show in `list` until `load()` runs (sync/pull
@@ -447,7 +487,7 @@ line:**
 ## 7. Repo hygiene
 
 - Public: `https://github.com/45Harry/agentbridge`, branch `master`.
-- Keep tests green (89 + 2 ignored); add a regression test for every bug, and
+- Keep tests green (90 + 2 ignored); add a regression test for every bug, and
   verify format changes against the real binary before believing them.
 - Never commit session data. `~/.agentbridge` is never the source of fixtures.
 - Ignored tests are the real-data checks: run them explicitly after any

@@ -226,10 +226,14 @@ pub fn ensure_thread_rows(
     let secs = anchor.timestamp();
     let ms = anchor.timestamp_millis();
     let first_user = first_user_message(session);
-    let title = if first_user.is_empty() {
-        session.title.clone().unwrap_or_else(|| "New conversation".to_string())
-    } else {
-        clip(&first_user, PREVIEW_MAX)
+    // An explicit title (real rename, or one recovered from another tool via
+    // the title overlay — see sync.rs's fold_overlay) always wins: it was
+    // deliberately set. Only a session that has never been named falls back
+    // to a message preview, matching Codex's own default before any rename.
+    let title = match &session.title {
+        Some(t) if !t.is_empty() => t.clone(),
+        _ if !first_user.is_empty() => clip(&first_user, PREVIEW_MAX),
+        _ => "New conversation".to_string(),
     };
     let has_user = if session.messages.iter().any(|m| m.role == Role::User) { 1 } else { 0 };
 
@@ -486,6 +490,31 @@ mod tests {
             session_uuid_for_dir(&a_session().id, "/home/harry/work"),
             session_uuid_for_dir(&a_session().id, "/home/harry/work")
         );
+    }
+
+    /// Regression: an explicit title (a real rename, or one recovered from
+    /// another tool via sync.rs's title overlay) must win over the
+    /// first-user-message preview `threads.title` otherwise falls back to —
+    /// previously the preview always won whenever the session had any user
+    /// message at all, silently discarding every rename.
+    #[test]
+    fn test_explicit_title_beats_first_message_preview() {
+        let (_tmp, db) = db_with_schema();
+        let mut s = a_session();
+        s.title = Some("renamed-session".to_string());
+        let report = ensure_thread_rows(
+            &db,
+            &s,
+            Path::new("/home/harry/.codex/sessions/2026/07/30/rollout-x.jsonl"),
+            &["/home/harry/work".to_string()],
+        )
+        .unwrap();
+        assert_eq!(report.inserted, 1);
+        let conn = Connection::open(&db).unwrap();
+        let title: String = conn
+            .query_row("SELECT title FROM threads", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(title, "renamed-session");
     }
 
     /// Two directories means two rows: the session is visible from both.
