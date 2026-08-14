@@ -372,6 +372,22 @@ cargo build     # build FIRST — HOME override breaks rustup
 HOME=$SB AGENTBRIDGE_DATA_DIR=$SB/.agentbridge ./target/debug/agentbridge sync --project $SB/work
 ```
 
+**⛔ Never invoke the real `codex` binary directly for testing, even with
+`CODEX_HOME` set — it is not a full sandbox for that tool.** Confirmed
+2026-08-14 (§2d): a `CODEX_HOME=<sandbox> codex exec …` run still touched the
+operator's real `~/.codex/state_5.sqlite` (mtime moved within seconds of the
+run; row count and content were unaffected, but that was luck, not a
+guarantee). `claude` and `opencode` *did* fully respect their equivalent
+overrides (`CLAUDE_CONFIG_DIR`, `XDG_DATA_HOME`) throughout the same session
+— this is specifically a `codex` gap, not a pattern to expect elsewhere.
+agentbridge itself never shells out to any of these binaries (`resume_cmd()`
+only *prints* a suggested command for the operator to run themselves — see
+`src/convert.rs`), so this risk is entirely about how a *session testing this
+codebase* behaves, not a bug reachable through any agentbridge code path.
+To verify `codex_write.rs` against real data, copy `~/.codex/state_5.sqlite`
+into the sandbox and let **agentbridge** write into the copy — never drive
+the real `codex` binary against it.
+
 **Zero-cost signals for checking a tool accepted a session** (no model call,
 no cost):
 
