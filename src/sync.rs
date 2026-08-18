@@ -81,14 +81,25 @@ pub enum ConflictChoice {
     Skip,
 }
 
+/// One tool's contribution to a conflicting session, handed to a
+/// `ConflictResolver` so it can show the operator what each side actually
+/// contains — not just the tool's name.
+#[derive(Debug, Clone)]
+pub struct ConflictItem {
+    pub provider: String,
+    pub new_messages: Vec<crate::model::Message>,
+    pub new_title: Option<String>,
+}
+
 /// Asked once per conflicting session during `pull_back_with`. The library
-/// stays free of any UI dependency; `main.rs` supplies a dialoguer-backed
-/// resolver for interactive terminals, and callers that must never block
-/// (dry-run, `auto watch`) use `AutoMerge`.
+/// stays free of any UI dependency; `main.rs` supplies a ratatui-backed
+/// full-screen resolver for interactive terminals, and callers that must
+/// never block (dry-run, `auto watch`) use `AutoMerge`.
 pub trait ConflictResolver {
-    /// `providers` lists every target provider with new work for this
-    /// session, in manifest order.
-    fn resolve(&mut self, session_id: &str, providers: &[String]) -> ConflictChoice;
+    /// `items` lists every target provider with new work for this session,
+    /// in manifest order, each carrying the actual turns/rename it
+    /// contributed since the last pull.
+    fn resolve(&mut self, session_id: &str, items: &[ConflictItem]) -> ConflictChoice;
 }
 
 /// Default resolver: merge every tool's new work, exactly as `pull_back`
@@ -97,7 +108,7 @@ pub trait ConflictResolver {
 pub struct AutoMerge;
 
 impl ConflictResolver for AutoMerge {
-    fn resolve(&mut self, _session_id: &str, _providers: &[String]) -> ConflictChoice {
+    fn resolve(&mut self, _session_id: &str, _items: &[ConflictItem]) -> ConflictChoice {
         ConflictChoice::MergeAll
     }
 }
@@ -324,7 +335,15 @@ pub fn pull_back_with(dry_run: bool, resolver: &mut dyn ConflictResolver) -> Pul
             pendings.iter().map(|p| manifest[p.manifest_idx].target_provider.clone()).collect();
 
         let choice = if pendings.len() > 1 {
-            let choice = resolver.resolve(&session_id, &providers);
+            let items: Vec<ConflictItem> = pendings
+                .iter()
+                .map(|p| ConflictItem {
+                    provider: manifest[p.manifest_idx].target_provider.clone(),
+                    new_messages: p.new_messages.clone(),
+                    new_title: p.new_title.clone(),
+                })
+                .collect();
+            let choice = resolver.resolve(&session_id, &items);
             report.conflicts.push((session_id.clone(), providers.clone(), choice.clone()));
             choice
         } else {
@@ -1676,8 +1695,9 @@ mod tests {
     }
 
     impl ConflictResolver for ScriptedResolver {
-        fn resolve(&mut self, session_id: &str, providers: &[String]) -> ConflictChoice {
-            self.asked.push((session_id.to_string(), providers.to_vec()));
+        fn resolve(&mut self, session_id: &str, items: &[ConflictItem]) -> ConflictChoice {
+            let providers: Vec<String> = items.iter().map(|i| i.provider.clone()).collect();
+            self.asked.push((session_id.to_string(), providers));
             self.choice.clone()
         }
     }

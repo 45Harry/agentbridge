@@ -6,6 +6,8 @@ use clap::{Parser, Subcommand};
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
+mod tui;
+
 #[derive(Parser)]
 #[command(name = "agentbridge", version, about = "Cross-tool session & memory bridge for AI coding agents")]
 struct Cli {
@@ -805,62 +807,15 @@ fn cmd_unsync(dry_run: bool) {
     }
 }
 
-/// Asks, once per session with new work from more than one tool, whether to
-/// merge everyone's contribution, keep only one tool's, or decide later.
-/// Only constructed on a real terminal (`cmd_pull` gates on `IsTerminal`) —
-/// `dialoguer::Select::interact()` reads directly from the tty.
-struct InteractiveConflictResolver;
-
-impl agentbridge::sync::ConflictResolver for InteractiveConflictResolver {
-    fn resolve(
-        &mut self,
-        session_id: &str,
-        providers: &[String],
-    ) -> agentbridge::sync::ConflictChoice {
-        use agentbridge::sync::ConflictChoice;
-        use dialoguer::Select;
-
-        println!();
-        println!(
-            "Session {} was worked on in {} tools since the last pull:",
-            session_id,
-            providers.len()
-        );
-        for p in providers {
-            println!("  - {}", p);
-        }
-
-        let mut items: Vec<String> = vec!["Merge — keep new work from every tool".to_string()];
-        for p in providers {
-            items.push(format!("Keep only {} — discard the other tool(s)' new turns", p));
-        }
-        items.push("Skip — decide on the next pull".to_string());
-
-        let selection = Select::new()
-            .with_prompt("What should agentbridge keep for this session?")
-            .items(&items)
-            .default(0)
-            .interact()
-            .unwrap_or(0);
-
-        if selection == 0 {
-            ConflictChoice::MergeAll
-        } else if selection == items.len() - 1 {
-            ConflictChoice::Skip
-        } else {
-            ConflictChoice::KeepOnly(providers[selection - 1].clone())
-        }
-    }
-}
-
 fn cmd_pull(dry_run: bool, auto_merge: bool) {
     // Dry-run never blocks for input — it only previews. A non-TTY stdin
     // (piped, scripted, cron) can't answer a prompt either. `--auto-merge`
-    // is the explicit opt-out for scripts that want today's behavior.
+    // is the explicit opt-out for scripts that want today's behavior. The
+    // full-screen picker (src/tui.rs) is only ever constructed here.
     let interactive = !dry_run && !auto_merge && std::io::stdin().is_terminal();
 
     let report = if interactive {
-        agentbridge::sync::pull_back_with(dry_run, &mut InteractiveConflictResolver)
+        agentbridge::sync::pull_back_with(dry_run, &mut crate::tui::RatatuiConflictResolver)
     } else {
         agentbridge::sync::pull_back(dry_run)
     };
