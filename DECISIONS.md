@@ -244,3 +244,30 @@ sandboxed `HOME`/`CLAUDE_CONFIG_DIR`/`CODEX_HOME`/`XDG_DATA_HOME`, real
 appended turns in both a real Claude Code JSONL copy and a real Codex rollout
 copy, confirmed the discarded turn never reached the overlay and the kept turn
 propagated into a freshly re-synced Codex copy afterward.
+
+---
+
+## 2026-08-18 (later) — Conflict screen upgraded: `ratatui`, not `dialoguer`
+
+The operator's follow-up: "no ui i asked you to use terminui and create an
+interactive terminal gui" — the `dialoguer::Select` above works but is a
+plain inline list, not the terminal GUI the operator wanted. `terminui`
+itself was already rejected (TypeScript; would reintroduce a Node runtime).
+**`ratatui`** is terminui's native-Rust equivalent — a double-buffered
+full-screen terminal UI toolkit (`crossterm` for events/raw mode), the same
+class of tool. Swapped `dialoguer` to `ratatui + crossterm` (same single
+`[dependencies]` footprint, no runtime outside the binary).
+
+**Decisions carried over unchanged:** TUI only ever constructed from
+`agentbridge pull` behind the same `IsTerminal` gate; `sync`/`auto watch`
+stay `AutoMerge`; `Skip` is the failure fallback (never `MergeAll`); TUI code
+lives in the binary (`src/tui.rs`), the library keeps only the
+`ConflictResolver` trait. One relaxation: the trait's conflict payload grew
+from tool names to the actual new turns per tool (`ConflictItem`), so the
+TUI can show each side's content in its own panel and the operator decides
+with the real bytes in front of them.
+
+Also fixed during this pass (found live, operator report): untitled sessions
+synced into Codex showed a long mid-word-cut prompt fragment as their picker
+name — the untitled fallback in `codex_write::ensure_thread_rows` now uses a
+short, word-boundary-safe, ellipsized name instead of the long preview clip.

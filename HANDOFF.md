@@ -11,7 +11,7 @@ conversation. Read this, then `DESIGN.md` (architecture and why), then
 ```bash
 git clone git@github.com:45Harry/agentbridge.git
 cd agentbridge
-cargo build && cargo test      # 95 tests pass (+2 ignored: live-verification suites)
+cargo build && cargo test      # 97 tests pass (+2 ignored: live-verification suites)
 cargo run -- init              # read-only: what's on this machine
 ```
 
@@ -362,16 +362,25 @@ summary here.
   `AutoMerge` (today's behavior, keep everyone) is the default for anything
   non-interactive; `pull_back_with(dry_run, resolver)` is the entry point for
   a caller that wants to choose.
-- `agentbridge pull`, run from a real terminal, uses a `dialoguer::Select`
-  prompt (new dependency — evaluated `github.com/ahmadawais/terminui`, the
-  operator's first pointer, but it's TypeScript; `dialoguer` is native Rust,
-  no runtime dependency, consistent with the 2026-07-30 language decision).
-  Options: merge all, keep only tool X (one item per contributing tool), or
-  skip and decide next pull. `--dry-run`, `--auto-merge`, and a non-TTY stdin
-  all skip the prompt and keep the old merge-everything behavior — `sync`'s
-  internal pull and `auto watch`'s pull are unaffected (still `AutoMerge`,
-  still unattended-safe), just now flagging conflicts in their output/log so
-  the operator knows to revisit with `agentbridge pull`.
+- `agentbridge pull`, run from a real terminal, shows a **full-screen TUI**
+  (new dependency: `ratatui` + `crossterm` — native Rust, no runtime outside
+  the single static binary; the operator's first pointer was
+  `github.com/ahmadawais/terminui`, evaluated and rejected: it's TypeScript,
+  which would break the no-Node language decision of 2026-07-30, so `ratatui`
+  is its native-Rust equivalent: double-buffered, full-screen, panel-based).
+  The conflict screen (`src/tui.rs`, only ever constructed from `cmd_pull`,
+  gated on `IsTerminal` like before) draws one panel per contributing tool
+  with the actual new turns/rename it added, a highlighted menu (merge all /
+  keep only tool X / skip), and `↑/↓`+`Enter` (or `j/k`, `Esc`/`q` to skip).
+  A broken terminal falls back to `Skip` (re-ask next pull), never
+  `MergeAll` (that would apply a choice nobody made). `--dry-run`,
+  `--auto-merge`, and a non-TTY stdin all skip the TUI and keep the old
+  merge-everything behavior — `sync`'s internal pull and `auto watch`'s pull
+  are unaffected (still `AutoMerge`, still unattended-safe), just now flagging
+  conflicts in their output/log so the operator knows to revisit with
+  `agentbridge pull`. The `ConflictResolver` trait now carries the actual
+  turns per tool (`ConflictItem`), so both the TUI and the scripted test
+  resolver see what each side contributed — not just tool names.
 - `KeepOnly(tool)` is permanent for that batch of turns: the discarded tool's
   manifest record still advances past the discarded turns, so re-pulling does
   not re-offer them. `Skip` is the opposite — the manifest is left untouched,
@@ -384,11 +393,16 @@ summary here.
   `AGENTBRIDGE_DATA_DIR` all redirected — see §4's sandbox recipe): a real
   turn appended to a real materialized Claude Code copy and a real turn
   appended to a real materialized Codex rollout copy, `agentbridge pull` from
-  a real pty showed the Select prompt with both tools listed, arrow-selecting
-  "keep only claude-code" left the Codex turn out of the overlay, and a
-  subsequent `unsync` + `sync` propagated the kept turn into a fresh Codex
-  copy without the discarded one. Cleaned up with `agentbridge unsync`,
-  nothing left behind.
+  a real pty rendered the full-screen ratatui UI (alternate screen, panels,
+  highlighted list), arrow-selecting "keep only claude-code" left the Codex
+  turn out of the overlay, the kept turn propagated into every re-synced
+  copy, and the discarded turn was physically gone from every materialized
+  file after the next correct `sync --project` (verified by grep across the
+  whole sandbox). Re-pull is quiet — `KeepOnly` permanent. One test-runner
+  stumble: a sync run *without* `--project` re-homed variants into the
+  shell's CWD instead of the sandbox project — always pass `--project` in
+  live runs; the "discarded turn still on disk" scare was that, not a bug.
+  Cleaned up with `agentbridge unsync`, nothing left behind.
 - **A real near-miss during this verification, worth remembering**: the first
   sandbox attempt overrode only `HOME`, not `CLAUDE_CONFIG_DIR` — this
   operator's shell always has `CLAUDE_CONFIG_DIR=~/.claude-mantra` set for
@@ -401,9 +415,18 @@ summary here.
   (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_DATA_HOME`, not just `HOME`) has to
   be overridden together for a sandbox to actually be one — `HOME` alone is
   not enough on a machine where the operator has redirected any tool's config
-  dir. Also: files materialized via `set_mtime_from_session()` (§2b) carry the
-  *session's* timestamp, not "now" — `find -newermt` will not find them; check
-  the manifest's `dest` paths directly instead.
+dir. Also: files materialized via `set_mtime_from_session()` (§2b) carry the
+   *session's* timestamp, not "now" — `find -newermt` will not find them; check
+   the manifest's `dest` paths directly instead.
+- **Same session, same day — Codex fallback-title mangling fixed.** An
+  untitled session synced in from another tool showed a long, mid-word-cut
+  prompt fragment as its picker name in `codex /resume`: the untitled
+  fallback used the 120-char preview clip, which chops words mid-way and
+  looks like a data dump. `codex_write::ensure_thread_rows` now falls back to
+  `short_title` (word-boundary-safe, ≤60 chars + ellipsis, whitespace
+  collapsed) instead; the `preview` column keeps the long clip, the `title`
+  column now reads as a name. Regression-tested
+  (`test_untitled_session_gets_a_short_word_safe_title`).
 
 ## 3. Architecture in one page
 
