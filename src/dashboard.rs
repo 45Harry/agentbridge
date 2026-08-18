@@ -29,6 +29,11 @@ use std::io;
 const TITLE_MAX: usize = 42;
 const PROJECT_MAX: usize = 24;
 
+/// ASCII brand mark: two agents connected by a bridge.
+const BRIDGE_LOGO_1: &str = "  ╔═════════════╗                ╔═════════════╗  ";
+const BRIDGE_LOGO_2: &str = "  ║   agent A   ║═════ bridge ════║   agent B   ║  ";
+const BRIDGE_LOGO_3: &str = "  ╚═════════════╝                ╚═════════════╝  ";
+
 pub struct Dashboard {
     registry: Registry,
     entries: Vec<IndexEntry>,
@@ -36,6 +41,7 @@ pub struct Dashboard {
     selected: usize,
     provider: Option<String>,
     status: String,
+    unsync_pending: bool,
 }
 
 impl Dashboard {
@@ -48,7 +54,8 @@ impl Dashboard {
             scan_errors,
             selected: 0,
             provider: None,
-            status: "ready — s sync, p pull, Tab filter, ↑/↓ move, q quit".to_string(),
+            status: "ready — s sync, p pull, u unsync, Tab filter, ↑/↓ move, q quit".to_string(),
+            unsync_pending: false,
         }
     }
 
@@ -120,6 +127,7 @@ impl Dashboard {
     }
 
     fn do_pull(&mut self) {
+        self.unsync_pending = false;
         let report = pull_back(false);
         let n: usize = report.pulled.iter().map(|(_, n)| n).sum();
         let conflicts = report.conflicts.len();
@@ -136,6 +144,32 @@ impl Dashboard {
             ));
         }
         self.status = msg;
+        self.refresh();
+    }
+
+    fn preview_unsync(&mut self) {
+        let report = agentbridge::sync::unsync(true);
+        self.status = format!(
+            "unsync would remove {} file(s), keep {} foreign (touched by a tool), {} already missing — press y to confirm",
+            report.removed.len(),
+            report.kept_foreign.len(),
+            report.missing
+        );
+        self.unsync_pending = true;
+    }
+
+    fn confirm_unsync(&mut self) {
+        let report = agentbridge::sync::unsync(false);
+        self.status = format!(
+            "unsync: removed {} file(s){}",
+            report.removed.len(),
+            if report.kept_foreign.is_empty() && report.missing == 0 {
+                String::new()
+            } else {
+                format!(", kept {} foreign, {} missing", report.kept_foreign.len(), report.missing)
+            }
+        );
+        self.unsync_pending = false;
         self.refresh();
     }
 
@@ -159,15 +193,33 @@ impl Dashboard {
                 continue;
             }
             match key.code {
-                KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
-                KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
-                KeyCode::Home | KeyCode::Char('g') => self.selected = 0,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.unsync_pending = false;
+                    self.move_selection(-1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.unsync_pending = false;
+                    self.move_selection(1);
+                }
+                KeyCode::Home | KeyCode::Char('g') => {
+                    self.unsync_pending = false;
+                    self.selected = 0;
+                }
                 KeyCode::End | KeyCode::Char('G') => {
+                    self.unsync_pending = false;
                     self.selected = self.filtered().len().saturating_sub(1);
                 }
-                KeyCode::Char('s') => self.do_sync(),
+                KeyCode::Char('s') => {
+                    self.unsync_pending = false;
+                    self.do_sync();
+                }
                 KeyCode::Char('p') => self.do_pull(),
-                KeyCode::Tab => self.cycle_filter(),
+                KeyCode::Char('u') => self.preview_unsync(),
+                KeyCode::Char('y') if self.unsync_pending => self.confirm_unsync(),
+                KeyCode::Tab => {
+                    self.unsync_pending = false;
+                    self.cycle_filter();
+                }
                 KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
                 _ => {}
             }
@@ -249,9 +301,9 @@ fn draw(f: &mut Frame, d: &Dashboard) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(5),
             Constraint::Min(4),
-            Constraint::Length(2),
+            Constraint::Length(3),
             Constraint::Length(1),
         ])
         .split(area);
@@ -264,16 +316,15 @@ fn draw(f: &mut Frame, d: &Dashboard) {
         .collect::<Vec<_>>()
         .join("  ");
     let header = Paragraph::new(vec![
-        Line::from(Span::styled(
-            " agentbridge — every tool's sessions ",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
+        Line::from(Span::styled(BRIDGE_LOGO_1, Style::default().fg(Color::Cyan))),
+        Line::from(Span::styled(BRIDGE_LOGO_2, Style::default().fg(Color::Cyan))),
+        Line::from(Span::styled(BRIDGE_LOGO_3, Style::default().fg(Color::Cyan))),
         Line::from(Span::styled(
             format!(" filter: {}    detected: {}", filter, detected),
             Style::default().fg(Color::DarkGray),
         )),
     ])
-    .block(Block::default().borders(Borders::ALL));
+    .block(Block::default().borders(Borders::ALL).title(" agentbridge — bridge between your agents "));
     f.render_widget(header, rows[0]);
 
     let filtered = d.filtered();
@@ -328,7 +379,7 @@ fn draw(f: &mut Frame, d: &Dashboard) {
     let mut lines: Vec<Line> = Vec::new();
     let status = Line::from(Span::styled(
         &d.status,
-        Style::default().fg(if d.status.contains("error") { Color::LightRed } else { Color::White }),
+        Style::default().fg(if d.status.contains("error") { Color::LightRed } else { Color::LightBlue }),
     ));
     lines.push(status);
     if !d.scan_errors.is_empty() {
@@ -342,9 +393,11 @@ fn draw(f: &mut Frame, d: &Dashboard) {
         .block(Block::default().borders(Borders::ALL));
     f.render_widget(status_para, rows[2]);
 
-    let footer = Paragraph::new(
-        "↑/↓ or j/k move   g/G top/bottom   s sync   p pull   Tab filter   q/Esc quit",
-    );
+    let footer = Paragraph::new(if d.unsync_pending {
+        "press y to run unsync for real (removes only agentbridge's own files) — any other key cancels"
+    } else {
+        "↑/↓ or j/k move   g/G top/bottom   s sync   p pull   u unsync   Tab filter   q/Esc quit"
+    });
     f.render_widget(footer, rows[3]);
 }
 

@@ -431,7 +431,16 @@ dir. Also: files materialized via `set_mtime_from_session()` (§2b) carry the
   pointer to run `agentbridge pull` in a real terminal), `↑/↓`/`j/k` move,
   `g`/`G` jump, `q`/`Esc` quit, terminal restored on any exit path. Bare
   invocation on a non-TTY stdin (pipes, cron) still prints the static help —
-  a TUI can never be entered unattended. Verified live in the sandbox
+  a TUI can never be entered unattended. **Operator follow-up (same day):
+  `agentbridge tui` (alias `dashboard`) is now an explicit subcommand, the
+  header carries an ASCII bridge-between-two-agents brand mark, `u` previews
+  `unsync` (dry-run counts in the status line) and `y` confirms it — the
+  status panel was also clipped to zero inner rows (Length(2) + borders) and
+  now renders. Live pitfalls recorded for next time: ratatui renders nothing
+  in a 0×0 pty — set the window size (`TIOCSWINSZ`) in any automated pty
+  harness or frames come back empty; `expect`'s log_file misses ratatui
+  frames (writes bypass its pty capture) while Python's `pty` module catches
+  them. Verified live in the sandbox
   through a real pty: table rendered against real fixture sessions, `s`
   produced a real manifest + links on disk, `q` restored the terminal.
 - **Same session, same day — Codex fallback-title mangling fixed.** An

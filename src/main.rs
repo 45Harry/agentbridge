@@ -58,6 +58,10 @@ enum Commands {
     #[command(name = "init")]
     Init,
 
+    /// Open the interactive dashboard TUI (same as running bare `agentbridge`)
+    #[command(name = "tui", visible_alias = "dashboard")]
+    Tui,
+
     /// Make every session on the machine visible in a directory, for every
     /// detected tool
     #[command(name = "sync")]
@@ -209,6 +213,18 @@ fn main() {
             cmd_inject(&registry, &provider, &session_ids, dry_run)
         }
         Some(Commands::Init) => cmd_init(&registry),
+        Some(Commands::Tui) => {
+            if std::io::stdin().is_terminal() {
+                let mut dash = crate::dashboard::Dashboard::new();
+                if let Err(e) = dash.run() {
+                    eprintln!("dashboard: {}", e);
+                    std::process::exit(1);
+                }
+            } else {
+                eprintln!("the dashboard needs a terminal — run it from a shell");
+                std::process::exit(1);
+            }
+        }
         Some(Commands::Sync { project, dry_run }) => cmd_sync(&registry, project.as_deref(), dry_run),
         Some(Commands::Pull { dry_run, auto_merge }) => cmd_pull(dry_run, auto_merge),
         Some(Commands::Auto { action }) => cmd_auto(&registry, action),
