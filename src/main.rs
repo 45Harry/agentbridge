@@ -73,6 +73,12 @@ enum Commands {
         /// Show what would be recovered without writing
         #[arg(long)]
         dry_run: bool,
+
+        /// Skip the interactive prompt when a session has new work from more
+        /// than one tool — keep every tool's contribution, same as before
+        /// this prompt existed. Implied by --dry-run and by a non-TTY stdin.
+        #[arg(long)]
+        auto_merge: bool,
     },
 
     /// Keep sessions synced automatically
@@ -184,7 +190,7 @@ fn main() {
         }
         Commands::Init => cmd_init(&registry),
         Commands::Sync { project, dry_run } => cmd_sync(&registry, project.as_deref(), dry_run),
-        Commands::Pull { dry_run } => cmd_pull(dry_run),
+        Commands::Pull { dry_run, auto_merge } => cmd_pull(dry_run, auto_merge),
         Commands::Auto { action } => cmd_auto(&registry, action),
         Commands::Status => cmd_status(),
         Commands::Unsync { dry_run } => cmd_unsync(dry_run),
@@ -799,8 +805,65 @@ fn cmd_unsync(dry_run: bool) {
     }
 }
 
-fn cmd_pull(dry_run: bool) {
-    let report = agentbridge::sync::pull_back(dry_run);
+/// Asks, once per session with new work from more than one tool, whether to
+/// merge everyone's contribution, keep only one tool's, or decide later.
+/// Only constructed on a real terminal (`cmd_pull` gates on `IsTerminal`) —
+/// `dialoguer::Select::interact()` reads directly from the tty.
+struct InteractiveConflictResolver;
+
+impl agentbridge::sync::ConflictResolver for InteractiveConflictResolver {
+    fn resolve(
+        &mut self,
+        session_id: &str,
+        providers: &[String],
+    ) -> agentbridge::sync::ConflictChoice {
+        use agentbridge::sync::ConflictChoice;
+        use dialoguer::Select;
+
+        println!();
+        println!(
+            "Session {} was worked on in {} tools since the last pull:",
+            session_id,
+            providers.len()
+        );
+        for p in providers {
+            println!("  - {}", p);
+        }
+
+        let mut items: Vec<String> = vec!["Merge — keep new work from every tool".to_string()];
+        for p in providers {
+            items.push(format!("Keep only {} — discard the other tool(s)' new turns", p));
+        }
+        items.push("Skip — decide on the next pull".to_string());
+
+        let selection = Select::new()
+            .with_prompt("What should agentbridge keep for this session?")
+            .items(&items)
+            .default(0)
+            .interact()
+            .unwrap_or(0);
+
+        if selection == 0 {
+            ConflictChoice::MergeAll
+        } else if selection == items.len() - 1 {
+            ConflictChoice::Skip
+        } else {
+            ConflictChoice::KeepOnly(providers[selection - 1].clone())
+        }
+    }
+}
+
+fn cmd_pull(dry_run: bool, auto_merge: bool) {
+    // Dry-run never blocks for input — it only previews. A non-TTY stdin
+    // (piped, scripted, cron) can't answer a prompt either. `--auto-merge`
+    // is the explicit opt-out for scripts that want today's behavior.
+    let interactive = !dry_run && !auto_merge && std::io::stdin().is_terminal();
+
+    let report = if interactive {
+        agentbridge::sync::pull_back_with(dry_run, &mut InteractiveConflictResolver)
+    } else {
+        agentbridge::sync::pull_back(dry_run)
+    };
     let total: usize = report.pulled.iter().map(|(_, n)| n).sum();
 
     if report.pulled.is_empty() {
@@ -821,6 +884,24 @@ fn cmd_pull(dry_run: bool) {
         );
         for (id, title) in &report.renamed {
             println!("  {:<40} -> {}", id, title);
+        }
+    }
+    if !report.conflicts.is_empty() {
+        println!(
+            "{} session(s) had new work from more than one tool:",
+            report.conflicts.len()
+        );
+        for (id, providers, choice) in &report.conflicts {
+            use agentbridge::sync::ConflictChoice;
+            let outcome = match choice {
+                ConflictChoice::MergeAll => "merged".to_string(),
+                ConflictChoice::KeepOnly(p) => format!("kept only {}", p),
+                ConflictChoice::Skip => "skipped — will ask again next pull".to_string(),
+            };
+            println!("  {:<40} {} -> {}", id, providers.join("+"), outcome);
+        }
+        if !interactive {
+            println!("  (non-interactive: use `agentbridge pull` from a terminal to choose)");
         }
     }
     for e in report.errors.iter().take(10) {

@@ -28,7 +28,10 @@ each directory's view fresh in every tool's own format:
   started elsewhere in the tool of your choice.
 - **Write-back.** Turns you append in one tool are recovered into an
   append-only overlay (`pull`) and folded into the other tools' copies on the
-  next sync. Your original files are never modified.
+  next sync. Your original files are never modified. If a session was
+  continued in *more than one* tool between pulls, `agentbridge pull` asks —
+  merge everyone's new turns, keep only one tool's, or decide later
+  (`--auto-merge` skips the prompt for scripts and non-interactive shells).
 - **Automatic.** `agentbridge auto install` hooks your shell; `auto watch`
   re-syncs within seconds of any session change.
 

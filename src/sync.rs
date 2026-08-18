@@ -56,7 +56,50 @@ pub struct PullReport {
     /// copy. Independent of `pulled` — a rename with no new turns still ends
     /// up here.
     pub renamed: Vec<(String, String)>,
+    /// (session id, providers with new work, choice made) for every session
+    /// where more than one tool contributed new turns/renames since the last
+    /// pull. A session with new work from exactly one tool is folded in
+    /// directly and never appears here — it was never a conflict.
+    pub conflicts: Vec<(String, Vec<String>, ConflictChoice)>,
     pub errors: Vec<String>,
+}
+
+/// What to do with a session where more than one tool has new write-back
+/// work since the last pull. `pull_back` cannot pick a winner on its own —
+/// dropping a tool's turns silently would violate the "never lose recovered
+/// work" invariant `unsync` already relies on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConflictChoice {
+    /// Keep every tool's new work — today's only behavior, unchanged.
+    MergeAll,
+    /// Keep only the named provider's new work; the other tool(s)'
+    /// contribution for this pull is discarded (marked seen, never written
+    /// to the overlay).
+    KeepOnly(String),
+    /// Decide nothing this round — leave the manifest untouched so the same
+    /// new work is offered again on the next pull.
+    Skip,
+}
+
+/// Asked once per conflicting session during `pull_back_with`. The library
+/// stays free of any UI dependency; `main.rs` supplies a dialoguer-backed
+/// resolver for interactive terminals, and callers that must never block
+/// (dry-run, `auto watch`) use `AutoMerge`.
+pub trait ConflictResolver {
+    /// `providers` lists every target provider with new work for this
+    /// session, in manifest order.
+    fn resolve(&mut self, session_id: &str, providers: &[String]) -> ConflictChoice;
+}
+
+/// Default resolver: merge every tool's new work, exactly as `pull_back`
+/// behaved before this feature existed. Used for dry-run, `auto watch`, and
+/// any non-interactive invocation.
+pub struct AutoMerge;
+
+impl ConflictResolver for AutoMerge {
+    fn resolve(&mut self, _session_id: &str, _providers: &[String]) -> ConflictChoice {
+        ConflictChoice::MergeAll
+    }
 }
 
 fn overlay_dir() -> PathBuf {
@@ -202,15 +245,41 @@ pub fn status() -> Vec<StatusRow> {
 }
 
 /// Write-back: recover turns a tool appended to a materialized session so
-/// every other tool can see them (DESIGN.md §6).
+/// every other tool can see them (DESIGN.md §6). Uses `AutoMerge`: every
+/// tool's new work is kept, matching every version of this function before
+/// conflict resolution existed. Use `pull_back_with` to ask the operator
+/// instead when two or more tools both have new work for the same session.
 ///
 /// Reads only files agentbridge itself created; source sessions are untouched.
 pub fn pull_back(dry_run: bool) -> PullReport {
+    pull_back_with(dry_run, &mut AutoMerge)
+}
+
+/// New work recovered from one materialized copy, not yet applied.
+struct Pending {
+    manifest_idx: usize,
+    new_messages: Vec<crate::model::Message>,
+    new_title: Option<String>,
+}
+
+/// Same as `pull_back`, but lets the caller decide what happens when more
+/// than one tool has new work for the same session since the last pull —
+/// `resolver` is asked once per such session. A session with new work from
+/// exactly one tool is never a conflict and is folded in directly, same as
+/// always.
+pub fn pull_back_with(dry_run: bool, resolver: &mut dyn ConflictResolver) -> PullReport {
     let mut report = PullReport::default();
     let mut manifest = read_manifest();
     let mut changed = false;
 
-    for rec in manifest.iter_mut() {
+    // Pass 1: read every materialized copy once and record what is new since
+    // the last pull. Two or more entries for the same session id here means
+    // two tools independently contributed new work — a conflict this
+    // function cannot resolve by itself.
+    let mut pending_by_session: std::collections::BTreeMap<String, Vec<Pending>> =
+        std::collections::BTreeMap::new();
+
+    for (idx, rec) in manifest.iter().enumerate() {
         if !rec.dest.exists() {
             continue;
         }
@@ -221,53 +290,99 @@ pub fn pull_back(dry_run: bool) -> PullReport {
         } else {
             rec.session_id.clone()
         };
-        let Some(session) = load_materialized(&rec.target_provider, &rec.dest, &id)
-        else {
+        let Some(session) = load_materialized(&rec.target_provider, &rec.dest, &id) else {
             continue;
         };
 
-        // Title drift, checked independent of message drift below: a rename
-        // with no new turns (or vice versa) must still be recovered.
-        if let Some(new_title) = &session.title
-            && rec.title.as_deref() != Some(new_title.as_str())
-        {
-            if dry_run {
-                report.renamed.push((rec.session_id.clone(), new_title.clone()));
-            } else {
-                match set_overlay_title(&rec.session_id, new_title) {
-                    Ok(()) => {
-                        report.renamed.push((rec.session_id.clone(), new_title.clone()));
-                        rec.title = Some(new_title.clone());
-                        changed = true;
+        let new_title = session
+            .title
+            .as_ref()
+            .filter(|t| rec.title.as_deref() != Some(t.as_str()))
+            .cloned();
+        let new_messages = if session.messages.len() > rec.message_count {
+            session.messages[rec.message_count..].to_vec()
+        } else {
+            Vec::new()
+        };
+
+        if new_title.is_none() && new_messages.is_empty() {
+            continue;
+        }
+
+        pending_by_session.entry(rec.session_id.clone()).or_default().push(Pending {
+            manifest_idx: idx,
+            new_messages,
+            new_title,
+        });
+    }
+
+    // Pass 2: apply. Ask the resolver only when a session actually has more
+    // than one contributing tool; a single contributor is applied exactly as
+    // `pull_back` always has, with no prompt.
+    for (session_id, pendings) in pending_by_session {
+        let providers: Vec<String> =
+            pendings.iter().map(|p| manifest[p.manifest_idx].target_provider.clone()).collect();
+
+        let choice = if pendings.len() > 1 {
+            let choice = resolver.resolve(&session_id, &providers);
+            report.conflicts.push((session_id.clone(), providers.clone(), choice.clone()));
+            choice
+        } else {
+            ConflictChoice::MergeAll
+        };
+
+        if choice == ConflictChoice::Skip {
+            // Leave every contributing manifest record untouched so the same
+            // new work is offered again on the next pull.
+            continue;
+        }
+
+        for pending in &pendings {
+            let keep = match &choice {
+                ConflictChoice::MergeAll => true,
+                ConflictChoice::KeepOnly(p) => manifest[pending.manifest_idx].target_provider == *p,
+                ConflictChoice::Skip => unreachable!("handled above"),
+            };
+
+            if let Some(new_title) = &pending.new_title {
+                if keep {
+                    if dry_run {
+                        report.renamed.push((session_id.clone(), new_title.clone()));
+                    } else if let Err(e) = set_overlay_title(&session_id, new_title) {
+                        report.errors.push(format!("overlay title {}: {}", session_id, e));
+                    } else {
+                        report.renamed.push((session_id.clone(), new_title.clone()));
                     }
-                    Err(e) => report
-                        .errors
-                        .push(format!("overlay title {}: {}", rec.session_id, e)),
+                }
+                if !dry_run {
+                    manifest[pending.manifest_idx].title = Some(new_title.clone());
+                    changed = true;
                 }
             }
-        }
 
-        // Anything past what we wrote is the tool's own new work.
-        if session.messages.len() <= rec.message_count {
-            continue;
-        }
-        let new = &session.messages[rec.message_count..];
+            if pending.new_messages.is_empty() {
+                continue;
+            }
+            let new_count = manifest[pending.manifest_idx].message_count + pending.new_messages.len();
 
-        if dry_run {
-            report.pulled.push((rec.session_id.clone(), new.len()));
-            continue;
-        }
-
-        match append_overlay(&rec.session_id, new) {
-            Ok(0) => {}
-            Ok(n) => {
-                report.pulled.push((rec.session_id.clone(), n));
-                rec.message_count = session.messages.len();
+            if keep {
+                if dry_run {
+                    report.pulled.push((session_id.clone(), pending.new_messages.len()));
+                } else {
+                    match append_overlay(&session_id, &pending.new_messages) {
+                        Ok(0) => {}
+                        Ok(n) => report.pulled.push((session_id.clone(), n)),
+                        Err(e) => {
+                            report.errors.push(format!("overlay {}: {}", session_id, e));
+                            continue;
+                        }
+                    }
+                }
+            }
+            if !dry_run {
+                manifest[pending.manifest_idx].message_count = new_count;
                 changed = true;
             }
-            Err(e) => report
-                .errors
-                .push(format!("overlay {}: {}", rec.session_id, e)),
         }
     }
 
@@ -1429,6 +1544,23 @@ mod tests {
         fs::write(dest, body).unwrap();
     }
 
+    /// Simulate a turn appended in Codex's own rollout format (`event_msg`
+    /// carrying a `payload.message` object — the shape `codex_cli.rs` reads
+    /// a real turn from).
+    fn append_codex_turn(dest: &Path, text: &str) {
+        let mut body = fs::read_to_string(dest).unwrap();
+        if !body.ends_with('\n') {
+            body.push('\n');
+        }
+        body.push_str(&serde_json::json!({
+            "type": "event_msg",
+            "timestamp": "2026-08-01T00:00:01.000Z",
+            "payload": { "message": { "role": "user", "content": text } },
+        }).to_string());
+        body.push('\n');
+        fs::write(dest, body).unwrap();
+    }
+
     /// Mirrors what a real in-session rename (or `-n/--name`) writes: a
     /// dedicated `custom-title` record, not a field on a turn.
     fn rename_claude_session(dest: &Path, sid: &str, title: &str) {
@@ -1527,6 +1659,168 @@ mod tests {
             body.contains("CROSS TOOL TURN"),
             "a turn added in one tool must appear in the other tool's copy"
         );
+    }
+
+    /// A resolver that returns a fixed choice and records every session it
+    /// was asked to resolve, so a test can assert both the outcome and that
+    /// the operator was (or wasn't) actually asked — without a real terminal.
+    struct ScriptedResolver {
+        choice: ConflictChoice,
+        asked: Vec<(String, Vec<String>)>,
+    }
+
+    impl ScriptedResolver {
+        fn new(choice: ConflictChoice) -> Self {
+            Self { choice, asked: Vec::new() }
+        }
+    }
+
+    impl ConflictResolver for ScriptedResolver {
+        fn resolve(&mut self, session_id: &str, providers: &[String]) -> ConflictChoice {
+            self.asked.push((session_id.to_string(), providers.to_vec()));
+            self.choice.clone()
+        }
+    }
+
+    /// New work from exactly one tool must never be reported as a conflict —
+    /// this is the ordinary write-back path every earlier pull_back test
+    /// already exercises, and it must stay prompt-free.
+    #[test]
+    fn test_pull_back_single_tool_new_work_is_not_a_conflict() {
+        let _sb = Sandbox::new();
+        let registry = crate::connectors::all_for_testing(&fixture_root());
+        let project = PathBuf::from("/tmp/some-project");
+        let synced = sync_into(&registry, &project, false);
+        let link = first_claude_link(&synced);
+
+        append_claude_turn(&link.dest, &link.session_id, "ONLY CLAUDE TOUCHED THIS");
+
+        let report = pull_back(false);
+        assert!(
+            report.conflicts.is_empty(),
+            "a single contributing tool must never be reported as a conflict"
+        );
+        assert_eq!(report.pulled.iter().map(|(_, n)| n).sum::<usize>(), 1);
+    }
+
+    /// Two tools both appending new turns to the same session since the last
+    /// pull is exactly the scenario the operator described: continue a
+    /// session in Codex after it was worked on in Claude Code. The default
+    /// resolver (`AutoMerge`, what plain `pull_back` uses) must keep both —
+    /// unchanged behavior from before conflict detection existed — but it
+    /// must still surface the conflict so the operator can see it happened.
+    #[test]
+    fn test_pull_back_two_tools_is_a_conflict_and_auto_merge_keeps_both() {
+        let _sb = Sandbox::new();
+        let registry = crate::connectors::all_for_testing(&fixture_root());
+        let project = PathBuf::from("/tmp/some-project");
+        let synced = sync_into(&registry, &project, false);
+        let claude = first_claude_link(&synced);
+        let codex = synced
+            .created
+            .iter()
+            .find(|r| r.target_provider == "codex-cli" && r.session_id == claude.session_id)
+            .expect("a codex-cli link for the same session")
+            .clone();
+
+        append_claude_turn(&claude.dest, &claude.session_id, "FROM CLAUDE CODE");
+        append_codex_turn(&codex.dest, "FROM CODEX");
+
+        let report = pull_back(false);
+
+        assert_eq!(report.conflicts.len(), 1, "two contributing tools must be one conflict");
+        let (id, providers, choice) = &report.conflicts[0];
+        assert_eq!(id, &claude.session_id);
+        assert_eq!(
+            providers.iter().collect::<std::collections::BTreeSet<_>>(),
+            ["claude-code".to_string(), "codex-cli".to_string()].iter().collect()
+        );
+        assert_eq!(choice, &ConflictChoice::MergeAll);
+
+        let overlay = overlay_messages(&claude.session_id);
+        assert!(overlay.iter().any(|m| m.text.as_deref() == Some("FROM CLAUDE CODE")));
+        assert!(overlay.iter().any(|m| m.text.as_deref() == Some("FROM CODEX")));
+    }
+
+    /// "Continue the written-back session, or only the session from one
+    /// agent, skipping the other" — the operator's own words for this
+    /// feature. `KeepOnly` must keep exactly the chosen tool's new turns and
+    /// discard the other's, permanently (not just this run — re-pulling must
+    /// not re-offer the discarded turns).
+    #[test]
+    fn test_pull_back_keep_only_discards_the_other_tool() {
+        let _sb = Sandbox::new();
+        let registry = crate::connectors::all_for_testing(&fixture_root());
+        let project = PathBuf::from("/tmp/some-project");
+        let synced = sync_into(&registry, &project, false);
+        let claude = first_claude_link(&synced);
+        let codex = synced
+            .created
+            .iter()
+            .find(|r| r.target_provider == "codex-cli" && r.session_id == claude.session_id)
+            .expect("a codex-cli link for the same session")
+            .clone();
+
+        append_claude_turn(&claude.dest, &claude.session_id, "KEEP ME");
+        append_codex_turn(&codex.dest, "DISCARD ME");
+
+        let mut resolver = ScriptedResolver::new(ConflictChoice::KeepOnly("claude-code".to_string()));
+        let report = pull_back_with(false, &mut resolver);
+
+        assert_eq!(resolver.asked.len(), 1, "the resolver must be asked exactly once");
+
+        let overlay = overlay_messages(&claude.session_id);
+        assert!(overlay.iter().any(|m| m.text.as_deref() == Some("KEEP ME")));
+        assert!(
+            !overlay.iter().any(|m| m.text.as_deref() == Some("DISCARD ME")),
+            "the non-chosen tool's new turn must not reach the overlay"
+        );
+        assert_eq!(report.pulled, vec![(claude.session_id.clone(), 1)]);
+
+        // Re-pulling must not re-offer the discarded turn as a conflict — it
+        // was a deliberate, permanent choice, not a deferral.
+        let mut resolver2 = ScriptedResolver::new(ConflictChoice::MergeAll);
+        let second = pull_back_with(false, &mut resolver2);
+        assert!(second.conflicts.is_empty(), "the discarded turn must not resurface");
+        assert!(second.pulled.is_empty());
+    }
+
+    /// `Skip` must decide nothing — the same conflict is offered again next
+    /// time, unlike `KeepOnly` which is a permanent choice for that batch of
+    /// turns.
+    #[test]
+    fn test_pull_back_skip_leaves_manifest_untouched_and_reasks() {
+        let _sb = Sandbox::new();
+        let registry = crate::connectors::all_for_testing(&fixture_root());
+        let project = PathBuf::from("/tmp/some-project");
+        let synced = sync_into(&registry, &project, false);
+        let claude = first_claude_link(&synced);
+        let codex = synced
+            .created
+            .iter()
+            .find(|r| r.target_provider == "codex-cli" && r.session_id == claude.session_id)
+            .expect("a codex-cli link for the same session")
+            .clone();
+
+        append_claude_turn(&claude.dest, &claude.session_id, "FROM CLAUDE CODE");
+        append_codex_turn(&codex.dest, "FROM CODEX");
+
+        let mut resolver = ScriptedResolver::new(ConflictChoice::Skip);
+        let first = pull_back_with(false, &mut resolver);
+        assert!(first.pulled.is_empty(), "skip must recover nothing this round");
+        assert!(overlay_messages(&claude.session_id).is_empty());
+
+        let mut resolver2 = ScriptedResolver::new(ConflictChoice::MergeAll);
+        let second = pull_back_with(false, &mut resolver2);
+        assert_eq!(
+            resolver2.asked.len(),
+            1,
+            "a skipped conflict must be offered again on the next pull"
+        );
+        assert_eq!(second.conflicts[0].2, ConflictChoice::MergeAll);
+        let overlay = overlay_messages(&claude.session_id);
+        assert!(overlay.iter().any(|m| m.text.as_deref() == Some("FROM CLAUDE CODE")));
+        assert!(overlay.iter().any(|m| m.text.as_deref() == Some("FROM CODEX")));
     }
 
     /// A rename made in a non-native copy must be recovered the same way an

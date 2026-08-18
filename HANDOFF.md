@@ -4,14 +4,14 @@ Pick this project up cold — new machine, new session, no memory of prior
 conversation. Read this, then `DESIGN.md` (architecture and why), then
 `CONNECTORS.md` (each tool's on-disk format).
 
-**Last updated:** 2026-08-14.
+**Last updated:** 2026-08-18.
 
 ## 0. Start here
 
 ```bash
 git clone git@github.com:45Harry/agentbridge.git
 cd agentbridge
-cargo build && cargo test      # 91 tests pass (+2 ignored: live-verification suites)
+cargo build && cargo test      # 95 tests pass (+2 ignored: live-verification suites)
 cargo run -- init              # read-only: what's on this machine
 ```
 
@@ -346,6 +346,65 @@ both passed the whole time, because they only ever exercised a *titled*
 fixture session — the untitled-session path was never touched until this
 outside-the-sandbox pass forced it.
 
+## 2f. `agentbridge pull` now asks when two tools both have new work — 2026-08-18
+
+Operator request: when a session is continued in more than one tool between
+pulls (write-back from Claude Code *and* Codex both waiting), let the operator
+choose what happens instead of always silently merging — with a real
+interactive terminal prompt. Full rationale in DECISIONS.md (2026-08-18);
+summary here.
+
+- `sync::pull_back` now groups pending write-back by session id before
+  applying it. Exactly one contributing tool: unchanged, no prompt, applied
+  exactly as `pull_back` always has (regression-tested:
+  `test_pull_back_single_tool_new_work_is_not_a_conflict`). Two or more tools:
+  a `ConflictResolver` (new trait in `sync.rs`) is asked once per session —
+  `AutoMerge` (today's behavior, keep everyone) is the default for anything
+  non-interactive; `pull_back_with(dry_run, resolver)` is the entry point for
+  a caller that wants to choose.
+- `agentbridge pull`, run from a real terminal, uses a `dialoguer::Select`
+  prompt (new dependency — evaluated `github.com/ahmadawais/terminui`, the
+  operator's first pointer, but it's TypeScript; `dialoguer` is native Rust,
+  no runtime dependency, consistent with the 2026-07-30 language decision).
+  Options: merge all, keep only tool X (one item per contributing tool), or
+  skip and decide next pull. `--dry-run`, `--auto-merge`, and a non-TTY stdin
+  all skip the prompt and keep the old merge-everything behavior — `sync`'s
+  internal pull and `auto watch`'s pull are unaffected (still `AutoMerge`,
+  still unattended-safe), just now flagging conflicts in their output/log so
+  the operator knows to revisit with `agentbridge pull`.
+- `KeepOnly(tool)` is permanent for that batch of turns: the discarded tool's
+  manifest record still advances past the discarded turns, so re-pulling does
+  not re-offer them. `Skip` is the opposite — the manifest is left untouched,
+  so the same conflict is asked again next time. Both directions
+  regression-tested (`test_pull_back_keep_only_discards_the_other_tool`,
+  `test_pull_back_skip_leaves_manifest_untouched_and_reasks`), plus the
+  default-merge path (`test_pull_back_two_tools_is_a_conflict_and_auto_merge_keeps_both`).
+- **Verified live**, real terminal via `expect`, real binary, fully isolated
+  sandbox (`HOME`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_DATA_HOME`,
+  `AGENTBRIDGE_DATA_DIR` all redirected — see §4's sandbox recipe): a real
+  turn appended to a real materialized Claude Code copy and a real turn
+  appended to a real materialized Codex rollout copy, `agentbridge pull` from
+  a real pty showed the Select prompt with both tools listed, arrow-selecting
+  "keep only claude-code" left the Codex turn out of the overlay, and a
+  subsequent `unsync` + `sync` propagated the kept turn into a fresh Codex
+  copy without the discarded one. Cleaned up with `agentbridge unsync`,
+  nothing left behind.
+- **A real near-miss during this verification, worth remembering**: the first
+  sandbox attempt overrode only `HOME`, not `CLAUDE_CONFIG_DIR` — this
+  operator's shell always has `CLAUDE_CONFIG_DIR=~/.claude-mantra` set for
+  real, so `sync` happily materialized ~800 real session hardlinks into two
+  new subdirectories under the *real* `~/.claude-mantra/projects/`. No
+  existing file was touched (hardlinks only land in *new* directories keyed
+  by the sandboxed project path), and `agentbridge unsync` — run with the same
+  env the sync used — removed exactly those files, matching §4's doctrine
+  exactly. Lesson reinforced: **every** live-root env var
+  (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_DATA_HOME`, not just `HOME`) has to
+  be overridden together for a sandbox to actually be one — `HOME` alone is
+  not enough on a machine where the operator has redirected any tool's config
+  dir. Also: files materialized via `set_mtime_from_session()` (§2b) carry the
+  *session's* timestamp, not "now" — `find -newermt` will not find them; check
+  the manifest's `dest` paths directly instead.
+
 ## 3. Architecture in one page
 
 Full detail in `DESIGN.md`; the three rules that matter:
@@ -564,7 +623,7 @@ invariant 2, `ClaudeCodeConverter::convert_multi`, and the Codex
 ## 7. Repo hygiene
 
 - Public: `https://github.com/45Harry/agentbridge`, branch `master`.
-- Keep tests green (91 + 2 ignored); add a regression test for every bug, and
+- Keep tests green (95 + 2 ignored); add a regression test for every bug, and
   verify format changes against the real binary before believing them.
 - Never commit session data. `~/.agentbridge` is never the source of fixtures.
 - Ignored tests are the real-data checks: run them explicitly after any

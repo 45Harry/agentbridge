@@ -201,3 +201,46 @@ Two consequences worth keeping in mind:
   message and part row. Fanning out to all known projects is a real decision
   about database size (278 MB for 148 native sessions today), not a cheap win —
   see HANDOFF §6.1, still open.
+
+---
+
+## 2026-08-18 — Pull conflicts: ask the operator, native `dialoguer` prompt, no Node
+
+Operator report: when a session is continued in more than one tool between
+pulls (e.g. a turn added in Claude Code *and* a turn added in Codex before the
+next `agentbridge pull`), write-back silently merged both into the overlay
+with no way to say "keep only one." Two decisions:
+
+**Prompt library: `dialoguer`, not `terminui`.** The operator's first pointer
+was `github.com/ahmadawais/terminui` — checked (`gh repo view`) and it is a
+TypeScript library. Pulling it in would mean shelling out to a Node runtime
+for a single Select prompt, which directly contradicts the 2026-07-30 language
+decision above (zero runtime dependency, true single binary). `dialoguer` is a
+native Rust crate with the same `Select`/`Confirm` primitives and costs one
+`[dependencies]` line. Confirmed with the operator before building (AskUserQuestion)
+rather than assuming.
+
+**Where the prompt lives: `agentbridge pull` only, not `sync`.** `sync` already
+calls `pull_back` internally (to refresh materialized copies with the latest
+write-back) and runs unattended from the shell hook and `auto watch` — making
+it interactive would block every new terminal and the watch loop. The prompt
+is scoped to the explicit, human-run `pull` command; `sync`'s internal pull and
+`auto watch`'s pull keep the pre-existing `AutoMerge` behavior (merge every
+tool's new work), with the conflict still surfaced in the report/log so the
+operator knows to revisit it. Also confirmed via AskUserQuestion.
+
+**Mechanism:** `sync::pull_back` groups new work by session id first; a session
+with new work from exactly one tool is applied exactly as before (no prompt,
+no behavior change — regression-tested explicitly). Two or more tools showing
+up for the same session is a conflict, resolved through a `ConflictResolver`
+trait so the merge/keep-only/skip logic in `sync.rs` has zero UI dependency —
+`main.rs` supplies the real `dialoguer`-backed resolver, tests supply a
+scripted one. `KeepOnly(tool)` is a permanent decision for that batch of turns
+(the discarded tool's manifest record still advances, so the same turns are
+never re-offered); `Skip` leaves the manifest untouched so the same conflict
+returns on the next pull. Verified live end-to-end (`expect`-driven real TTY,
+sandboxed `HOME`/`CLAUDE_CONFIG_DIR`/`CODEX_HOME`/`XDG_DATA_HOME`, real
+`agentbridge` binary): arrow-key-selected "keep only claude-code" against real
+appended turns in both a real Claude Code JSONL copy and a real Codex rollout
+copy, confirmed the discarded turn never reached the overlay and the kept turn
+propagated into a freshly re-synced Codex copy afterward.
