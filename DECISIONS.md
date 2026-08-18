@@ -271,3 +271,27 @@ Also fixed during this pass (found live, operator report): untitled sessions
 synced into Codex showed a long mid-word-cut prompt fragment as their picker
 name — the untitled fallback in `codex_write::ensure_thread_rows` now uses a
 short, word-boundary-safe, ellipsized name instead of the long preview clip.
+
+---
+
+## 2026-08-18 (same pass, later) — Bare `agentbridge` = interactive dashboard
+
+Operator ran `agentbridge` with no subcommand and asked (AskUserQuestion):
+"what should happen" — the answer was an interactive terminal GUI as the
+default entry point. Bare invocation was previously an error ("missing
+subcommand"); it now opens a full-screen ratatui dashboard
+(`src/dashboard.rs`) whenever stdin is a terminal, and falls back to the
+static help exactly when a TUI cannot render (piped/cron stdin) — a TUI is
+never entered unattended.
+
+**Scope deliberately kept shallow:** view (sessions table), `s` sync, `p`
+pull, `Tab` filter. No session-level actions (resume/inject) yet — those
+need sub-pickers and are the next natural layer on top, but gated on the
+operator asking for them. `p` in the dashboard is `AutoMerge`-semantics on
+purpose: the dashboard is already a TUI, so `tui.rs`'s conflict screen
+cannot open inside it; conflicts surface in the status line with a pointer
+to a real `agentbridge pull`.
+
+**Alternatives rejected:** making missing-subcommand an implicit
+`ls`/`init` (no interactivity, hides the mapping), and wiring
+`terminui`-style third-party panels (already settled: native ratatui).

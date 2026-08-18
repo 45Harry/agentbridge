@@ -418,6 +418,22 @@ summary here.
 dir. Also: files materialized via `set_mtime_from_session()` (§2b) carry the
    *session's* timestamp, not "now" — `find -newermt` will not find them; check
    the manifest's `dest` paths directly instead.
+- **Same session, same day — bare `agentbridge` opens a full-screen
+  dashboard.** Operator ran `agentbridge` with no subcommand, got the static
+  help, and asked for an interactive terminal GUI as the default entry
+  point (`src/dashboard.rs`, ratatui): one table of every tool's sessions
+  (tool / title / project / last-activity, provider-colored, newest first),
+  a provider filter (`Tab` cycles all → each detected tool), and one-key
+  actions — `s` runs a full sync pass (`pull_back` + `sync_into`, mirroring
+  `cmd_sync`'s pipeline), `p` runs pull with `AutoMerge` semantics
+  (deliberate: the dashboard is already a TUI and cannot nest the conflict
+  screen from `tui.rs`; conflicts are reported in the status line with a
+  pointer to run `agentbridge pull` in a real terminal), `↑/↓`/`j/k` move,
+  `g`/`G` jump, `q`/`Esc` quit, terminal restored on any exit path. Bare
+  invocation on a non-TTY stdin (pipes, cron) still prints the static help —
+  a TUI can never be entered unattended. Verified live in the sandbox
+  through a real pty: table rendered against real fixture sessions, `s`
+  produced a real manifest + links on disk, `q` restored the terminal.
 - **Same session, same day — Codex fallback-title mangling fixed.** An
   untitled session synced in from another tool showed a long, mid-word-cut
   prompt fragment as its picker name in `codex /resume`: the untitled

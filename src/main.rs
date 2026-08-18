@@ -6,13 +6,15 @@ use clap::{Parser, Subcommand};
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
+mod dashboard;
 mod tui;
 
 #[derive(Parser)]
 #[command(name = "agentbridge", version, about = "Cross-tool session & memory bridge for AI coding agents")]
 struct Cli {
+    /// Open the interactive dashboard when omitted
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -179,24 +181,40 @@ fn main() {
     let registry = connectors::all();
 
     match cli.command {
-        Commands::List { project, provider } => cmd_list(&registry, project, provider),
-        Commands::Index { provider } => cmd_index(&registry, provider),
-        Commands::Start { provider, passthrough, dry_run } => {
+        None => {
+            // Bare `agentbridge` = the dashboard, but only where a TUI can
+            // actually render; a piped/cron run must never enter full-screen
+            // mode. Non-TTY falls back to the static help, like a missing
+            // subcommand used to.
+            if std::io::stdin().is_terminal() {
+                let mut dash = crate::dashboard::Dashboard::new();
+                if let Err(e) = dash.run() {
+                    eprintln!("dashboard: {}", e);
+                    std::process::exit(1);
+                }
+            } else {
+                use clap::CommandFactory;
+                let _ = Cli::command().print_help();
+            }
+        }
+        Some(Commands::List { project, provider }) => cmd_list(&registry, project, provider),
+        Some(Commands::Index { provider }) => cmd_index(&registry, provider),
+        Some(Commands::Start { provider, passthrough, dry_run }) => {
             cmd_start(&registry, &provider, &passthrough, dry_run)
         }
-        Commands::Resume { session_id, target, project, dry_run, merge, copy } => {
+        Some(Commands::Resume { session_id, target, project, dry_run, merge, copy }) => {
             cmd_resume(&registry, &session_id, &target, project.as_deref(), dry_run, merge, copy)
         }
-        Commands::Inject { provider, session_ids, dry_run } => {
+        Some(Commands::Inject { provider, session_ids, dry_run }) => {
             cmd_inject(&registry, &provider, &session_ids, dry_run)
         }
-        Commands::Init => cmd_init(&registry),
-        Commands::Sync { project, dry_run } => cmd_sync(&registry, project.as_deref(), dry_run),
-        Commands::Pull { dry_run, auto_merge } => cmd_pull(dry_run, auto_merge),
-        Commands::Auto { action } => cmd_auto(&registry, action),
-        Commands::Status => cmd_status(),
-        Commands::Unsync { dry_run } => cmd_unsync(dry_run),
-        Commands::Info => cmd_info(&registry),
+        Some(Commands::Init) => cmd_init(&registry),
+        Some(Commands::Sync { project, dry_run }) => cmd_sync(&registry, project.as_deref(), dry_run),
+        Some(Commands::Pull { dry_run, auto_merge }) => cmd_pull(dry_run, auto_merge),
+        Some(Commands::Auto { action }) => cmd_auto(&registry, action),
+        Some(Commands::Status) => cmd_status(),
+        Some(Commands::Unsync { dry_run }) => cmd_unsync(dry_run),
+        Some(Commands::Info) => cmd_info(&registry),
     }
 }
 
