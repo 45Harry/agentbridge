@@ -295,3 +295,87 @@ to a real `agentbridge pull`.
 **Alternatives rejected:** making missing-subcommand an implicit
 `ls`/`init` (no interactivity, hides the mapping), and wiring
 `terminui`-style third-party panels (already settled: native ratatui).
+
+---
+
+## 2026-08-19 — Antigravity write connector, and four hidden read bugs
+
+Operator asked to verify antigravity sessions really were synced, test
+write-back, and make every session reachable in both directions. Verification
+against the real store first showed the connector was reporting success while
+delivering almost nothing: **12 of 24 readable sessions visible, 15 of 733
+messages decoded**, and zero antigravity rows in `agentbridge status`. The
+existing "real data" test passed throughout, because it only asserted the
+message list was non-empty — one message satisfied it.
+
+Four read bugs, each verified on the operator's own databases:
+
+1. **One store scanned out of four.** `ANTIGRAVITY_HOME` was a single hardcoded
+   `~/.gemini/antigravity-cli`. The sibling `antigravity-ide` store holds 12
+   more conversations (1,798 steps, ids non-overlapping) in the *same* SQLite
+   format. All homes are now scanned, deduped by id.
+2. **Model responses were never decoded.** Only the *error* field
+   (`payload.24.3.1`) was read, so every session loaded as a lone user message.
+   Real model text is `payload.20.1` (step type 15). `.20.3` is private
+   reasoning and is deliberately *not* surfaced — presenting it as the response
+   would leak chain-of-thought into every brief.
+3. **`preview` was read as the title.** The schema has a real `title` column;
+   reading the preview instead makes a rename invisible, which silently breaks
+   title write-back.
+4. **Summary timestamps were all dropped.** agy writes
+   `2026-07-29 08:54:35+00:00` — a space where RFC 3339 requires `T`, so
+   `parse_from_rfc3339` rejected every value.
+
+**Decision:** reverse the 2026-08-01 "read-only first" deferral and ship the
+write connector (`src/antigravity_write.rs`). The two blockers named then are
+gone: model-response text is mapped (bug 2), and exercising the real binary
+turned out to be unnecessary — the store is plain SQLite, so a written
+conversation can be verified by reading it back through our own connector plus
+agy's own index, without a model call. The `.pb` bodies in the desktop/backup
+stores are **encrypted** (measured entropy 8.000/8.000), not an unmapped
+format; there is no key, so they are skipped silently rather than reported as
+corrupt on every scan.
+
+**What makes antigravity different from the other three writers:** visibility
+requires *both* a conversation body and a `conversation_summaries` row, and the
+body's step payloads are protobuf. This is the only place agentbridge authors
+protobuf rather than JSON. The encoder writes exactly the five fields the
+decoder reads, so the round trip is exact for everything agentbridge models,
+and agy tolerates the absence of the rest. Guards mirror
+`opencode_write`/`codex_write` exactly: backup-before-first-insert, marker
+column (`agent_name`, verified unused by agy in 0 of 102 rows), refuse while
+agy is running, `--dry-run`. Bodies are written to a temp file and renamed so a
+crash cannot hand agy a half-built database.
+
+**Merge-back is refused for antigravity natives, unlike Claude/Codex.** A real
+agy body carries protobuf fields we do not decode (tool calls, reasoning,
+`gen_metadata` blobs). Rewriting one with a minimal encoder would destroy
+everything outside the fields we understand, so recovered turns stay in the
+overlay. This is a stronger reason than OpenCode's exclusion and is enforced at
+the call site *and* backstopped in `merge_back_native`.
+
+**Two bugs found in existing code while wiring this up:**
+
+- `main.rs` had a live `unreachable!()` in the `resume` write dispatch. Any
+  target outside the three hardcoded arms panicked on a user's machine; it now
+  returns a reported error.
+- `codex_cli::config_home` cached `CODEX_HOME` in a `LazyLock`, so the value
+  depended on whichever code path read it first in the process and a later
+  change was ignored for the rest of the run. The sibling connectors already
+  re-read their env var per call; this one now does too. Surfaced as a flaky
+  `test_live_root_honors_config_dir_overrides` once new sandboxed tests changed
+  test ordering — the existing suite hid it by accident of ordering, which is
+  exactly the failure mode HANDOFF §5 warns about.
+
+`Sandbox` now also sets `ANTIGRAVITY_HOME`. Without it a sandboxed test would
+write conversations into the operator's real `~/.gemini` store — the same
+isolation gap already documented for `CODEX_HOME`.
+
+**Verified end-to-end on a copy of the real store** (all five env vars
+redirected): sync wrote 26 conversations and took an automatic backup; `status`
+showed matching counts and then `+1` drift after a step was appended; `pull`
+recovered both the appended turn and a rename made in agy's index; a following
+`sync` propagated both into the Claude Code copy; three further passes left the
+count unchanged (no feedback loop); `unsync` restored exactly 12 bodies / 102
+rows with all 12 original bodies byte-identical and recovered work preserved.
+The real store was confirmed untouched throughout (0 marked rows, no backups).

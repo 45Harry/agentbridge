@@ -7,7 +7,8 @@ conversation in Claude Code, continue it in Codex or OpenCode — from any
 directory. Sessions you create in one tool automatically appear in every
 other tool, and the work you add anywhere is pulled back and shared everywhere.
 
-Works today, verified live: **Claude Code, Codex CLI, OpenCode, Antigravity CLI**.
+Works today, verified live: **Claude Code, Codex CLI, OpenCode, Antigravity**.
+All four are bidirectional — sessions flow in and out of every one of them.
 
 ## The problem
 
@@ -115,20 +116,23 @@ inode, OpenCode rows by marker) and never deletes recovered work.
 | Claude Code | `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl` | yes | yes |
 | Codex CLI | `~/.codex/sessions/<date>/rollout-*.jsonl` + `state_5.sqlite` | yes | yes, incl. picker rows* |
 | OpenCode | `~/.local/share/opencode/opencode.db` (SQLite) | yes | yes, guarded† |
-| Antigravity CLI | `~/.gemini/antigravity-cli/conversations/*.db` (SQLite) | yes | pending‡ |
+| Antigravity | `~/.gemini/antigravity-{cli,ide}/conversations/*.db` (SQLite) | yes, all stores‡ | yes, guarded† |
 
 \* Codex's `/resume` lists from the `threads` table in `state_5.sqlite`, never
 from the rollout files (its disk backfill is a one-time migration — verified).
 agentbridge inserts a `threads` row per synced session so they appear in the
 picker, with the same guards as OpenCode.
 
-† OpenCode is the only tool whose sessions live in a live database. Every
-write backs the database up first, tags its rows (removable by that tag alone),
-and refuses to run while OpenCode is open.
+† OpenCode and Antigravity keep sessions in live databases. Every write backs
+the database up first, tags its rows (removable by that tag alone), and refuses
+to run while the tool is open. Antigravity needs both a conversation body and
+an index row to be visible, so agentbridge writes both — it is the one place
+agentbridge authors protobuf rather than JSON.
 
-‡ Antigravity is read-only: its sessions are surfaced into every other tool,
-but foreign sessions are not yet materialized into it (write path deferred
-until the CLI's model quota resets and the binary can be exercised live).
+‡ Antigravity ships several surfaces (CLI, IDE) that each keep a separate store
+under `~/.gemini/`; all are scanned. Some conversations are stored as encrypted
+`.pb` files with no available key — those are skipped rather than reported as
+corrupt. See `CONNECTORS.md` §7.
 
 ## How it works
 
