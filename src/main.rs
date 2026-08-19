@@ -529,6 +529,13 @@ fn cmd_resume(
                 });
             vec![data_dir]
         }
+        "antigravity" => match agentbridge::antigravity_write::store() {
+            Some(home) => vec![home],
+            None => {
+                eprintln!("Antigravity store not found (looked under ~/.gemini)");
+                return;
+            }
+        },
         _ => {
             eprintln!("Unknown target provider: {}", target);
             return;
@@ -634,7 +641,33 @@ fn cmd_resume(
                 }
             }
         }
-        _ => unreachable!(),
+        "antigravity" => match agentbridge::antigravity_write::ensure_safe_to_write() {
+            Err(e) => Err(e.to_string()),
+            Ok(()) => {
+                let dir = session.project_path().unwrap_or_default();
+                // The conversation is already ours: the write below only
+                // refreshes it, which needs no backup. A new one gets one first.
+                let index = agentbridge::antigravity_write::summaries_db(target_dir);
+                if index.is_file()
+                    && agentbridge::antigravity_write::will_insert(
+                        target_dir,
+                        &session,
+                        std::slice::from_ref(&dir),
+                    )
+                    && let Err(e) = agentbridge::antigravity_write::backup(&index)
+                {
+                    eprintln!("  ! antigravity backup failed: {}", e);
+                }
+                agentbridge::antigravity_write::write_session(target_dir, &session, &dir)
+                    .map(|row| row.body)
+                    .map_err(|e| e.to_string())
+            }
+        },
+        // Every target the CLI accepts must be handled above; `resume` parses
+        // `target` from a fixed list, so anything else is a programming error
+        // rather than bad input — but reporting it beats panicking on a user's
+        // machine.
+        other => Err(format!("resume into {} is not implemented", other)),
     };
 
     match result {
@@ -652,6 +685,15 @@ fn cmd_resume(
                     "run".to_string(),
                     "--session".to_string(),
                     path.to_string_lossy().to_string(),
+                ],
+                // The conversation id is the body's filename stem.
+                // `--conversation` per CONNECTORS.md §4 (verified agy 1.1.8).
+                "antigravity" => vec![
+                    "agy".to_string(),
+                    "--conversation".to_string(),
+                    path.file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default(),
                 ],
                 _ => vec![],
             };

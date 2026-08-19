@@ -202,6 +202,14 @@ fn load_materialized(target: &str, path: &Path, id: &str) -> Option<crate::model
         "claude-code" => crate::connectors::claude_code::load_file(path, id).ok(),
         "codex-cli" => crate::connectors::codex_cli::load_file(path, id).ok(),
         "opencode" => crate::connectors::opencode::load_from_db(path, id).ok(),
+        // Antigravity's `dest` is the conversation body agentbridge wrote; the
+        // title lives in the separate summaries index, so it is layered on
+        // here or a rename made inside agy would never be seen.
+        "antigravity" => {
+            let mut s = crate::antigravity_write::load_written(path, id).ok()?;
+            s.title = crate::antigravity_write::written_title(path, id);
+            Some(s)
+        }
         _ => None,
     }
 }
@@ -227,17 +235,26 @@ impl StatusRow {
     }
 }
 
+/// The id a materialized copy is addressed by in its target tool.
+///
+/// Most targets keep the source's own id, but the tools agentbridge writes
+/// rows/databases into (OpenCode, Antigravity) require a native-shaped id, so
+/// the derived one is stashed in `LinkRecord::cache` at write time and has to
+/// be used to read the copy back.
+fn materialized_id(r: &LinkRecord) -> String {
+    match r.target_provider.as_str() {
+        "opencode" | "antigravity" => r.cache.to_string_lossy().to_string(),
+        _ => r.session_id.clone(),
+    }
+}
+
 pub fn status() -> Vec<StatusRow> {
     read_manifest()
         .into_iter()
         .map(|r| {
             let exists = r.dest.exists();
             let actual = if exists {
-                let id = if r.target_provider == "opencode" {
-                    r.cache.to_string_lossy().to_string()
-                } else {
-                    r.session_id.clone()
-                };
+                let id = materialized_id(&r);
                 load_materialized(&r.target_provider, &r.dest, &id)
                     .map(|s| s.messages.len())
             } else {
@@ -294,13 +311,10 @@ pub fn pull_back_with(dry_run: bool, resolver: &mut dyn ConflictResolver) -> Pul
         if !rec.dest.exists() {
             continue;
         }
-        // OpenCode rows are addressed by the ses_... id agentbridge created;
-        // for file targets the source session id names the materialized file.
-        let id = if rec.target_provider == "opencode" {
-            rec.cache.to_string_lossy().to_string()
-        } else {
-            rec.session_id.clone()
-        };
+        // OpenCode rows and Antigravity conversations are addressed by the
+        // native-shaped id agentbridge created; for file targets the source
+        // session id names the materialized file.
+        let id = materialized_id(rec);
         let Some(session) = load_materialized(&rec.target_provider, &rec.dest, &id) else {
             continue;
         };
@@ -498,7 +512,9 @@ fn live_root(target: &str) -> Option<PathBuf> {
         "claude-code" => crate::connectors::claude_code::write_root(),
         "codex-cli" => crate::connectors::codex_cli::config_home(),
         // OpenCode stores rows in SQLite, not files — it cannot be hardlinked
-        // into and is handled separately (DESIGN.md §5).
+        // into and is handled separately (DESIGN.md §5). Antigravity is the
+        // same: one SQLite body per conversation plus an index row, so it is
+        // written by `antigravity_write`, not linked.
         _ => None,
     }
 }
@@ -562,6 +578,14 @@ fn link_or_copy(src: &Path, dest: &Path) -> std::io::Result<u64> {
     Ok(fs::metadata(dest)?.ino())
 }
 
+/// The inode of a file agentbridge wrote directly (rather than hardlinked).
+/// Recorded so `unsync` can refuse to delete a path the tool has since
+/// replaced with a file of its own. `0` when unreadable, which `unsync` treats
+/// as "no match" and therefore leaves alone.
+fn inode_of(path: &Path) -> u64 {
+    fs::metadata(path).map(|m| m.ino()).unwrap_or(0)
+}
+
 pub fn read_manifest() -> Vec<LinkRecord> {
     let path = manifest_path();
     let Ok(content) = fs::read_to_string(&path) else {
@@ -592,6 +616,8 @@ fn append_manifest(records: &[LinkRecord]) -> std::io::Result<()> {
     // session, so the row id (kept in `cache`) is what makes an entry unique.
     // Keyed on dest alone a whole run's OpenCode rows collapse into a single
     // manifest entry and `status`/`pull` lose sight of every session but one.
+    // Antigravity needs no such exception: each conversation is its own file,
+    // so its dest is already unique per row.
     let key = |r: &LinkRecord| -> (PathBuf, Option<PathBuf>) {
         if r.target_provider == "opencode" {
             (r.dest.clone(), Some(r.cache.clone()))
@@ -697,6 +723,10 @@ fn merge_back_native(
             link_or_copy(&artifact, &dest).map_err(|e| format!("merge-back write: {}", e))?;
             Ok(())
         }
+        // Antigravity is deliberately absent: rewriting a native agy body with
+        // the minimal protobuf encoder in `antigravity_write` would drop every
+        // field agentbridge does not decode. The caller excludes it before
+        // reaching here; this arm is the backstop.
         other => Err(format!("merge-back not supported for {}", other)),
     }
 }
@@ -705,17 +735,24 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
     let index: Index = discover(registry);
     let mut report = SyncReport::default();
 
-    // OpenCode has no live_root (rows, not files) but is still a valid target.
+    // OpenCode and Antigravity have no live_root (rows/per-conversation
+    // databases, not linkable files) but are still valid targets.
     let targets: Vec<String> = registry
         .detected()
         .map(|c| c.id().to_string())
-        .filter(|id| live_root(id).is_some() || (id == "opencode" && opencode_db().is_some()))
+        .filter(|id| {
+            live_root(id).is_some()
+                || (id == "opencode" && opencode_db().is_some())
+                || (id == "antigravity" && crate::antigravity_write::store().is_some())
+        })
         .collect();
 
     // Back up OpenCode's database once per run, before any INSERT.
     let mut opencode_backed_up = false;
     // Same for Codex's index (`state_5.sqlite`).
     let mut codex_backed_up = false;
+    // Same for Antigravity's summaries index.
+    let mut antigravity_backed_up = false;
 
     let mut manifest = read_manifest();
     let mut manifest_dirty = false;
@@ -771,6 +808,14 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
                     && is_merge(&entry.id)
                     && !overlay_messages(&entry.id).is_empty()
                     && entry.provider != "opencode"
+                    // Antigravity is excluded for a stronger reason than
+                    // OpenCode's: a real agy body carries protobuf fields
+                    // agentbridge does not decode (tool calls, reasoning,
+                    // gen_metadata blobs). Rewriting one with the minimal
+                    // encoder in `antigravity_write` would silently destroy
+                    // everything outside the handful of fields we understand,
+                    // so recovered turns stay in the overlay instead.
+                    && entry.provider != "antigravity"
                 {
                     match merge_back_native(registry, entry) {
                         Ok(()) => report.merged_native += 1,
@@ -784,7 +829,11 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
 
             let is_opencode = target == "opencode";
             let is_codex = target == "codex-cli";
-            if !is_opencode && (live_root(target).is_none() || converter_for(target).is_none()) {
+            let is_antigravity = target == "antigravity";
+            if !is_opencode
+                && !is_antigravity
+                && (live_root(target).is_none() || converter_for(target).is_none())
+            {
                 continue;
             }
 
@@ -811,6 +860,11 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
                 report.created.push(LinkRecord {
                     dest: if is_opencode {
                         opencode_db().unwrap_or_default()
+                    } else if is_antigravity {
+                        crate::antigravity_write::store()
+                            .unwrap_or_default()
+                            .join("conversations")
+                            .join("(planned)")
                     } else {
                         live_root(target).unwrap_or_default().join("(planned)")
                     },
@@ -823,6 +877,63 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
                     message_count: session.messages.len(),
                     title: session.title.clone(),
                 });
+                continue;
+            }
+
+            // Antigravity: one SQLite body per conversation plus a summaries
+            // row. Neither is linkable, so this writes both directly, the same
+            // way OpenCode INSERTs rows.
+            if is_antigravity {
+                let Some(home) = crate::antigravity_write::store() else {
+                    continue;
+                };
+                if let Err(e) = crate::antigravity_write::ensure_safe_to_write() {
+                    report.errors.push(e.to_string());
+                    continue;
+                }
+                let dirs = target_dirs(project, &session);
+                if !antigravity_backed_up
+                    && crate::antigravity_write::summaries_db(&home).is_file()
+                    && crate::antigravity_write::will_insert(&home, &session, &dirs)
+                {
+                    // A run that would only refresh conversations agentbridge
+                    // already wrote needs no backup; one that inserts does.
+                    match crate::antigravity_write::backup(
+                        &crate::antigravity_write::summaries_db(&home),
+                    ) {
+                        Ok(_) => antigravity_backed_up = true,
+                        Err(e) => {
+                            report.errors.push(e.to_string());
+                            continue;
+                        }
+                    }
+                }
+                let (rows, errors) =
+                    crate::antigravity_write::write_sessions(&home, &session, &dirs);
+                for e in errors {
+                    report.errors.push(format!("antigravity {}", e));
+                }
+                for row in rows {
+                    report.created.push(LinkRecord {
+                        // The body is the artifact a pull re-reads, so it is
+                        // the `dest`; `unsync` removes it and its index row
+                        // together by the marker.
+                        dest: row.body.clone(),
+                        cache: PathBuf::from(&row.id),
+                        session_id: entry.id.clone(),
+                        source_provider: entry.provider.clone(),
+                        target_provider: target.clone(),
+                        project: PathBuf::from(row.directory),
+                        inode: inode_of(&row.body),
+                        message_count: row.messages,
+                        // The title actually persisted, not session.title:
+                        // an untitled session gets a derived name, and that
+                        // text is what a later pull reads back. Recording the
+                        // source's `None` here would make every untitled
+                        // session look renamed on the next pull.
+                        title: Some(row.title),
+                    });
+                }
                 continue;
             }
 
@@ -1127,8 +1238,31 @@ pub fn unsync(dry_run: bool) -> UnsyncReport {
             }
         }
 
+    // Antigravity conversations agentbridge wrote are removed by their marker,
+    // which takes the body and its summaries row together — an orphaned body
+    // would still be found by a filesystem scan.
+    if !dry_run
+        && records.iter().any(|r| r.target_provider == "antigravity")
+        && let Some(home) = crate::antigravity_write::store() {
+            match crate::antigravity_write::ensure_safe_to_write() {
+                Ok(()) => {
+                    let _ = crate::antigravity_write::remove_all(&home);
+                }
+                Err(_) => {
+                    // Leave them; the operator is told to quit Antigravity.
+                }
+            }
+        }
+
     for r in &records {
         if r.target_provider == "opencode" {
+            report.removed.push(r.dest.clone());
+            continue;
+        }
+        // Antigravity bodies were already deleted with their index rows above,
+        // by marker rather than by path. Counting them as missing here would
+        // report a successful teardown as a failure.
+        if r.target_provider == "antigravity" {
             report.removed.push(r.dest.clone());
             continue;
         }
@@ -1187,6 +1321,7 @@ pub fn unsync(dry_run: bool) -> UnsyncReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connector::Connector;
     use rusqlite::{params, Connection};
     use std::path::Path;
 
@@ -1219,6 +1354,11 @@ mod tests {
                 // write into their real session store instead of tmp.
                 std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path().join(".claude"));
                 std::env::set_var("CODEX_HOME", tmp.path().join(".codex"));
+                // Same hazard for antigravity: `antigravity_write::store()`
+                // honors ANTIGRAVITY_HOME, so without this a sandboxed test
+                // would write conversations into the operator's real
+                // ~/.gemini store (HANDOFF §sandbox doctrine).
+                std::env::set_var("ANTIGRAVITY_HOME", tmp.path().join(".gemini/antigravity-cli"));
             }
             Sandbox { _tmp: tmp, _guard: guard }
         }
@@ -1356,6 +1496,274 @@ mod tests {
         crate::connector::Registry::new(vec![Box::new(
             crate::connectors::claude_code::TestClaudeCode::new(root),
         )])
+    }
+
+    /// A registry holding a real antigravity connector rooted in the sandbox,
+    /// so it is both a discovery source and a write target.
+    fn agy_registry(claude_root: PathBuf) -> crate::connector::Registry {
+        crate::connector::Registry::new(vec![
+            Box::new(crate::connectors::claude_code::TestClaudeCode::new(claude_root)),
+            Box::new(crate::connectors::antigravity::AntigravityConnector::new()),
+        ])
+    }
+
+    /// Create the sandbox's antigravity store so `store()`/`detect()` see it.
+    fn make_agy_store() -> PathBuf {
+        let home = crate::antigravity_write::store()
+            .unwrap_or_else(|| crate::connectors::antigravity::write_home().unwrap());
+        fs::create_dir_all(home.join("conversations")).unwrap();
+        home
+    }
+
+    /// Sync must materialize a Claude session **into** antigravity: a body and
+    /// an index row, both discoverable by antigravity's own connector.
+    #[test]
+    fn test_sync_materializes_into_antigravity() {
+        let _sb = Sandbox::new();
+        let live = live_root("claude-code").unwrap();
+        write_native_claude_session(&live, "/tmp/merge-project");
+        let agy_home = make_agy_store();
+        let registry = agy_registry(live);
+
+        let report = sync_into(&registry, Path::new("/tmp/merge-project"), false);
+
+        let agy: Vec<&LinkRecord> = report
+            .created
+            .iter()
+            .filter(|r| r.target_provider == "antigravity")
+            .collect();
+        assert!(!agy.is_empty(), "antigravity must be a sync target: {:?}", report.errors);
+        for r in &agy {
+            assert!(r.dest.is_file(), "body written at {}", r.dest.display());
+            assert!(r.inode != 0, "inode recorded so unsync can verify ownership");
+            assert!(r.title.is_some(), "title recorded for rename detection");
+        }
+        assert_eq!(
+            crate::antigravity_write::count_written(&agy_home),
+            agy.len(),
+            "one marked conversation per manifest row"
+        );
+
+        // And agy's own reader finds them.
+        let connector = crate::connectors::antigravity::AntigravityConnector::new();
+        let ids: Vec<String> = connector
+            .scan()
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .map(|r| r.id)
+            .collect();
+        for r in &agy {
+            let id = r.cache.to_string_lossy().to_string();
+            assert!(ids.contains(&id), "{} must be listed by the connector", id);
+        }
+    }
+
+    /// Re-running must refresh, not accumulate conversations.
+    #[test]
+    fn test_sync_into_antigravity_is_idempotent() {
+        let _sb = Sandbox::new();
+        let live = live_root("claude-code").unwrap();
+        write_native_claude_session(&live, "/tmp/merge-project");
+        let agy_home = make_agy_store();
+        let registry = agy_registry(live);
+
+        sync_into(&registry, Path::new("/tmp/merge-project"), false);
+        let after_first = crate::antigravity_write::count_written(&agy_home);
+        sync_into(&registry, Path::new("/tmp/merge-project"), false);
+        let after_second = crate::antigravity_write::count_written(&agy_home);
+        assert_eq!(after_first, after_second, "no duplicate conversations");
+        assert!(after_first > 0);
+    }
+
+    /// A conversation agentbridge wrote into agy must not be re-materialized as
+    /// if the user had authored it there — that is the loop that multiplies
+    /// sessions on every run (DESIGN.md §6).
+    #[test]
+    fn test_sync_does_not_feed_on_conversations_it_wrote_into_antigravity() {
+        let _sb = Sandbox::new();
+        let live = live_root("claude-code").unwrap();
+        write_native_claude_session(&live, "/tmp/merge-project");
+        let agy_home = make_agy_store();
+        let registry = agy_registry(live);
+
+        sync_into(&registry, Path::new("/tmp/merge-project"), false);
+        let first = crate::antigravity_write::count_written(&agy_home);
+        // Two more passes: a feedback loop would grow the count each time.
+        sync_into(&registry, Path::new("/tmp/merge-project"), false);
+        sync_into(&registry, Path::new("/tmp/merge-project"), false);
+        assert_eq!(
+            crate::antigravity_write::count_written(&agy_home),
+            first,
+            "agentbridge's own antigravity conversations must never become sources"
+        );
+    }
+
+    /// Write-back out of antigravity: turns appended to the materialized
+    /// conversation are recovered into the overlay, and a rename is detected.
+    #[test]
+    fn test_pull_back_recovers_turns_and_renames_from_antigravity() {
+        let _sb = Sandbox::new();
+        let live = live_root("claude-code").unwrap();
+        write_native_claude_session(&live, "/tmp/merge-project");
+        make_agy_store();
+        let registry = agy_registry(live);
+        sync_into(&registry, Path::new("/tmp/merge-project"), false);
+
+        let rec = read_manifest()
+            .into_iter()
+            .find(|r| r.target_provider == "antigravity")
+            .expect("an antigravity row");
+        let agy_id = rec.cache.to_string_lossy().to_string();
+
+        // Simulate the user continuing the conversation inside agy, and
+        // renaming it, by appending a step and updating the index.
+        let before = crate::antigravity_write::load_written(&rec.dest, &agy_id).unwrap();
+        append_agy_turn(&rec.dest, before.messages.len(), "a reply typed inside agy");
+        rename_agy(&rec.dest, &agy_id, "Renamed inside agy");
+
+        let report = pull_back(false);
+        assert!(
+            report.pulled.iter().any(|(sid, n)| sid == &rec.session_id && *n >= 1),
+            "the appended turn must be recovered: {:?}",
+            report.pulled
+        );
+        let recovered = overlay_messages(&rec.session_id);
+        assert!(
+            recovered.iter().any(|m| m.text.as_deref() == Some("a reply typed inside agy")),
+            "recovered text lands in the overlay"
+        );
+        assert_eq!(
+            overlay_title(&rec.session_id).as_deref(),
+            Some("Renamed inside agy"),
+            "the rename is recovered too"
+        );
+    }
+
+    /// An untitled session gets a derived name in agy. Reading that back must
+    /// not look like the user renamed it — the false-rename regression this
+    /// project hit twice before.
+    #[test]
+    fn test_antigravity_fallback_title_is_not_a_false_rename() {
+        let _sb = Sandbox::new();
+        let live = live_root("claude-code").unwrap();
+        // A session with no title at all.
+        let encoded = crate::convert::ClaudeCodeConverter::encode_project_dir("/tmp/untitled-proj");
+        let dir = live.join(&encoded);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("c1d2e3f4-a5b6-7890-cdef-123456789abc.jsonl"),
+            "{\"uuid\":\"c1d2e3f4-a5b6-7890-cdef-123456789abc\",\"type\":\"conversation_start\",\"cwd\":\"/tmp/untitled-proj\",\"timestamp\":\"2026-07-01T12:00:00Z\"}\n             {\"uuid\":\"d2e3f4a5-b6c7-8901-def1-23456789abcd\",\"type\":\"user_message\",\"cwd\":\"/tmp/untitled-proj\",\"timestamp\":\"2026-07-01T12:00:05Z\",\"content\":\"do the thing\"}\n",
+        )
+        .unwrap();
+        make_agy_store();
+        let registry = agy_registry(live);
+        sync_into(&registry, Path::new("/tmp/untitled-proj"), false);
+
+        let report = pull_back(false);
+        assert!(
+            report.renamed.is_empty(),
+            "a derived title must not read as a rename: {:?}",
+            report.renamed
+        );
+    }
+
+    /// Teardown must remove the bodies *and* their index rows, leaving
+    /// conversations agy authored alone.
+    #[test]
+    fn test_unsync_removes_antigravity_conversations_but_not_agy_own() {
+        let _sb = Sandbox::new();
+        let live = live_root("claude-code").unwrap();
+        write_native_claude_session(&live, "/tmp/merge-project");
+        let agy_home = make_agy_store();
+        let registry = agy_registry(live);
+        sync_into(&registry, Path::new("/tmp/merge-project"), false);
+
+        let written: Vec<PathBuf> = read_manifest()
+            .into_iter()
+            .filter(|r| r.target_provider == "antigravity")
+            .map(|r| r.dest)
+            .collect();
+        assert!(!written.is_empty());
+
+        // A conversation agy authored, which must survive.
+        let native_body = agy_home
+            .join("conversations")
+            .join("75ce4071-a2a8-44d0-9958-6720905cc5e4.db");
+        fs::write(&native_body, b"agy own").unwrap();
+
+        unsync(false);
+
+        for body in &written {
+            assert!(!body.exists(), "{} must be removed", body.display());
+        }
+        assert!(native_body.exists(), "agy's own conversation is untouched");
+        assert_eq!(
+            crate::antigravity_write::count_written(&agy_home),
+            0,
+            "no marked index rows remain"
+        );
+    }
+
+    /// Append a step to a materialized conversation the way agy would, so the
+    /// pull path sees new work. Encodes the same protobuf shape the reader
+    /// expects (`.19.2` for user text).
+    fn append_agy_turn(body: &Path, idx: usize, text: &str) {
+        let conn = rusqlite::Connection::open(body).unwrap();
+        let mut payload = Vec::new();
+        // .1 step_type = 14 (user)
+        payload.extend([0x08, 14]);
+        // .4 status = 3
+        payload.extend([0x20, 3]);
+        // .5.1 created
+        let mut created = Vec::new();
+        created.extend([0x08]);
+        let secs: u64 = 1_785_400_000;
+        let mut v = secs;
+        loop {
+            let mut b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v != 0 {
+                b |= 0x80;
+            }
+            created.push(b);
+            if v == 0 {
+                break;
+            }
+        }
+        created.extend([0x10, 0]);
+        let mut meta = Vec::new();
+        meta.push(0x0a);
+        meta.push(created.len() as u8);
+        meta.extend(&created);
+        payload.push(0x2a);
+        payload.push(meta.len() as u8);
+        payload.extend(&meta);
+        // .19 { .2 = text }
+        let mut inner = vec![0x12, text.len() as u8];
+        inner.extend(text.as_bytes());
+        payload.push(0x9a);
+        payload.push(0x01);
+        payload.push(inner.len() as u8);
+        payload.extend(&inner);
+
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, status, step_payload, step_format) \
+             VALUES (?1, 14, 3, ?2, 0)",
+            rusqlite::params![idx as i64, payload],
+        )
+        .unwrap();
+    }
+
+    /// Rename a materialized conversation in agy's index, the way the app would.
+    fn rename_agy(body: &Path, id: &str, title: &str) {
+        let home = body.parent().unwrap().parent().unwrap();
+        let conn =
+            rusqlite::Connection::open(crate::antigravity_write::summaries_db(home)).unwrap();
+        conn.execute(
+            "UPDATE conversation_summaries SET title = ?1 WHERE conversation_id = ?2",
+            rusqlite::params![title, id],
+        )
+        .unwrap();
     }
 
     #[test]
