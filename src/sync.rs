@@ -856,6 +856,17 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
             // also continued it in its own tool.
             fold_overlay(&mut session, &entry.id);
 
+            // Stamp the cross-tool label into the title every target picker
+            // shows: origin tool, name, the session's own start time, and the
+            // first 8 characters of its id. Applied after `fold_overlay` so a
+            // rename recovered from another tool is what gets labeled, and
+            // before every write so all four copies carry the same string.
+            //
+            // `session.provider`/`session.id` are still the *origin's* here
+            // (only `project_id` was re-homed above), which is exactly what
+            // makes the label identical in every tool.
+            crate::label::apply(&mut session);
+
             if dry_run {
                 report.created.push(LinkRecord {
                     dest: if is_opencode {
@@ -1615,6 +1626,54 @@ mod tests {
         );
     }
 
+    /// The cross-tool label must be what lands in every target's title, must
+    /// be identical across targets for one session, and must not read as a
+    /// rename on the next pull.
+    #[test]
+    fn test_label_is_written_to_every_target_and_is_not_a_false_rename() {
+        let _sb = Sandbox::new();
+        let live = live_root("claude-code").unwrap();
+        write_native_claude_session(&live, "/tmp/merge-project");
+        make_agy_store();
+        let registry = agy_registry(live);
+
+        let report = sync_into(&registry, Path::new("/tmp/merge-project"), false);
+        let native = report
+            .created
+            .iter()
+            .filter(|r| r.session_id == NATIVE_UUID)
+            .collect::<Vec<_>>();
+        assert!(!native.is_empty(), "the session was materialized somewhere");
+
+        let mut labels: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for r in &native {
+            let title = r.title.as_deref().expect("every row records a title");
+            let l = crate::label::parse(title)
+                .unwrap_or_else(|| panic!("{} title must be a label: {:?}", r.target_provider, title));
+            // The fixture session carries an explicit name; it must survive
+            // verbatim rather than being reworded or clipped.
+            assert_eq!(l.name, "Merge test", "existing name kept as-is");
+            assert!(NATIVE_UUID.starts_with(l.id), "label id prefixes the origin id");
+            assert_eq!(l.provider, "claude-code", "label names the origin tool");
+            labels.insert(title.to_string());
+        }
+        assert_eq!(
+            labels.len(),
+            1,
+            "one session must carry one identical label into every tool: {:?}",
+            labels
+        );
+
+        // The label is what agentbridge wrote, so reading it back is not a
+        // rename — this is the 705-false-rename hazard.
+        let pulled = pull_back(false);
+        assert!(
+            pulled.renamed.is_empty(),
+            "labeling must not report renames: {:?}",
+            pulled.renamed
+        );
+    }
+
     /// Regression: the antigravity branch always *appended* its manifest rows,
     /// so every re-sync added another row per conversation. `pull` then read a
     /// single session as several tools' worth of new work and reported a
@@ -2359,7 +2418,21 @@ mod tests {
         // file body (that upsert has its own coverage in codex_write.rs) — so
         // the LinkRecord is the observable point here: it carries the title
         // that will be written into that index (`ensure_codex_row`).
-        assert_eq!(codex.title.as_deref(), Some("renamed-in-claude-code"));
+        //
+        // The written title is the cross-tool label, so the recovered rename
+        // is its *name* field rather than the whole string.
+        let written = codex.title.as_deref().expect("codex link carries a title");
+        let parsed = crate::label::parse(written)
+            .unwrap_or_else(|| panic!("codex title must be a label: {:?}", written));
+        assert_eq!(parsed.name, "renamed-in-claude-code");
+        // And the label still identifies the origin session, which is the
+        // point of carrying it into other tools at all.
+        assert!(
+            link.session_id.starts_with(parsed.id),
+            "label id {:?} must prefix the origin session id {:?}",
+            parsed.id,
+            link.session_id
+        );
     }
 
     /// The overlay is the ONLY durable copy of turns added in a materialized
