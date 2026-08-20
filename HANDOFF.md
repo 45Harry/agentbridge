@@ -565,6 +565,79 @@ documented for `CODEX_HOME`.
 Test count went 97 → 128 (10 connector, 13 write, 6 sync, plus the strengthened
 real-data test which now asserts model responses decode, not just "not empty").
 
+## 2h. One session, four picker rows, nothing tying them together — 2026-08-19
+
+Operator asked for "agent name + session name + date and time + session id" in
+each tool, with the **exact** session date rather than the sync date, so one
+conversation can be tracked across agents. Then corrected the first draft: a
+session that already has a name keeps it — only unnamed sessions get one.
+
+Implemented in `src/label.rs`, applied in `sync_into` immediately after
+`fold_overlay` and before every write, so all four copies carry one string:
+
+```
+claude-code · My Important Session · 2026-08-19 10:00 · aaaaaaaa
+provider    · name                 · started_at       · id[..8]
+```
+
+**The three things that make this dangerous, and how each is handled.** The
+title is not a cosmetic field here — `pull_back` compares the title it wrote
+against the title it reads back to detect renames, so anything unstable in the
+label reports every session as renamed on every pull (the 705-false-rename
+regression, §2e):
+
+- **Timestamp is `started_at`, never `now`,** and always UTC. Sync time would
+  change every run; local time would change with the machine's timezone.
+- **Labeling is idempotent.** A rename made inside a tool arrives *as a labeled
+  title*; `apply` strips the old label first and rebuilds around the user's new
+  name rather than nesting.
+- **An existing name is verbatim.** Only a name agentbridge derives for an
+  unnamed session is clipped (word-safe, deterministic, marked with `…`). The
+  metadata fields are never truncated — a cut id or date defeats the point.
+
+`provider` and `id` are the **origin's**, which is what makes one session yield
+one identical label in every tool: `sync_into` re-homes `project_id` per target
+but leaves those two alone. A test asserts the label set for one session has
+size 1.
+
+`parse` demands all four fields be well formed, so a user's own title is never
+mistaken for a label and rewritten. Covered: titles containing the separator,
+unknown provider, malformed stamp, short id.
+
+**Session ids are not always UUIDs.** Claude Code derives one from the filename
+stem, so `renamed-in-claude-code` is a real id, and a UUID's first 8 characters
+can themselves contain `-`. The first id check was alphanumeric-only, rejected
+those labels, and `pull_back` immediately read agentbridge's own label as a
+foreign rename. An existing sync test caught it.
+
+### A duplication bug in the antigravity write path
+
+Found while verifying labels: the antigravity branch **appended** manifest rows
+instead of updating them, so re-syncing grew the manifest 52 → 78 → 104 across
+three runs. `pull` then read one session as several tools' worth of new work and
+reported a conflict against itself:
+
+```
+1 session(s) had new work from more than one tool:
+  aaaaaaaa-…  antigravity+antigravity+antigravity -> merged
+```
+
+The file targets already solved this in their `unchanged` branch (update the
+row in place, count it unchanged); the antigravity branch now does the same.
+Regression test asserts one row per (session, dest) and a stable count across
+re-syncs. Worth noting the *symptom* pointed at the conflict resolver and the
+*cause* was in manifest bookkeeping two layers away.
+
+### Verified on a copy of the real store
+
+A named claude session kept `My Important Session` exactly; unnamed agy
+conversations got word-safe derived names; every label carried the conversation's
+real date (2026-08-18/19), never the sync date; the identical label appeared in
+both agy's index and the Claude Code copy; a rename made inside agy was
+recovered **bare** into the overlay (not labeled) and republished with the label
+rebuilt around it; three sync+pull cycles produced a stable 52-row manifest and
+zero renames. Tests 128 -> 143.
+
 ## 3. Architecture in one page
 
 Full detail in `DESIGN.md`; the three rules that matter:
@@ -592,6 +665,8 @@ src/
   index.rs      discovery — metadata only, bodies stay in source files
   sync.rs       cache, hardlink fan-out, manifest, pull_back, status, unsync
   convert.rs    native-format writers (Claude Code, Codex) + brief builder
+  label.rs      the cross-tool session label written into every target's
+                title: provider · name · started_at · id[..8]
   opencode_write.rs  SQLite write path for OpenCode (backup, tags, PID guard)
   codex_write.rs     `threads` index rows so Codex's picker lists them
   antigravity_write.rs  SQLite body + summaries row for agy; the only place
@@ -822,7 +897,7 @@ invariant 2, `ClaudeCodeConverter::convert_multi`, and the Codex
 ## 7. Repo hygiene
 
 - Public: `https://github.com/45Harry/agentbridge`, branch `master`.
-- Keep tests green (128 + 2 ignored); add a regression test for every bug, and
+- Keep tests green (143 + 2 ignored); add a regression test for every bug, and
   verify format changes against the real binary before believing them.
 - Never commit session data. `~/.agentbridge` is never the source of fixtures.
 - Ignored tests are the real-data checks: run them explicitly after any

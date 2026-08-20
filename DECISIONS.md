@@ -379,3 +379,79 @@ recovered both the appended turn and a rename made in agy's index; a following
 count unchanged (no feedback loop); `unsync` restored exactly 12 bodies / 102
 rows with all 12 original bodies byte-identical and recovered work preserved.
 The real store was confirmed untouched throughout (0 marked rows, no backups).
+
+---
+
+## 2026-08-19 (same pass, later) — Cross-tool session labels
+
+Operator: "I also want the date, exact date not the new sync date, alongside
+session ids, so it will be agent name + session name + date and time + session
+id to track the session across multiple agents." Then, on seeing the first
+draft: "don't change the session name — it already has one. Some tools' sessions
+might have a session name, so keep it as it was; only to no-names add names."
+
+The problem is real: a session materialized into four tools shows up as four
+picker rows with nothing tying them together, and each tool's date column
+reflects when the *copy* was written, not when the conversation happened.
+
+**Decision:** stamp a label into the one field every tool displays — the title
+— built in `src/label.rs` and applied in `sync_into` right after
+`fold_overlay`:
+
+```
+claude-code · My Important Session · 2026-08-19 10:00 · aaaaaaaa
+provider    · name                 · started_at       · id[..8]
+```
+
+Four constraints, three of them safety:
+
+1. **`started_at`, never `now`.** `pull_back` compares the title it wrote
+   against the title it reads back, so a label containing sync time would
+   report every session as renamed on every pull — the 705-false-rename
+   regression, re-armed. Verified: three sync+pull cycles, zero renames.
+2. **UTC.** Local time would make the label depend on the machine's timezone,
+   so syncing from a laptop that changed zones would look like a mass rename.
+3. **Idempotent.** `apply` strips any label already present before building a
+   new one, so a label that leaks back into a session's title is rebuilt rather
+   than nested. A rename made inside a tool arrives *as a labeled title*, and
+   the new label is built around the user's new name, not around the old label.
+4. **An existing name is kept verbatim** (the operator's correction). Only a
+   name agentbridge *derives* for an unnamed session is clipped, and that
+   clipping is deterministic and word-safe. Clipping a real name would both
+   lose information and, since the written title is what `pull_back` compares
+   against, read as a rename. The label's metadata fields are never truncated;
+   an id or date cut short defeats the whole point.
+
+**Why `provider` and `id` are the origin's, not the target's:** `sync_into`
+re-homes `project_id` per target but deliberately leaves `provider`/`id` alone,
+which is exactly what makes one session produce one identical label in all four
+tools. Locked by a test asserting the label set for one session has size 1.
+
+`parse` requires all four fields to be well formed — a known provider id, a
+structurally valid stamp, an id of the right length — so a user's own title is
+never mistaken for a label and mangled. Verified against titles that merely
+contain the separator, an unknown provider, a malformed stamp, and a short id.
+
+**Id validation had to accept more than hex.** Session ids are not always
+UUIDs: Claude Code derives one from the filename stem, so a real id can be
+`renamed-in-claude-code`, and even a UUID's first 8 characters can contain `-`.
+The initial alphanumeric-only check rejected those labels, and `pull_back` then
+saw agentbridge's own label as a foreign rename. Caught by an existing sync
+test, now covered directly.
+
+**Bug found while wiring this up (in the antigravity write path shipped
+earlier the same day):** the antigravity branch always *appended* its manifest
+rows instead of updating them, so every re-sync added another row per
+conversation — 52 → 78 → 104 across three runs. `pull` then read one session as
+several tools' worth of new work and reported a conflict against itself
+("antigravity+antigravity+antigravity -> merged"). The file targets already
+handled this in their `unchanged` branch; the antigravity branch now does the
+same. Regression test asserts one manifest row per (session, dest) and a stable
+count across re-syncs.
+
+Verified on a copy of the real store: a named session kept "My Important
+Session" exactly; unnamed agy conversations got word-safe derived names; every
+label carried the session's real date (2026-08-18/19), never the sync date; the
+same label appeared in both the agy index and the Claude Code copy; a rename
+made inside agy was recovered bare (not labeled) into the overlay and
+republished with the label rebuilt around it. Tests 128 → 143.

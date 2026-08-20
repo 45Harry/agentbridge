@@ -146,6 +146,28 @@ corrupt. See `CONNECTORS.md` §7.
    append-only overlay agentbridge owns and folded into the other tools'
    copies. `unsync` deletes only what it created.
 
+## Tracking one session across tools
+
+Every synced copy is titled with the same label, so the four picker rows for
+one conversation are recognizably the same conversation:
+
+```
+claude-code · My Important Session · 2026-08-19 10:00 · aaaaaaaa
+└ origin tool  └ session name        └ session start    └ session id
+```
+
+- **The date is the session's own start time**, read from inside the
+  transcript — not when the sync ran. It never changes, so the same
+  conversation shows the same date in every tool.
+- **A name the tool already has is kept verbatim.** `claude -n`, an in-session
+  rename, agy's `title` column: that name is yours and is never truncated or
+  reworded. Only a session with *no* name gets one derived from its opening
+  message (marked with `…` when shortened).
+- **Renaming a copy in any tool** is picked up by `pull` and republished, with
+  the label rebuilt around your new name and the id and date preserved.
+- Timestamps are UTC and the label is a pure function of the session, so
+  re-syncing never reports a session as renamed just for having been synced.
+
 ## Docs
 
 - `DESIGN.md` — architecture, the cost model, and the bugs real testing found.
