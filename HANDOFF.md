@@ -4,14 +4,14 @@ Pick this project up cold — new machine, new session, no memory of prior
 conversation. Read this, then `DESIGN.md` (architecture and why), then
 `CONNECTORS.md` (each tool's on-disk format).
 
-**Last updated:** 2026-08-14.
+**Last updated:** 2026-08-18.
 
 ## 0. Start here
 
 ```bash
 git clone git@github.com:45Harry/agentbridge.git
 cd agentbridge
-cargo build && cargo test      # 87 tests pass (+2 ignored: live-verification suites)
+cargo build && cargo test      # 97 tests pass (+2 ignored: live-verification suites)
 cargo run -- init              # read-only: what's on this machine
 ```
 
@@ -44,8 +44,9 @@ one tool are pulled into the overlay and republished. See DECISIONS.md
 - A fake Codex session dropped into `~/.codex/sessions/` surfaced as a
   UUIDv5 claude artifact in `~/.claude/projects/<encoded-dir>/` within 35s,
   then cleaned up.
-- Antigravity: read connector verified against the two real CLI conversation
-  databases — both load (user text at `.19.2`, model errors at `.24.3.1`).
+- Antigravity: **read and write, all stores** — see §2g. 24 conversations /
+  733 messages load across `antigravity-cli` and `antigravity-ide`; foreign
+  sessions materialize into agy's own picker.
 - Write-back: `sync` pulls turns appended in any tool into the overlay and
   republishes (WRITE-BACK-OK markers verified in the claude copies).
 - OpenCode write path proven against the real database (sessions created by
@@ -61,10 +62,11 @@ one tool are pulled into the overlay and republished. See DECISIONS.md
   as OpenCode, verified against the real binary (`codex delete` resolves an
   inserted row; `codex /resume` shows them). Refused while Codex is running,
   same as OpenCode.
-- Antigravity write connector + successful model-response text mapping (only
-  error text at `.24.3.1` is mapped) — deferred until the CLI's model quota
-  resets. Read-only is safe by construction: no `live_root`/converter for
-  antigravity in sync.rs, so sync never writes into it.
+- Antigravity: **shipped 2026-08-19** (§2g). Model text is mapped
+  (`payload.20.1`), the write connector exists, and both directions are
+  verified. Remaining gaps: the encrypted `.pb` bodies in the desktop/backup
+  stores cannot be read at all (no key), and merge-back into a *native* agy
+  body is deliberately refused — recovered turns stay in the overlay.
 - `start`/`inject` (cross-tool brief injection) exist; the brief builder is
   unit-tested, live-agent launch verification is light.
 - Redaction (`SPEC.md` §3) not implemented.
@@ -194,6 +196,448 @@ Test coverage added this round (see `cargo test`, now 87 + 2 ignored):
 `test_converted_claude_file_mtime_matches_session_last_event`,
 `test_codex_convert_multi_mtime_matches_session_last_event`.
 
+## 2c. §2b re-verified live, and a second bug found — 2026-08-14
+
+Ran the §6 "START HERE" checklist against the real `claude` (2.1.232), `opencode`
+(1.18.15) and `codex` (0.147.0) binaries, in a sandbox (fake `HOME`, real
+binaries, per §4 — never on the operator's own data). Found and fixed one more
+bug; everything else confirmed working:
+
+- **`ClaudeCodeConverter` had no real `convert_multi`.** It used the
+  `SessionConverter` trait's default (`convert()` once, `dirs` argument
+  discarded), while `sync_into`'s per-directory loop does
+  `dirs.iter().zip(&artifacts)` — with only one artifact ever produced, `zip`
+  silently truncated to the first directory and dropped every other one,
+  including the `$HOME` fallback `target_dirs()` computes. In practice: a
+  Claude-Code-native session synced from directory B only ever got a copy in
+  B, never in `$HOME` too — contrary to what this doc claimed in §6 item 1.
+  Fixed by giving `ClaudeCodeConverter` a real `convert_multi` (one session
+  variant per directory, `project_id` swapped per copy, each through the
+  existing single-directory `convert()`), mirroring how `CodexCliConverter`
+  already does it. Regression tests:
+  `test_claude_convert_multi_writes_one_file_per_directory` (`convert.rs`),
+  `test_sync_materializes_claude_session_into_project_and_home` (`sync.rs`).
+  This was very likely compounding the original "renamed in OpenCode, not
+  showing in Claude Code" report: even after §2b's title-overlay fix, the
+  directory the operator happened to be checking may simply never have had a
+  Claude Code copy at all.
+- **Title write-back confirmed end-to-end, real binaries.** Built a native
+  Claude Code session (accepted by the real `claude --resume`, verified via
+  the zero-cost "No deferred tool marker found" signal from §4), synced it
+  into OpenCode (row visible in real `opencode session list`), renamed it via
+  a direct `UPDATE session SET title=…` — the same mutation OpenCode's own
+  rename does — reconfirmed via `opencode session list`, then `agentbridge
+  pull` (reported the rename), then `agentbridge sync --project <a directory
+  that never held a copy>`. The new Claude Code copy there carried the
+  renamed title in a real `custom-title`/`agent-name` record and was accepted
+  by `claude --resume` (same zero-cost signal) — a rename made through
+  OpenCode's real database reached a directory that had never seen this
+  session before, through a real Claude Code file. The session's actual
+  native file was never given a `custom-title` record by agentbridge (still
+  none there) — invariant 2 held.
+- **mtime fix confirmed**, isolated from the run above (which got a stray
+  real edit from an unrelated auth-failed `claude -p` probe and briefly
+  looked like it hadn't): a clean session with content timestamped
+  `2020-01-01` produced a materialized copy with that exact mtime, not the
+  sync wall-clock time.
+- **Not exercised live**: Codex's `threads.title` upsert. `codex_write.rs`
+  only activates once `~/.codex/state_5.sqlite` already exists, which the
+  real `codex` binary only creates on first authenticated use — out of scope
+  for a sandbox run. Already covered by `codex_write.rs`'s own unit tests
+  against the reverse-engineered real schema (`REAL_SCHEMA` in its test
+  module); still worth a real pass per §4's doctrine when convenient.
+
+## 2d. Codex never showed a rename either — third bug, fixed 2026-08-14
+
+Operator follow-up: "what about codex?" §2c had explicitly left Codex's
+`threads.title` unverified live (state_5.sqlite needs a real authenticated
+`codex` run to bootstrap). Two findings from actually chasing that down:
+
+- **`CODEX_HOME` is not fully honored by the real `codex` binary.** Sandboxing
+  `codex exec` with `CODEX_HOME=<sandbox>` still touched the operator's real
+  `~/.codex/state_5.sqlite` (confirmed by mtime, moments after the sandboxed
+  run) — the sessions themselves went into the sandboxed dir correctly, but
+  something about opening the state DB reached the default location instead.
+  No corruption resulted (row count unchanged, no new/bogus rows — it looks
+  like an open/checkpoint touch, not a write of new data), but **do not
+  invoke the real `codex` binary against a `CODEX_HOME` override expecting
+  full isolation** — it does not give you one, unlike `claude`/`opencode`,
+  which respected their equivalent overrides throughout all of §2c's testing.
+  Safe alternative used here instead: copy the operator's real
+  `state_5.sqlite` (schema + realistic prior rows) into a sandboxed
+  `CODEX_HOME`, then let *agentbridge itself* (not the real `codex` binary)
+  write into it — that fully respects `CODEX_HOME` since it's our own code.
+- **The real bug**: `codex_write.rs::ensure_thread_rows` computed `threads.title`
+  as `if first_user.is_empty() { session.title } else { clip(first_user) }` —
+  i.e. it used the first-user-message preview whenever one existed
+  (virtually always), and only fell back to `session.title` for a session
+  with zero user turns. An explicit title — a real Codex rename, or one
+  recovered from Claude Code/OpenCode via §2b's title overlay — was silently
+  discarded every time. Fixed to prefer `session.title` whenever set,
+  falling back to the preview only for an unnamed session (matching Codex's
+  own default-before-rename behavior). This predates §2b/§2c entirely — a
+  rename made *natively in Codex itself* was just as broken, since
+  `session.title` there passed straight through the same code path.
+  Regression test: `test_explicit_title_beats_first_message_preview`
+  (`codex_write.rs`). Verified against a copy of the operator's real
+  `state_5.sqlite` schema (not the original — see the `CODEX_HOME` note
+  above): a fresh row picked up the recovered title correctly; existing rows
+  from directories not touched by that particular `sync --project` run kept
+  their old title, exactly as expected (a sync only refreshes the project
+  directory + `$HOME`, not every directory a session was ever materialized
+  into — re-sync each directory to refresh it).
+
+## 2e. §2b's fix flooded 705 false "renames" outside the sandbox — fixed 2026-08-14
+
+The operator asked to install and test the title-sync work against real
+machine data (not synthetic fixtures) — real risk, since this machine's real
+manifest tracks ~19,000 rows across ~4,500 sessions. Found a real, machine-
+scale bug immediately:
+
+**`agentbridge pull` reported 705 "renames"** on the very first run against
+real data, for sessions nobody had touched. Root cause: `LinkRecord.title`
+was recorded as the raw `session.title` — which is `None` for the (very
+common) case of an untitled session — while `opencode_write::write_session`
+always persists *something* (falling back to `"{provider} session {id}"`
+when `session.title` is `None`). Once that fallback round-trips through
+`load_from_db` on the next `pull`, it is indistinguishable from a real title:
+`rec.title` (`None`) no longer matches what's actually in the row (the
+fallback text), so every untitled OpenCode-materialized session looked
+"renamed" — not a one-time transition cost as the original `LinkRecord.title`
+doc comment assumed, but a permanent, ongoing false positive for any session
+without an explicit title. The same class of bug existed for Codex's
+`threads.title` (also always falls back to a message preview or "New
+conversation") — though in practice it couldn't manifest as a `pull_back`
+false positive there, since `load_materialized("codex-cli", …)` reads the
+rollout *file*, which never carries title data in the modern format, so a
+codex-side mismatch could never be observed through that read path either
+way (harmless, but the same principle applies if that ever changes).
+
+**Fixed**: both `opencode_write::RowWritten` and `codex_write::ThreadRowReport`
+now return the title actually persisted, and `sync.rs` records *that* — not
+`session.title` — as `LinkRecord.title` for OpenCode (Codex's `LinkRecord.title`
+deliberately still tracks `session.title` directly, matching what its
+file-based read path can ever observe — see the code comment at the
+`ensure_codex_row` call sites). Regression tests:
+`test_untitled_session_fallback_title_is_not_a_false_rename`, and the two
+existing OpenCode pull tests now assert `report.renamed.is_empty()`
+explicitly instead of only checking message counts.
+
+**Cleanup performed on this operator's real machine** (no other remediation
+needed — nothing had been synced with the bad data yet, since `pull` only
+writes to `~/.agentbridge/overlay/` and `manifest.jsonl`, never a materialized
+copy directly):
+1. Deleted all 212 unique spurious `~/.agentbridge/overlay/*.title` files
+   (all timestamped from this session — the title-overlay feature didn't
+   exist before today, so there was nothing legitimate to lose).
+2. Left the stale-but-self-consistent `rec.title` values already written into
+   `manifest.jsonl` alone — they match what's currently in each OpenCode row,
+   so they cannot trigger another false positive, and self-heal the next time
+   `sync` touches each session (fresh `LinkRecord`s are written unconditionally
+   for every OpenCode target).
+3. Verified with the fixed binary: `agentbridge pull --dry-run` now reports
+   **0** renames against the same real data that produced 705 before.
+4. `~/.agentbridge/manifest.jsonl` confirmed structurally intact throughout
+   (19,106 lines, all valid JSON) — this was a false-positive bug, not data
+   corruption.
+
+This is exactly the class of bug §4's "unit tests mean nothing here" doctrine
+exists for: `test_pull_back_recovers_a_rename` and
+`test_recovered_rename_propagates_to_other_tools` (added when §2b landed)
+both passed the whole time, because they only ever exercised a *titled*
+fixture session — the untitled-session path was never touched until this
+outside-the-sandbox pass forced it.
+
+## 2f. `agentbridge pull` now asks when two tools both have new work — 2026-08-18
+
+Operator request: when a session is continued in more than one tool between
+pulls (write-back from Claude Code *and* Codex both waiting), let the operator
+choose what happens instead of always silently merging — with a real
+interactive terminal prompt. Full rationale in DECISIONS.md (2026-08-18);
+summary here.
+
+- `sync::pull_back` now groups pending write-back by session id before
+  applying it. Exactly one contributing tool: unchanged, no prompt, applied
+  exactly as `pull_back` always has (regression-tested:
+  `test_pull_back_single_tool_new_work_is_not_a_conflict`). Two or more tools:
+  a `ConflictResolver` (new trait in `sync.rs`) is asked once per session —
+  `AutoMerge` (today's behavior, keep everyone) is the default for anything
+  non-interactive; `pull_back_with(dry_run, resolver)` is the entry point for
+  a caller that wants to choose.
+- `agentbridge pull`, run from a real terminal, shows a **full-screen TUI**
+  (new dependency: `ratatui` + `crossterm` — native Rust, no runtime outside
+  the single static binary; the operator's first pointer was
+  `github.com/ahmadawais/terminui`, evaluated and rejected: it's TypeScript,
+  which would break the no-Node language decision of 2026-07-30, so `ratatui`
+  is its native-Rust equivalent: double-buffered, full-screen, panel-based).
+  The conflict screen (`src/tui.rs`, only ever constructed from `cmd_pull`,
+  gated on `IsTerminal` like before) draws one panel per contributing tool
+  with the actual new turns/rename it added, a highlighted menu (merge all /
+  keep only tool X / skip), and `↑/↓`+`Enter` (or `j/k`, `Esc`/`q` to skip).
+  A broken terminal falls back to `Skip` (re-ask next pull), never
+  `MergeAll` (that would apply a choice nobody made). `--dry-run`,
+  `--auto-merge`, and a non-TTY stdin all skip the TUI and keep the old
+  merge-everything behavior — `sync`'s internal pull and `auto watch`'s pull
+  are unaffected (still `AutoMerge`, still unattended-safe), just now flagging
+  conflicts in their output/log so the operator knows to revisit with
+  `agentbridge pull`. The `ConflictResolver` trait now carries the actual
+  turns per tool (`ConflictItem`), so both the TUI and the scripted test
+  resolver see what each side contributed — not just tool names.
+- `KeepOnly(tool)` is permanent for that batch of turns: the discarded tool's
+  manifest record still advances past the discarded turns, so re-pulling does
+  not re-offer them. `Skip` is the opposite — the manifest is left untouched,
+  so the same conflict is asked again next time. Both directions
+  regression-tested (`test_pull_back_keep_only_discards_the_other_tool`,
+  `test_pull_back_skip_leaves_manifest_untouched_and_reasks`), plus the
+  default-merge path (`test_pull_back_two_tools_is_a_conflict_and_auto_merge_keeps_both`).
+- **Verified live**, real terminal via `expect`, real binary, fully isolated
+  sandbox (`HOME`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_DATA_HOME`,
+  `AGENTBRIDGE_DATA_DIR` all redirected — see §4's sandbox recipe): a real
+  turn appended to a real materialized Claude Code copy and a real turn
+  appended to a real materialized Codex rollout copy, `agentbridge pull` from
+  a real pty rendered the full-screen ratatui UI (alternate screen, panels,
+  highlighted list), arrow-selecting "keep only claude-code" left the Codex
+  turn out of the overlay, the kept turn propagated into every re-synced
+  copy, and the discarded turn was physically gone from every materialized
+  file after the next correct `sync --project` (verified by grep across the
+  whole sandbox). Re-pull is quiet — `KeepOnly` permanent. One test-runner
+  stumble: a sync run *without* `--project` re-homed variants into the
+  shell's CWD instead of the sandbox project — always pass `--project` in
+  live runs; the "discarded turn still on disk" scare was that, not a bug.
+  Cleaned up with `agentbridge unsync`, nothing left behind.
+- **A real near-miss during this verification, worth remembering**: the first
+  sandbox attempt overrode only `HOME`, not `CLAUDE_CONFIG_DIR` — this
+  operator's shell always has `CLAUDE_CONFIG_DIR=~/.claude-mantra` set for
+  real, so `sync` happily materialized ~800 real session hardlinks into two
+  new subdirectories under the *real* `~/.claude-mantra/projects/`. No
+  existing file was touched (hardlinks only land in *new* directories keyed
+  by the sandboxed project path), and `agentbridge unsync` — run with the same
+  env the sync used — removed exactly those files, matching §4's doctrine
+  exactly. Lesson reinforced: **every** live-root env var
+  (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_DATA_HOME`, not just `HOME`) has to
+  be overridden together for a sandbox to actually be one — `HOME` alone is
+  not enough on a machine where the operator has redirected any tool's config
+dir. Also: files materialized via `set_mtime_from_session()` (§2b) carry the
+   *session's* timestamp, not "now" — `find -newermt` will not find them; check
+   the manifest's `dest` paths directly instead.
+- **Same session, same day — bare `agentbridge` opens a full-screen
+  dashboard.** Operator ran `agentbridge` with no subcommand, got the static
+  help, and asked for an interactive terminal GUI as the default entry
+  point (`src/dashboard.rs`, ratatui): one table of every tool's sessions
+  (tool / title / project / last-activity, provider-colored, newest first),
+  a provider filter (`Tab` cycles all → each detected tool), and one-key
+  actions — `s` runs a full sync pass (`pull_back` + `sync_into`, mirroring
+  `cmd_sync`'s pipeline), `p` runs pull with `AutoMerge` semantics
+  (deliberate: the dashboard is already a TUI and cannot nest the conflict
+  screen from `tui.rs`; conflicts are reported in the status line with a
+  pointer to run `agentbridge pull` in a real terminal), `↑/↓`/`j/k` move,
+  `g`/`G` jump, `q`/`Esc` quit, terminal restored on any exit path. Bare
+  invocation on a non-TTY stdin (pipes, cron) still prints the static help —
+  a TUI can never be entered unattended. **Operator follow-up (same day):
+  `agentbridge tui` (alias `dashboard`) is now an explicit subcommand, the
+  header carries an ASCII bridge-between-two-agents brand mark, `u` previews
+  `unsync` (dry-run counts in the status line) and `y` confirms it — the
+  status panel was also clipped to zero inner rows (Length(2) + borders) and
+  now renders. Live pitfalls recorded for next time: ratatui renders nothing
+  in a 0×0 pty — set the window size (`TIOCSWINSZ`) in any automated pty
+  harness or frames come back empty; `expect`'s log_file misses ratatui
+  frames (writes bypass its pty capture) while Python's `pty` module catches
+  them. Verified live in the sandbox
+  through a real pty: table rendered against real fixture sessions, `s`
+  produced a real manifest + links on disk, `q` restored the terminal.
+- **Same session, same day — Codex fallback-title mangling fixed.** An
+  untitled session synced in from another tool showed a long, mid-word-cut
+  prompt fragment as its picker name in `codex /resume`: the untitled
+  fallback used the 120-char preview clip, which chops words mid-way and
+  looks like a data dump. `codex_write::ensure_thread_rows` now falls back to
+  `short_title` (word-boundary-safe, ≤60 chars + ellipsis, whitespace
+  collapsed) instead; the `preview` column keeps the long clip, the `title`
+  column now reads as a name. Regression-tested
+  (`test_untitled_session_gets_a_short_word_safe_title`).
+
+## 2g. Antigravity was reporting success while syncing almost nothing — fixed 2026-08-19
+
+**Symptom the operator asked about:** "verify the agy sessions are synced, test
+the write back, fix so all sessions are accessible in agy and can be written as
+well, and vice versa."
+
+**What verification actually found.** `ls --provider antigravity` listed 12
+sessions and every one loaded with exactly 1–4 messages. `agentbridge status`
+showed **zero** antigravity rows, meaning nothing had ever been written into it
+and nothing could be pulled back out. The ignored real-data test passed the
+whole time: it asserted only `!session.messages.is_empty()`, which one message
+satisfies. Measured against the real store: **12 of 24 readable sessions,
+15 of 733 messages.**
+
+Four read bugs, all verified on the operator's own databases:
+
+| # | Bug | Consequence |
+| --- | --- | --- |
+| 1 | Only `~/.gemini/antigravity-cli` scanned | 12 IDE conversations (1,798 steps) invisible |
+| 2 | Only the *error* field `.24.3.1` decoded | every model answer discarded |
+| 3 | `preview` read as the title | a rename inside agy is invisible → title write-back dead |
+| 4 | `last_modified_time` parsed as strict RFC 3339 | every summary timestamp dropped |
+
+Bug 2 is the important one. Real model text is **`payload.20.1`** on step type
+15, confirmed on all 12 CLI conversations. The old header comment claimed this
+was "not yet mapped" because every recorded step 17 was a quota failure — but
+step 17 is the *failure* variant; step 15 is the normal one and was being
+skipped entirely. `payload.20.3` is the model's private reasoning and `.20.8`
+repeats `.20.1`; only `.20.1` is surfaced, or chain-of-thought would leak into
+every brief and diff.
+
+**There are four stores, not one.** `antigravity-cli` (12 `.db`),
+`antigravity-ide` (12 `.db` + 103 `.pb`), `antigravity` (101 `.pb`),
+`antigravity-backup` (100 `.pb`). Same schema, non-overlapping ids, so all are
+scanned and deduped by id. The `.pb` files are **encrypted** — measured byte
+entropy 8.000/8.000, no valid leading wire type. The earlier note calling them
+"not protobuf (wire type 7)" understated it. There is no key, so they are
+skipped **silently**; reporting them would emit 200+ errors per scan.
+
+**Where the project path comes from.** The summaries index only exists for
+`antigravity-cli`, and 11 of its 12 bodies have no row in it. So
+`trajectory_metadata_blob` (`.1.1` workspace URI, `.2` created) is the primary
+source, not the fallback — that is what makes IDE sessions usable (12 of 12
+carry a workspace URI). The 11 CLI conversations with no workspace really are
+headless (`project_id = default-cli-project`), so `(unknown)` is correct there.
+
+**The write connector** (`src/antigravity_write.rs`) reverses the 2026-08-01
+"read-only first" decision. Both blockers named then are gone: model text is
+mapped, and exercising the real binary proved unnecessary — the store is plain
+SQLite, so a written conversation is verified by reading it back through our own
+connector *and* agy's index, with no model call and no quota.
+
+Antigravity is unlike the other three writers in two ways:
+
+1. **Visibility needs two writes**, a conversation body *and* a
+   `conversation_summaries` row. Claude Code needs only a file; OpenCode only a
+   row.
+2. **Payloads are protobuf**, so this is the one place agentbridge *authors*
+   protobuf. The encoder writes exactly the five fields the decoder reads
+   (`.1`, `.4`, `.5.1`, `.19.2`, `.20.1`/`.20.8`), so the round trip is exact
+   for everything agentbridge models and agy tolerates the rest being absent.
+
+Guards mirror `opencode_write`/`codex_write` exactly: backup before the first
+*inserting* write of a run, marker column `agent_name = "agentbridge"` (verified
+unused by agy — 0 of 102 rows), refuse while `agy`/`antigravity`/`Antigravity`
+runs, `--dry-run`. Bodies go to a temp file and are renamed, so a crash cannot
+hand agy a half-built database to open. `unsync` removes body **and** index row
+together — an orphaned body would still be found by a filesystem scan.
+
+**Merge-back into a native agy body is refused**, a stronger rule than
+OpenCode's exclusion. A real body carries fields we do not decode (tool calls,
+reasoning, `gen_metadata`); rewriting one with the minimal encoder would destroy
+them. Enforced at the call site in `sync_into` and backstopped in
+`merge_back_native`.
+
+### Two pre-existing bugs found while wiring this
+
+- **`main.rs` had a live `unreachable!()`** in the `resume` write dispatch. Any
+  target outside the three hardcoded arms panicked on a user's machine. Now a
+  reported error.
+- **`codex_cli::config_home` cached `CODEX_HOME` in a `LazyLock`.** The value
+  became whatever the first reader in the process saw; a later change was
+  ignored for the rest of the run. Sibling connectors already re-read per call.
+  This surfaced as a *flaky* `test_live_root_honors_config_dir_overrides` only
+  after new sandboxed tests changed test ordering — the suite had been hiding it
+  by accident of ordering, exactly the failure mode §5 warns about. Confirmed
+  pre-existing by stashing this branch and re-running.
+
+`Sandbox` now also sets `ANTIGRAVITY_HOME`. Without it a sandboxed test writes
+into the operator's real `~/.gemini` store — the same isolation gap already
+documented for `CODEX_HOME`.
+
+### Live verification (copy of the real store, all five env vars redirected)
+
+1. `sync` wrote 26 conversations (12 → 38 bodies), took an automatic backup,
+   left all 102 of agy's own rows intact.
+2. `status` showed antigravity rows with matching counts; appending one step
+   showed `+1` drift.
+3. `pull` recovered **both** the appended turn and a rename made in agy's index.
+4. A following `sync` propagated both into the Claude Code copy — the full
+   round trip, agy → overlay → other tools.
+5. Three more `sync` passes left the count at 26 — no feedback loop.
+6. `unsync` restored exactly 12 bodies / 102 rows, all 12 original bodies
+   byte-identical (`cmp`), recovered work preserved in the overlay.
+7. The operator's real store was confirmed untouched: 0 marked rows, no backup
+   files, 12 bodies, 102 summary rows.
+
+Test count went 97 → 128 (10 connector, 13 write, 6 sync, plus the strengthened
+real-data test which now asserts model responses decode, not just "not empty").
+
+## 2h. One session, four picker rows, nothing tying them together — 2026-08-19
+
+Operator asked for "agent name + session name + date and time + session id" in
+each tool, with the **exact** session date rather than the sync date, so one
+conversation can be tracked across agents. Then corrected the first draft: a
+session that already has a name keeps it — only unnamed sessions get one.
+
+Implemented in `src/label.rs`, applied in `sync_into` immediately after
+`fold_overlay` and before every write, so all four copies carry one string:
+
+```
+claude-code · My Important Session · 2026-08-19 10:00 · aaaaaaaa
+provider    · name                 · started_at       · id[..8]
+```
+
+**The three things that make this dangerous, and how each is handled.** The
+title is not a cosmetic field here — `pull_back` compares the title it wrote
+against the title it reads back to detect renames, so anything unstable in the
+label reports every session as renamed on every pull (the 705-false-rename
+regression, §2e):
+
+- **Timestamp is `started_at`, never `now`,** and always UTC. Sync time would
+  change every run; local time would change with the machine's timezone.
+- **Labeling is idempotent.** A rename made inside a tool arrives *as a labeled
+  title*; `apply` strips the old label first and rebuilds around the user's new
+  name rather than nesting.
+- **An existing name is verbatim.** Only a name agentbridge derives for an
+  unnamed session is clipped (word-safe, deterministic, marked with `…`). The
+  metadata fields are never truncated — a cut id or date defeats the point.
+
+`provider` and `id` are the **origin's**, which is what makes one session yield
+one identical label in every tool: `sync_into` re-homes `project_id` per target
+but leaves those two alone. A test asserts the label set for one session has
+size 1.
+
+`parse` demands all four fields be well formed, so a user's own title is never
+mistaken for a label and rewritten. Covered: titles containing the separator,
+unknown provider, malformed stamp, short id.
+
+**Session ids are not always UUIDs.** Claude Code derives one from the filename
+stem, so `renamed-in-claude-code` is a real id, and a UUID's first 8 characters
+can themselves contain `-`. The first id check was alphanumeric-only, rejected
+those labels, and `pull_back` immediately read agentbridge's own label as a
+foreign rename. An existing sync test caught it.
+
+### A duplication bug in the antigravity write path
+
+Found while verifying labels: the antigravity branch **appended** manifest rows
+instead of updating them, so re-syncing grew the manifest 52 → 78 → 104 across
+three runs. `pull` then read one session as several tools' worth of new work and
+reported a conflict against itself:
+
+```
+1 session(s) had new work from more than one tool:
+  aaaaaaaa-…  antigravity+antigravity+antigravity -> merged
+```
+
+The file targets already solved this in their `unchanged` branch (update the
+row in place, count it unchanged); the antigravity branch now does the same.
+Regression test asserts one row per (session, dest) and a stable count across
+re-syncs. Worth noting the *symptom* pointed at the conflict resolver and the
+*cause* was in manifest bookkeeping two layers away.
+
+### Verified on a copy of the real store
+
+A named claude session kept `My Important Session` exactly; unnamed agy
+conversations got word-safe derived names; every label carried the conversation's
+real date (2026-08-18/19), never the sync date; the identical label appeared in
+both agy's index and the Claude Code copy; a rename made inside agy was
+recovered **bare** into the overlay (not labeled) and republished with the label
+rebuilt around it; three sync+pull cycles produced a stable 52-row manifest and
+zero renames. Tests 128 -> 143.
+
 ## 3. Architecture in one page
 
 Full detail in `DESIGN.md`; the three rules that matter:
@@ -221,7 +665,12 @@ src/
   index.rs      discovery — metadata only, bodies stay in source files
   sync.rs       cache, hardlink fan-out, manifest, pull_back, status, unsync
   convert.rs    native-format writers (Claude Code, Codex) + brief builder
+  label.rs      the cross-tool session label written into every target's
+                title: provider · name · started_at · id[..8]
   opencode_write.rs  SQLite write path for OpenCode (backup, tags, PID guard)
+  codex_write.rs     `threads` index rows so Codex's picker lists them
+  antigravity_write.rs  SQLite body + summaries row for agy; the only place
+                 agentbridge *authors* protobuf (same gates as the above)
   auto.rs       fingerprint + watch loop (WAL-aware), shell-hook install
   connectors/   per-tool readers; mod.rs is the single registration point
     claude_code.rs  codex_cli.rs  opencode.rs  antigravity.rs
@@ -263,6 +712,23 @@ Every format change must be checked by running the actual tool — and since
   not a length — using `i += n` instead of `i = n` silently desynced the
   antigravity step walker (caught by the synthetic fixture asserting exact
   field values, then verified against real DBs).
+- **"Not empty" is not an assertion.** The antigravity real-data test asserted
+  `!messages.is_empty()` and passed for weeks while 718 of 733 messages were
+  being silently dropped (§2g). A test that cannot distinguish 1 message from
+  40 is not testing the decoder. Assert a *property of the content* — that
+  model responses decode at all, that a count is plausible.
+- **One store is an assumption, not a fact.** Antigravity keeps four separate
+  stores under `~/.gemini/`; the connector hardcoded one and silently missed
+  half the readable sessions (§2g). Before believing a tool has a single
+  session directory, list its config root and check the siblings.
+- **Env-var caching turns config into first-reader-wins.** `codex_cli` held
+  `CODEX_HOME` in a `LazyLock`, so whichever code path read it first fixed the
+  value for the whole process. It hid as a *passing* test until unrelated new
+  tests changed ordering. Resolve env overrides per call; a `getenv` is cheap.
+- **High entropy means encrypted, not "unknown format".** 200+ antigravity
+  `.pb` bodies were logged as an unmapped protobuf variant. Measuring byte
+  entropy (8.000/8.000) settled it in one command — no schema work would ever
+  have read them. Measure before mapping.
 
 **Never `rm -rf ~/.agentbridge` — always `agentbridge unsync`.** Deleting the
 manifest orphans generated files, and without it agentbridge cannot tell its
@@ -280,6 +746,39 @@ cp <a real codex rollout>.jsonl $SB/.codex/sessions/2026/07/29/
 cargo build     # build FIRST — HOME override breaks rustup
 HOME=$SB AGENTBRIDGE_DATA_DIR=$SB/.agentbridge ./target/debug/agentbridge sync --project $SB/work
 ```
+
+**`HOME` alone is not enough — override every store env var.** The connectors
+honor `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and `ANTIGRAVITY_HOME`, so if the
+operator's shell exports any of them, a "sandboxed" run writes into their real
+store. The full set:
+
+```bash
+env HOME=$SB AGENTBRIDGE_DATA_DIR=$SB/.agentbridge \
+    CLAUDE_CONFIG_DIR=$SB/.claude CODEX_HOME=$SB/.codex \
+    ANTIGRAVITY_HOME=$SB/agy-store \
+    ./target/debug/agentbridge sync --project $SB/work
+```
+
+`Sandbox::new()` in `sync.rs`'s tests sets all of these for the same reason.
+Note `ANTIGRAVITY_HOME` redirects the *write* target but the read scan still
+covers the real homes by design — for a fully isolated write test, redirect
+`HOME` too (that is how §2g was verified).
+
+**⛔ Never invoke the real `codex` binary directly for testing, even with
+`CODEX_HOME` set — it is not a full sandbox for that tool.** Confirmed
+2026-08-14 (§2d): a `CODEX_HOME=<sandbox> codex exec …` run still touched the
+operator's real `~/.codex/state_5.sqlite` (mtime moved within seconds of the
+run; row count and content were unaffected, but that was luck, not a
+guarantee). `claude` and `opencode` *did* fully respect their equivalent
+overrides (`CLAUDE_CONFIG_DIR`, `XDG_DATA_HOME`) throughout the same session
+— this is specifically a `codex` gap, not a pattern to expect elsewhere.
+agentbridge itself never shells out to any of these binaries (`resume_cmd()`
+only *prints* a suggested command for the operator to run themselves — see
+`src/convert.rs`), so this risk is entirely about how a *session testing this
+codebase* behaves, not a bug reachable through any agentbridge code path.
+To verify `codex_write.rs` against real data, copy `~/.codex/state_5.sqlite`
+into the sandbox and let **agentbridge** write into the copy — never drive
+the real `codex` binary against it.
 
 **Zero-cost signals for checking a tool accepted a session** (no model call,
 no cost):
@@ -317,29 +816,30 @@ reads it fine).
 
 ## 6. Next steps, in order
 
-**⚠️ START HERE — re-verify the §2b title/mtime fix against the real
-binaries.** It only has unit-test coverage (87 passing tests) — per §4,
-that has meant nothing here three times before. Concretely:
+**§2b/§2c/§2d done — re-verified live 2026-08-14** (sandbox, real `claude`/
+`opencode`/`codex` binaries, plus a copy of the operator's real
+`state_5.sqlite` schema for the Codex title upsert): title write-back, mtime,
+invariant 2, `ClaudeCodeConverter::convert_multi`, and the Codex
+`threads.title` fix all confirmed. **Still open, next in line:**
 
-```bash
-cargo install --path . && agentbridge --version   # must print the new build
-```
-
-1. Rename a real session in OpenCode (`opencode`, in-app rename or
-   equivalent), `agentbridge sync`, then `agentbridge pull` and confirm
-   `PullReport.renamed` fires and `agentbridge sync` again pushes the new
-   title into the Claude Code copy — `claude --resume <id>` should show it,
-   and the file's `custom-title`/`agent-name` records should carry it.
-2. Do the same starting from a Claude Code in-session rename (`/rename` or
-   whatever the real UI action is) propagating out to the Codex/OpenCode
-   copies — check the `threads.title` / `session.title` columns directly.
-3. Confirm the mtime fix: after `sync`, a months-old session's materialized
-   Claude Code file should **not** sort to the top of `claude --resume`'s
-   picker — `stat` the file and diff against the session's real last-activity
-   timestamp.
-4. Confirm invariant 2 still holds: renaming in a *non-native* copy must never
-   touch the session's real origin file unless that session opted into
-   `resume --merge`.
+1. **A real `codex resume` picker pass**, once convenient — §2d verified the
+   `threads.title` column directly via SQL against a copy of the schema (safe,
+   given the `CODEX_HOME` isolation gap §2d documents); nobody has yet
+   confirmed the real picker UI actually renders that column as the
+   displayed title rather than `preview`/`first_user_message`. Needs a real
+   authenticated `codex` session (state_5.sqlite only fully initializes on
+   one) — do this on the operator's own machine, not a fresh sandbox.
+2. **`agentbridge list`'s title lag.** Documented in §2b as a narrower,
+   known gap: `scan()` stops at the first `cwd`-bearing record, so a
+   mid-conversation rename won't show in `list` until `load()` runs (sync/pull
+   are unaffected). Worth deciding whether that's acceptable long-term or
+   `list` needs its own fix.
+3. Now that `ClaudeCodeConverter` has a real `convert_multi`, check whether
+   Claude Code needs the same per-directory "already natively visible, don't
+   duplicate" guard Codex has (the `is_codex`-specific block in
+   `sync_into`) — not proven necessary yet (Claude Code sessions don't
+   multi-file the way Codex rollouts can), but worth a second look now that
+   more directories actually get copies.
 
 0. **Re-verify the 2026-08-03 OpenCode fix live.** The
    per-project id + manifest key changes pass 78 unit tests and nothing else;
@@ -377,13 +877,15 @@ cargo install --path . && agentbridge --version   # must print the new build
 
 2. **Durable marker in generated files** so orphans can never be mistaken for
    real sessions (the §4 footgun).
-3. **Antigravity write path + model-text mapping** — post-quota: map
-   successful type-17 response text (error text is `.24.3.1`; success location
-   unknown), then materialize foreign sessions into
-   `~/.gemini/antigravity-cli/conversations/`. Re-read `CONNECTORS.md` §7
-   before starting; the embedded Cortex protos in
-   `/opt/Antigravity/resources/bin/language_server` may map payloads faster
-   than black-box probing.
+3. ~~**Antigravity write path + model-text mapping**~~ — **done 2026-08-19**
+   (§2g). Model text is `payload.20.1` on step type 15; the write connector is
+   `src/antigravity_write.rs`. Remaining antigravity work, if wanted:
+   decrypting the `.pb` bodies (201 conversations in the desktop/backup stores
+   are unreadable without a key — the embedded Cortex protos in
+   `Antigravity/resources/bin/language_server` may help, but the blocker is the
+   *cipher*, not the schema), and mapping tool-call steps (type 21, 258
+   occurrences) into `Message::tool_name`/`tool_input`, which currently decode
+   as no turn at all.
 4. **Redaction** (`src/redact.rs`, doesn't exist) — `SPEC.md` §3 requires it
    before anything is written or sent. Fail closed.
 5. **Kilo Code / other connectors** — as requested, on their own
@@ -395,7 +897,7 @@ cargo install --path . && agentbridge --version   # must print the new build
 ## 7. Repo hygiene
 
 - Public: `https://github.com/45Harry/agentbridge`, branch `master`.
-- Keep tests green (87 + 2 ignored); add a regression test for every bug, and
+- Keep tests green (143 + 2 ignored); add a regression test for every bug, and
   verify format changes against the real binary before believing them.
 - Never commit session data. `~/.agentbridge` is never the source of fixtures.
 - Ignored tests are the real-data checks: run them explicitly after any

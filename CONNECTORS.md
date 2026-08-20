@@ -190,17 +190,18 @@ any other directory via the picker's `All` filter.
 ## 4. Antigravity CLI (`agy`)
 
 **Last verified:** against `agy 1.1.8`, on 2026-07-30, macOS. **Storage
-location now confirmed on Linux 2026-08-01 — see §7 for the full on-disk
-format; the connector built from it is read-only and verified against real
-databases.**
+confirmed on macOS 2026-08-19 — see §7 for the full on-disk format, the four
+separate stores, and the read+write connectors built from it.**
 
 - `agy` is a separate Go binary (`~/.local/bin/agy`, ships its own bubbletea
   TUI) from the Antigravity IDE app (`~/.antigravity`,
   `~/Library/Application Support/Antigravity` — a full VS Code–style Electron
-  app with its own `workspaceStorage`/`state.vscdb` layout). They are
-  related but **not confirmed to share a session store** — do not assume the
-  IDE's `workspaceStorage` is where `agy` CLI conversations live without
-  verifying first.
+  app with its own `workspaceStorage`/`state.vscdb` layout).
+  **Resolved 2026-08-19:** they do *not* share one store, but they use the
+  same on-disk format in sibling directories — `~/.gemini/antigravity-cli/`
+  and `~/.gemini/antigravity-ide/`, with identical `steps` schemas and
+  non-overlapping conversation ids. Both are scanned (§7.1). The IDE's
+  `workspaceStorage` is **not** where conversations live.
 - Flag surface is nearly a 1:1 match with Claude Code's:
   `--dangerously-skip-permissions`, `--effort <low|medium|high>`,
   `--mode <accept-edits|plan>`, `--output-format <text|json|stream-json>`,
@@ -213,13 +214,13 @@ databases.**
   (`no_conversations_to_migrate`, `persist_destination_project`,
   `root_assigned_to_standalone`) — implies standalone CLI conversations can
   be adopted into an IDE-tracked project, which is a different mental model
-  than the other three providers' flat local session stores. **M2 needs a
-  dedicated research spike** (per `DECISIONS.md`) before writing a parser:
-  either inspect a real conversation's storage location directly (`fs_usage`/
-  `dtruss`-style tracing while a real `agy -p` run is active, or ask Google's
-  published docs at the URL above) rather than guessing further.
-- **Resume flag:** `--conversation <id>`. Observed behavior, not yet fully
-  characterized:
+  than the other three providers' flat local session stores. **Resolved
+  2026-08-19:** the on-disk format is fully mapped (§7); no further research
+  spike is needed. `project_id` is `default-cli-project` for headless runs and
+  `outside-of-project` for conversations with no workspace.
+- **Resume flag:** `--conversation <id>` (this is what `resume_cmd` emits —
+  *not* `--resume`, which the other three tools use). Observed behavior, not
+  yet fully characterized:
   - No prompt supplied → does not appear to validate the ID before attempting
     to open its interactive TUI (failed only on `bubbletea: could not open
     TTY` in this headless environment, regardless of whether the ID was a
@@ -348,55 +349,141 @@ undocumented, drifting vendor formats exactly). It strengthens the case for
 prioritizing M4 (distilled brief injection, format-agnostic) over polishing
 the M5 copy-shim.
 
-## 7. Antigravity CLI session store (confirmed Linux, 2026-08-01)
+## 7. Antigravity session store (`agy`) — read **and** write
 
-**Last verified:** against the operator's real databases on 2026-07-30/08-01,
-Linux. Read connector implemented in `src/connectors/antigravity.rs`
-(read-only; databases open with `SQLITE_OPEN_READ_ONLY` so a live Antigravity
-process is never blocked).
+**Last verified:** against the operator's real databases on 2026-08-19, macOS
+(24 readable conversations, 733 messages). Read connector in
+`src/connectors/antigravity.rs`; write connector in
+`src/antigravity_write.rs`. Reads open `SQLITE_OPEN_READ_ONLY` so a live
+Antigravity process is never blocked.
 
-- **Storage root:** `~/.gemini/antigravity-cli/` (Linux). macOS path for the
-  CLI is unconfirmed — the `agy` binary and the Antigravity IDE app are
-  separate installs (see §4); do not assume the IDE's `workspaceStorage`
-  holds CLI conversations.
-- **One SQLite database per conversation:** `conversations/<uuid>.db`.
-  Tables observed: `trajectory_meta` (id, cascade_id, type=4, source=17,
-  created/updated timestamps), `steps` (idx, type, status, payload),
-  `gen_metadata`, `executor_metadata`, `parent_references`,
-  `trajectory_metadata_blob` (single `main` row, protobuf),
-  `battle_mode_infos`.
-- **Metadata index:** `conversation_summaries.db` — columns
-  `conversation_id`, `title`, `preview`, `step_count`, `last_modified_time`,
-  `workspace_uris`, `status`, `source`, `agent_name`, `parent_conversation_id`,
-  `nesting_depth`, `battle_id`, `winning_conversation_id`, `not_fully_idle`,
-  `killed`, `last_user_input_time`, `last_user_input_step_index`,
-  `app_data_dir`. Contains IDE sessions; the two standalone CLI conversations
-  observed had **no row here** (project scoping `""`, title `NULL`).
-- **Step records:** `steps` rows ordered by `idx`. `status` 3 = DONE.
-  `type` 14 = user input with text, 15 = follow-up user input with **no**
-  text, 17 = model turn, 98 = context/state row (skipped by the connector).
-- **Payloads are Google cortex protobuf blobs**, decoded with a minimal
-  hand-rolled reader in `antigravity.rs` (no dependencies; raw-slice descent,
-  no string-vs-message guessing). Known offsets, verified against real DBs:
+### 7.1 There are four stores, not one
+
+Antigravity ships several surfaces and each keeps its own store under
+`~/.gemini/`. All are scanned; `ANTIGRAVITY_HOME` overrides the write target.
+
+| Home | Bodies (real machine) | Format | Summaries index | Readable |
+| --- | --- | --- | --- | --- |
+| `antigravity-cli/` | 12 `.db` | SQLite | yes (102 rows) | **yes** |
+| `antigravity-ide/` | 12 `.db` + 103 `.pb` | SQLite / encrypted | **no** | **the `.db` only** |
+| `antigravity/` | 101 `.pb` | encrypted | no | no |
+| `antigravity-backup/` | 100 `.pb` | encrypted | no | no |
+
+- **Regression this fixed:** the connector hardcoded `antigravity-cli` only, so
+  12 of 24 readable sessions (and all 1,798 IDE steps) were invisible. Ids do
+  not overlap between homes; the scan dedupes by id, first home wins.
+- **`.pb` bodies are encrypted, not protobuf.** Measured byte entropy is
+  8.000/8.000 and the leading bytes are not a valid wire type. No key is
+  available, so they are skipped **silently** — reporting them as corrupt would
+  produce 200+ errors on every scan. (The earlier note claiming "wire type 7"
+  understated this: it is encryption, not an unknown field.)
+- The `.db` files in every home share one schema, so a single decoder serves
+  all of them.
+
+### 7.2 Body schema (`conversations/<uuid>.db`)
+
+`trajectory_meta`, `steps`, `gen_metadata`, `executor_metadata`,
+`parent_references`, `trajectory_metadata_blob` (single `main` row, protobuf),
+`battle_mode_infos`.
+
+`steps` rows ordered by `idx`; `status` 3 = DONE. Step-type vocabulary observed
+across CLI and IDE stores (IDE histogram: 15→609, 21→258, 90→303, 14→83):
+
+| Type | Meaning | Text location |
+| --- | --- | --- |
+| 14 | user input | `payload.19.2` (fallback `.19.3`) |
+| 15 | **model turn — the common case** | `payload.20.1` |
+| 17 | model turn that failed | `payload.24.3.1` |
+| 23 | model summary | `payload.30.4` |
+| 5, 7, 8, 9, 21, 90, 98, 99, 101, 132, 138 | context, tool calls, telemetry | none (skipped) |
+
+- **Regression this fixed:** only `payload.24.3.1` (the *error* field) was
+  decoded, so every session loaded as a single user message with the model's
+  answer discarded. The old note said successful model text was "not yet
+  mapped" — it is `payload.20.1`, confirmed on all 12 CLI conversations.
+- `payload.20.3` is the model's **private reasoning** and `.20.8` repeats
+  `.20.1`. Only `.20.1` is surfaced: presenting `.20.3` as the response would
+  leak chain-of-thought into every brief and diff.
+
+### 7.3 Metadata, and where the project comes from
+
+`conversation_summaries.db` columns: `conversation_id`, `title`, `preview`,
+`step_count`, `last_modified_time`, `workspace_uris`, `status`, `source`,
+`project_id`, `agent_name`, `parent_conversation_id`, `nesting_depth`,
+`battle_id`, `winning_conversation_id`, `not_fully_idle`, `killed`,
+`last_user_input_time`, `last_user_input_step_index`, `app_data_dir`.
+
+- **`title` beats `preview`.** The connector read `preview` (the opening words
+  of the first message). `title` is the user's explicit rename — reading
+  `preview` made a rename invisible, which silently breaks title write-back.
+  On the real store 0 of 102 rows have a `title`, so `preview` remains the
+  fallback.
+- **Timestamps are not RFC 3339.** The real format is
+  `2026-07-29 08:54:35.312249+00:00` — a space where RFC 3339 wants `T`, which
+  `parse_from_rfc3339` rejects outright, dropping every summary timestamp.
+  Both spellings are now accepted.
+- **The index is optional.** Only `antigravity-cli` has one, and 11 of its 12
+  bodies have **no row** in it. The per-conversation
+  `trajectory_metadata_blob` is therefore the primary metadata source:
 
   | Path | Contents |
   | --- | --- |
-  | `payload.1` | varint step type (mirrors the `steps.type` column) |
-  | `payload.4` | varint status (3 = DONE) |
-  | `payload.5` | StepMetadata: `.5.1.1` / `.5.1.2` = created seconds + nanos (RFC 3339 output) |
-  | `payload.19.2` | user text (step type 14) |
-  | `payload.19.3.1` | fallback user text (input without `2` subfield) |
-  | `payload.24.3.1` | model error message (step type 17) |
-  | `payload.18` (trajectory_metadata_blob `main`) | project id string (`default-cli-project`) |
+  | `.1.1` / `.1.2` | workspace URI (`file:///...`) → the project path |
+  | `.1.3.2` | git remote |
+  | `.1.4` | git branch |
+  | `.2.1` / `.2.2` | created seconds + nanos |
+  | `.18` | project id (`default-cli-project` for headless runs) |
 
-- **Not yet mapped:** successful model-response text for type 17. Every real
-  step 17 on record was a quota failure, so the text field's location is
-  unknown — decode a successful response once the CLI's model quota resets.
-  The embedded Cortex protos inside
-  `/opt/Antigravity/resources/bin/language_server` may map the remaining
-  payload faster than black-box probing.
-- **Write connector:** pending (read-only by design). Foreign sessions are
-  surfaced *into* other tools; nothing materializes into
-  `conversations/<uuid>.db` yet. The real `.pb` files under the IDE's
-  `~/.gemini/antigravity/conversations/` were checked and are **not**
-  protobuf (wire type 7) — SQLite is the only viable surface.
+  This is what makes IDE sessions usable: 12 of 12 carry a workspace URI here.
+  The 11 CLI conversations with no workspace are genuinely headless
+  (`default-cli-project`), so `(unknown)` is the correct answer for them.
+
+### 7.4 Write connector
+
+agentbridge is the only writer here that must **author** protobuf rather than
+JSON. A conversation is visible in agy's picker only when **both** a body and a
+summaries row exist — unlike Claude Code (file alone) or OpenCode (row alone).
+
+- **Encoder** (`antigravity_write::encode_step`) writes exactly the fields the
+  decoder reads: `.1` step type, `.4` status, `.5.1` created, `.19.2` user
+  text, `.20.1`/`.20.8` model text. Round-tripping is exact for those fields;
+  agy tolerates the absence of the rest.
+- **Id derivation:** UUID v5 of
+  `agentbridge:antigravity:<provider>:<id>:<project>`. A bare UUID is required
+  (it is both the summaries primary key and the body filename), so unlike
+  OpenCode's `ses_ab…` there is no prefix. Keyed per project because agy's
+  picker scopes by workspace — one conversation per project is the minimum for
+  visibility and the maximum before the picker lists it twice.
+- **Marker column:** `agent_name = "agentbridge"`. Verified unused by agy
+  (0 of 102 rows), so `unsync` can target exactly agentbridge's rows. Removal
+  deletes the body **and** its index row — an orphaned body would still be
+  found by a filesystem scan.
+- **Gates** (identical to `codex_write`/`opencode_write`): back up
+  `conversation_summaries.db` before the first inserting write of a run;
+  refuse while `agy`/`antigravity`/`Antigravity` is running; `--dry-run`
+  renders without executing. Bodies are written to a temp file and renamed, so
+  a crash cannot leave agy a half-built database to open.
+- **Untitled sessions** get a word-safe derived title capped at 60 chars,
+  matching `codex_write`'s cap. `RowWritten::title` reports what was *actually*
+  persisted; recording `session.title` instead would make every untitled
+  session look renamed on the next pull — the 705-false-rename regression.
+- **Merge-back is deliberately refused for antigravity natives.** A real agy
+  body carries protobuf fields agentbridge does not decode (tool calls,
+  reasoning, `gen_metadata` blobs); rewriting one with the minimal encoder
+  would destroy everything outside the handful of fields we understand.
+  Recovered turns stay in the overlay instead.
+
+### 7.5 End-to-end verification (2026-08-19, copy of the real store)
+
+Run against an isolated copy (`HOME`, `ANTIGRAVITY_HOME`,
+`AGENTBRIDGE_DATA_DIR`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME` all redirected):
+
+1. `sync` wrote 26 conversations (12 → 38 bodies), took an automatic backup,
+   and left all 102 of agy's own rows intact.
+2. `status` reported AGY rows with matching counts; appending a step showed
+   `+1` drift.
+3. `pull` recovered both the appended turn and a rename made in agy's index.
+4. `sync` propagated both to the Claude Code copy.
+5. Three further `sync` passes left the count at 26 — no feedback loop.
+6. `unsync` returned the store to exactly 12 bodies / 102 rows; all 12 original
+   bodies byte-identical (`cmp`), recovered work preserved in the overlay.

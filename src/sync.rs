@@ -56,7 +56,61 @@ pub struct PullReport {
     /// copy. Independent of `pulled` — a rename with no new turns still ends
     /// up here.
     pub renamed: Vec<(String, String)>,
+    /// (session id, providers with new work, choice made) for every session
+    /// where more than one tool contributed new turns/renames since the last
+    /// pull. A session with new work from exactly one tool is folded in
+    /// directly and never appears here — it was never a conflict.
+    pub conflicts: Vec<(String, Vec<String>, ConflictChoice)>,
     pub errors: Vec<String>,
+}
+
+/// What to do with a session where more than one tool has new write-back
+/// work since the last pull. `pull_back` cannot pick a winner on its own —
+/// dropping a tool's turns silently would violate the "never lose recovered
+/// work" invariant `unsync` already relies on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConflictChoice {
+    /// Keep every tool's new work — today's only behavior, unchanged.
+    MergeAll,
+    /// Keep only the named provider's new work; the other tool(s)'
+    /// contribution for this pull is discarded (marked seen, never written
+    /// to the overlay).
+    KeepOnly(String),
+    /// Decide nothing this round — leave the manifest untouched so the same
+    /// new work is offered again on the next pull.
+    Skip,
+}
+
+/// One tool's contribution to a conflicting session, handed to a
+/// `ConflictResolver` so it can show the operator what each side actually
+/// contains — not just the tool's name.
+#[derive(Debug, Clone)]
+pub struct ConflictItem {
+    pub provider: String,
+    pub new_messages: Vec<crate::model::Message>,
+    pub new_title: Option<String>,
+}
+
+/// Asked once per conflicting session during `pull_back_with`. The library
+/// stays free of any UI dependency; `main.rs` supplies a ratatui-backed
+/// full-screen resolver for interactive terminals, and callers that must
+/// never block (dry-run, `auto watch`) use `AutoMerge`.
+pub trait ConflictResolver {
+    /// `items` lists every target provider with new work for this session,
+    /// in manifest order, each carrying the actual turns/rename it
+    /// contributed since the last pull.
+    fn resolve(&mut self, session_id: &str, items: &[ConflictItem]) -> ConflictChoice;
+}
+
+/// Default resolver: merge every tool's new work, exactly as `pull_back`
+/// behaved before this feature existed. Used for dry-run, `auto watch`, and
+/// any non-interactive invocation.
+pub struct AutoMerge;
+
+impl ConflictResolver for AutoMerge {
+    fn resolve(&mut self, _session_id: &str, _items: &[ConflictItem]) -> ConflictChoice {
+        ConflictChoice::MergeAll
+    }
 }
 
 fn overlay_dir() -> PathBuf {
@@ -148,6 +202,14 @@ fn load_materialized(target: &str, path: &Path, id: &str) -> Option<crate::model
         "claude-code" => crate::connectors::claude_code::load_file(path, id).ok(),
         "codex-cli" => crate::connectors::codex_cli::load_file(path, id).ok(),
         "opencode" => crate::connectors::opencode::load_from_db(path, id).ok(),
+        // Antigravity's `dest` is the conversation body agentbridge wrote; the
+        // title lives in the separate summaries index, so it is layered on
+        // here or a rename made inside agy would never be seen.
+        "antigravity" => {
+            let mut s = crate::antigravity_write::load_written(path, id).ok()?;
+            s.title = crate::antigravity_write::written_title(path, id);
+            Some(s)
+        }
         _ => None,
     }
 }
@@ -173,17 +235,26 @@ impl StatusRow {
     }
 }
 
+/// The id a materialized copy is addressed by in its target tool.
+///
+/// Most targets keep the source's own id, but the tools agentbridge writes
+/// rows/databases into (OpenCode, Antigravity) require a native-shaped id, so
+/// the derived one is stashed in `LinkRecord::cache` at write time and has to
+/// be used to read the copy back.
+fn materialized_id(r: &LinkRecord) -> String {
+    match r.target_provider.as_str() {
+        "opencode" | "antigravity" => r.cache.to_string_lossy().to_string(),
+        _ => r.session_id.clone(),
+    }
+}
+
 pub fn status() -> Vec<StatusRow> {
     read_manifest()
         .into_iter()
         .map(|r| {
             let exists = r.dest.exists();
             let actual = if exists {
-                let id = if r.target_provider == "opencode" {
-                    r.cache.to_string_lossy().to_string()
-                } else {
-                    r.session_id.clone()
-                };
+                let id = materialized_id(&r);
                 load_materialized(&r.target_provider, &r.dest, &id)
                     .map(|s| s.messages.len())
             } else {
@@ -202,72 +273,149 @@ pub fn status() -> Vec<StatusRow> {
 }
 
 /// Write-back: recover turns a tool appended to a materialized session so
-/// every other tool can see them (DESIGN.md §6).
+/// every other tool can see them (DESIGN.md §6). Uses `AutoMerge`: every
+/// tool's new work is kept, matching every version of this function before
+/// conflict resolution existed. Use `pull_back_with` to ask the operator
+/// instead when two or more tools both have new work for the same session.
 ///
 /// Reads only files agentbridge itself created; source sessions are untouched.
 pub fn pull_back(dry_run: bool) -> PullReport {
+    pull_back_with(dry_run, &mut AutoMerge)
+}
+
+/// New work recovered from one materialized copy, not yet applied.
+struct Pending {
+    manifest_idx: usize,
+    new_messages: Vec<crate::model::Message>,
+    new_title: Option<String>,
+}
+
+/// Same as `pull_back`, but lets the caller decide what happens when more
+/// than one tool has new work for the same session since the last pull —
+/// `resolver` is asked once per such session. A session with new work from
+/// exactly one tool is never a conflict and is folded in directly, same as
+/// always.
+pub fn pull_back_with(dry_run: bool, resolver: &mut dyn ConflictResolver) -> PullReport {
     let mut report = PullReport::default();
     let mut manifest = read_manifest();
     let mut changed = false;
 
-    for rec in manifest.iter_mut() {
+    // Pass 1: read every materialized copy once and record what is new since
+    // the last pull. Two or more entries for the same session id here means
+    // two tools independently contributed new work — a conflict this
+    // function cannot resolve by itself.
+    let mut pending_by_session: std::collections::BTreeMap<String, Vec<Pending>> =
+        std::collections::BTreeMap::new();
+
+    for (idx, rec) in manifest.iter().enumerate() {
         if !rec.dest.exists() {
             continue;
         }
-        // OpenCode rows are addressed by the ses_... id agentbridge created;
-        // for file targets the source session id names the materialized file.
-        let id = if rec.target_provider == "opencode" {
-            rec.cache.to_string_lossy().to_string()
-        } else {
-            rec.session_id.clone()
-        };
-        let Some(session) = load_materialized(&rec.target_provider, &rec.dest, &id)
-        else {
+        // OpenCode rows and Antigravity conversations are addressed by the
+        // native-shaped id agentbridge created; for file targets the source
+        // session id names the materialized file.
+        let id = materialized_id(rec);
+        let Some(session) = load_materialized(&rec.target_provider, &rec.dest, &id) else {
             continue;
         };
 
-        // Title drift, checked independent of message drift below: a rename
-        // with no new turns (or vice versa) must still be recovered.
-        if let Some(new_title) = &session.title
-            && rec.title.as_deref() != Some(new_title.as_str())
-        {
-            if dry_run {
-                report.renamed.push((rec.session_id.clone(), new_title.clone()));
-            } else {
-                match set_overlay_title(&rec.session_id, new_title) {
-                    Ok(()) => {
-                        report.renamed.push((rec.session_id.clone(), new_title.clone()));
-                        rec.title = Some(new_title.clone());
-                        changed = true;
+        let new_title = session
+            .title
+            .as_ref()
+            .filter(|t| rec.title.as_deref() != Some(t.as_str()))
+            .cloned();
+        let new_messages = if session.messages.len() > rec.message_count {
+            session.messages[rec.message_count..].to_vec()
+        } else {
+            Vec::new()
+        };
+
+        if new_title.is_none() && new_messages.is_empty() {
+            continue;
+        }
+
+        pending_by_session.entry(rec.session_id.clone()).or_default().push(Pending {
+            manifest_idx: idx,
+            new_messages,
+            new_title,
+        });
+    }
+
+    // Pass 2: apply. Ask the resolver only when a session actually has more
+    // than one contributing tool; a single contributor is applied exactly as
+    // `pull_back` always has, with no prompt.
+    for (session_id, pendings) in pending_by_session {
+        let providers: Vec<String> =
+            pendings.iter().map(|p| manifest[p.manifest_idx].target_provider.clone()).collect();
+
+        let choice = if pendings.len() > 1 {
+            let items: Vec<ConflictItem> = pendings
+                .iter()
+                .map(|p| ConflictItem {
+                    provider: manifest[p.manifest_idx].target_provider.clone(),
+                    new_messages: p.new_messages.clone(),
+                    new_title: p.new_title.clone(),
+                })
+                .collect();
+            let choice = resolver.resolve(&session_id, &items);
+            report.conflicts.push((session_id.clone(), providers.clone(), choice.clone()));
+            choice
+        } else {
+            ConflictChoice::MergeAll
+        };
+
+        if choice == ConflictChoice::Skip {
+            // Leave every contributing manifest record untouched so the same
+            // new work is offered again on the next pull.
+            continue;
+        }
+
+        for pending in &pendings {
+            let keep = match &choice {
+                ConflictChoice::MergeAll => true,
+                ConflictChoice::KeepOnly(p) => manifest[pending.manifest_idx].target_provider == *p,
+                ConflictChoice::Skip => unreachable!("handled above"),
+            };
+
+            if let Some(new_title) = &pending.new_title {
+                if keep {
+                    if dry_run {
+                        report.renamed.push((session_id.clone(), new_title.clone()));
+                    } else if let Err(e) = set_overlay_title(&session_id, new_title) {
+                        report.errors.push(format!("overlay title {}: {}", session_id, e));
+                    } else {
+                        report.renamed.push((session_id.clone(), new_title.clone()));
                     }
-                    Err(e) => report
-                        .errors
-                        .push(format!("overlay title {}: {}", rec.session_id, e)),
+                }
+                if !dry_run {
+                    manifest[pending.manifest_idx].title = Some(new_title.clone());
+                    changed = true;
                 }
             }
-        }
 
-        // Anything past what we wrote is the tool's own new work.
-        if session.messages.len() <= rec.message_count {
-            continue;
-        }
-        let new = &session.messages[rec.message_count..];
+            if pending.new_messages.is_empty() {
+                continue;
+            }
+            let new_count = manifest[pending.manifest_idx].message_count + pending.new_messages.len();
 
-        if dry_run {
-            report.pulled.push((rec.session_id.clone(), new.len()));
-            continue;
-        }
-
-        match append_overlay(&rec.session_id, new) {
-            Ok(0) => {}
-            Ok(n) => {
-                report.pulled.push((rec.session_id.clone(), n));
-                rec.message_count = session.messages.len();
+            if keep {
+                if dry_run {
+                    report.pulled.push((session_id.clone(), pending.new_messages.len()));
+                } else {
+                    match append_overlay(&session_id, &pending.new_messages) {
+                        Ok(0) => {}
+                        Ok(n) => report.pulled.push((session_id.clone(), n)),
+                        Err(e) => {
+                            report.errors.push(format!("overlay {}: {}", session_id, e));
+                            continue;
+                        }
+                    }
+                }
+            }
+            if !dry_run {
+                manifest[pending.manifest_idx].message_count = new_count;
                 changed = true;
             }
-            Err(e) => report
-                .errors
-                .push(format!("overlay {}: {}", rec.session_id, e)),
         }
     }
 
@@ -364,7 +512,9 @@ fn live_root(target: &str) -> Option<PathBuf> {
         "claude-code" => crate::connectors::claude_code::write_root(),
         "codex-cli" => crate::connectors::codex_cli::config_home(),
         // OpenCode stores rows in SQLite, not files — it cannot be hardlinked
-        // into and is handled separately (DESIGN.md §5).
+        // into and is handled separately (DESIGN.md §5). Antigravity is the
+        // same: one SQLite body per conversation plus an index row, so it is
+        // written by `antigravity_write`, not linked.
         _ => None,
     }
 }
@@ -428,6 +578,14 @@ fn link_or_copy(src: &Path, dest: &Path) -> std::io::Result<u64> {
     Ok(fs::metadata(dest)?.ino())
 }
 
+/// The inode of a file agentbridge wrote directly (rather than hardlinked).
+/// Recorded so `unsync` can refuse to delete a path the tool has since
+/// replaced with a file of its own. `0` when unreadable, which `unsync` treats
+/// as "no match" and therefore leaves alone.
+fn inode_of(path: &Path) -> u64 {
+    fs::metadata(path).map(|m| m.ino()).unwrap_or(0)
+}
+
 pub fn read_manifest() -> Vec<LinkRecord> {
     let path = manifest_path();
     let Ok(content) = fs::read_to_string(&path) else {
@@ -458,6 +616,8 @@ fn append_manifest(records: &[LinkRecord]) -> std::io::Result<()> {
     // session, so the row id (kept in `cache`) is what makes an entry unique.
     // Keyed on dest alone a whole run's OpenCode rows collapse into a single
     // manifest entry and `status`/`pull` lose sight of every session but one.
+    // Antigravity needs no such exception: each conversation is its own file,
+    // so its dest is already unique per row.
     let key = |r: &LinkRecord| -> (PathBuf, Option<PathBuf>) {
         if r.target_provider == "opencode" {
             (r.dest.clone(), Some(r.cache.clone()))
@@ -563,6 +723,10 @@ fn merge_back_native(
             link_or_copy(&artifact, &dest).map_err(|e| format!("merge-back write: {}", e))?;
             Ok(())
         }
+        // Antigravity is deliberately absent: rewriting a native agy body with
+        // the minimal protobuf encoder in `antigravity_write` would drop every
+        // field agentbridge does not decode. The caller excludes it before
+        // reaching here; this arm is the backstop.
         other => Err(format!("merge-back not supported for {}", other)),
     }
 }
@@ -571,17 +735,24 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
     let index: Index = discover(registry);
     let mut report = SyncReport::default();
 
-    // OpenCode has no live_root (rows, not files) but is still a valid target.
+    // OpenCode and Antigravity have no live_root (rows/per-conversation
+    // databases, not linkable files) but are still valid targets.
     let targets: Vec<String> = registry
         .detected()
         .map(|c| c.id().to_string())
-        .filter(|id| live_root(id).is_some() || (id == "opencode" && opencode_db().is_some()))
+        .filter(|id| {
+            live_root(id).is_some()
+                || (id == "opencode" && opencode_db().is_some())
+                || (id == "antigravity" && crate::antigravity_write::store().is_some())
+        })
         .collect();
 
     // Back up OpenCode's database once per run, before any INSERT.
     let mut opencode_backed_up = false;
     // Same for Codex's index (`state_5.sqlite`).
     let mut codex_backed_up = false;
+    // Same for Antigravity's summaries index.
+    let mut antigravity_backed_up = false;
 
     let mut manifest = read_manifest();
     let mut manifest_dirty = false;
@@ -637,6 +808,14 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
                     && is_merge(&entry.id)
                     && !overlay_messages(&entry.id).is_empty()
                     && entry.provider != "opencode"
+                    // Antigravity is excluded for a stronger reason than
+                    // OpenCode's: a real agy body carries protobuf fields
+                    // agentbridge does not decode (tool calls, reasoning,
+                    // gen_metadata blobs). Rewriting one with the minimal
+                    // encoder in `antigravity_write` would silently destroy
+                    // everything outside the handful of fields we understand,
+                    // so recovered turns stay in the overlay instead.
+                    && entry.provider != "antigravity"
                 {
                     match merge_back_native(registry, entry) {
                         Ok(()) => report.merged_native += 1,
@@ -650,7 +829,11 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
 
             let is_opencode = target == "opencode";
             let is_codex = target == "codex-cli";
-            if !is_opencode && (live_root(target).is_none() || converter_for(target).is_none()) {
+            let is_antigravity = target == "antigravity";
+            if !is_opencode
+                && !is_antigravity
+                && (live_root(target).is_none() || converter_for(target).is_none())
+            {
                 continue;
             }
 
@@ -673,10 +856,26 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
             // also continued it in its own tool.
             fold_overlay(&mut session, &entry.id);
 
+            // Stamp the cross-tool label into the title every target picker
+            // shows: origin tool, name, the session's own start time, and the
+            // first 8 characters of its id. Applied after `fold_overlay` so a
+            // rename recovered from another tool is what gets labeled, and
+            // before every write so all four copies carry the same string.
+            //
+            // `session.provider`/`session.id` are still the *origin's* here
+            // (only `project_id` was re-homed above), which is exactly what
+            // makes the label identical in every tool.
+            crate::label::apply(&mut session);
+
             if dry_run {
                 report.created.push(LinkRecord {
                     dest: if is_opencode {
                         opencode_db().unwrap_or_default()
+                    } else if is_antigravity {
+                        crate::antigravity_write::store()
+                            .unwrap_or_default()
+                            .join("conversations")
+                            .join("(planned)")
                     } else {
                         live_root(target).unwrap_or_default().join("(planned)")
                     },
@@ -689,6 +888,80 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
                     message_count: session.messages.len(),
                     title: session.title.clone(),
                 });
+                continue;
+            }
+
+            // Antigravity: one SQLite body per conversation plus a summaries
+            // row. Neither is linkable, so this writes both directly, the same
+            // way OpenCode INSERTs rows.
+            if is_antigravity {
+                let Some(home) = crate::antigravity_write::store() else {
+                    continue;
+                };
+                if let Err(e) = crate::antigravity_write::ensure_safe_to_write() {
+                    report.errors.push(e.to_string());
+                    continue;
+                }
+                let dirs = target_dirs(project, &session);
+                if !antigravity_backed_up
+                    && crate::antigravity_write::summaries_db(&home).is_file()
+                    && crate::antigravity_write::will_insert(&home, &session, &dirs)
+                {
+                    // A run that would only refresh conversations agentbridge
+                    // already wrote needs no backup; one that inserts does.
+                    match crate::antigravity_write::backup(
+                        &crate::antigravity_write::summaries_db(&home),
+                    ) {
+                        Ok(_) => antigravity_backed_up = true,
+                        Err(e) => {
+                            report.errors.push(e.to_string());
+                            continue;
+                        }
+                    }
+                }
+                let (rows, errors) =
+                    crate::antigravity_write::write_sessions(&home, &session, &dirs);
+                for e in errors {
+                    report.errors.push(format!("antigravity {}", e));
+                }
+                for row in rows {
+                    let record = LinkRecord {
+                        // The body is the artifact a pull re-reads, so it is
+                        // the `dest`; `unsync` removes it and its index row
+                        // together by the marker.
+                        dest: row.body.clone(),
+                        cache: PathBuf::from(&row.id),
+                        session_id: entry.id.clone(),
+                        source_provider: entry.provider.clone(),
+                        target_provider: target.clone(),
+                        project: PathBuf::from(row.directory),
+                        inode: inode_of(&row.body),
+                        message_count: row.messages,
+                        // The title actually persisted, not session.title:
+                        // an untitled session gets a derived name, and that
+                        // text is what a later pull reads back. Recording the
+                        // source's `None` here would make every untitled
+                        // session look renamed on the next pull.
+                        title: Some(row.title),
+                    };
+                    // A re-sync rewrites the same conversation in place, so the
+                    // manifest row must be *updated*, not appended — otherwise
+                    // every run adds another row per conversation and `pull`
+                    // reads one session as several tools' worth of new work
+                    // (observed as "antigravity+antigravity+antigravity" in a
+                    // conflict report). The file targets do the same thing via
+                    // their `unchanged` branch below.
+                    if let Some(existing) = manifest
+                        .iter_mut()
+                        .find(|r| r.session_id == record.session_id && r.dest == record.dest)
+                    {
+                        *existing = record;
+                        manifest_dirty = true;
+                        report.unchanged += 1;
+                    } else {
+                        report.created.push(record);
+                    }
+                }
                 continue;
             }
 
@@ -733,7 +1006,14 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
                         // True row count, not session.messages.len(): a
                         // placeholder turn may have been inserted.
                         message_count: row.messages,
-                        title: session.title.clone(),
+                        // The title actually persisted, not session.title —
+                        // OpenCode always writes something (falling back to
+                        // a derived name for an untitled session), and that
+                        // fallback text is what a later pull will read back.
+                        // Recording the source's often-`None` title here
+                        // would make every untitled session look renamed on
+                        // the next pull (see RowWritten::title).
+                        title: Some(row.title),
                     });
                 }
                 continue;
@@ -806,11 +1086,18 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
                     // its inode (hardlink), so the copy *is* refreshed even though
                     // nothing is linked. The manifest count must follow, or the
                     // next pull reads agentbridge's own refresh as tool drift.
+                    //
+                    // Title tracks session.title here, unlike the OpenCode branch
+                    // below: `load_materialized` for codex-cli reads the rollout
+                    // *file*, which never carries a title in the modern format —
+                    // never `ensure_codex_row`'s DB-side fallback, which pull_back
+                    // can never observe through that read path anyway.
                     if let Some(row) = manifest
                         .iter_mut()
                         .find(|r| r.session_id == entry.id && r.dest == dest)
                     {
                         row.message_count = session.messages.len();
+                        row.title = session.title.clone();
                         manifest_dirty = true;
                     }
                     // A materialized rollout still needs its `threads` row for
@@ -898,19 +1185,22 @@ fn interactive_source(source: Option<&str>) -> bool {
 /// lists it (CONNECTORS.md §2). Guarded and backed up once per run, exactly
 /// like the OpenCode path. Silently skipped when Codex has never run here
 /// (no `state_5.sqlite` to index into) or while Codex is open.
+/// Returns the title actually persisted into the `threads` row(s) touched,
+/// when the write happened at all — `None` when skipped (no state_5.sqlite,
+/// Codex running, or an error, all already reported). Callers must record
+/// this as `LinkRecord.title`, not `session.title` (see
+/// `ThreadRowReport::title`).
 fn ensure_codex_row(
     report: &mut SyncReport,
     backed_up: &mut bool,
     session: &crate::model::Session,
     rollout_path: &Path,
     dirs: &[String],
-) {
-    let Some(db) = crate::codex_write::state_db() else {
-        return;
-    };
+) -> Option<String> {
+    let db = crate::codex_write::state_db()?;
     if let Err(e) = crate::codex_write::ensure_safe_to_write() {
         report.errors.push(e.to_string());
-        return;
+        return None;
     }
     if !*backed_up {
         // Refreshing rows agentbridge already wrote is idempotent; only an
@@ -926,14 +1216,20 @@ fn ensure_codex_row(
                 Ok(_) => *backed_up = true,
                 Err(e) => {
                     report.errors.push(e.to_string());
-                    return;
+                    return None;
                 }
             }
         }
     }
     match crate::codex_write::ensure_thread_rows(&db, session, rollout_path, dirs) {
-        Ok(r) => report.codex_indexed += r.inserted,
-        Err(e) => report.errors.push(e.to_string()),
+        Ok(r) => {
+            report.codex_indexed += r.inserted;
+            Some(r.title)
+        }
+        Err(e) => {
+            report.errors.push(e.to_string());
+            None
+        }
     }
 }
 
@@ -970,8 +1266,31 @@ pub fn unsync(dry_run: bool) -> UnsyncReport {
             }
         }
 
+    // Antigravity conversations agentbridge wrote are removed by their marker,
+    // which takes the body and its summaries row together — an orphaned body
+    // would still be found by a filesystem scan.
+    if !dry_run
+        && records.iter().any(|r| r.target_provider == "antigravity")
+        && let Some(home) = crate::antigravity_write::store() {
+            match crate::antigravity_write::ensure_safe_to_write() {
+                Ok(()) => {
+                    let _ = crate::antigravity_write::remove_all(&home);
+                }
+                Err(_) => {
+                    // Leave them; the operator is told to quit Antigravity.
+                }
+            }
+        }
+
     for r in &records {
         if r.target_provider == "opencode" {
+            report.removed.push(r.dest.clone());
+            continue;
+        }
+        // Antigravity bodies were already deleted with their index rows above,
+        // by marker rather than by path. Counting them as missing here would
+        // report a successful teardown as a failure.
+        if r.target_provider == "antigravity" {
             report.removed.push(r.dest.clone());
             continue;
         }
@@ -1030,6 +1349,7 @@ pub fn unsync(dry_run: bool) -> UnsyncReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connector::Connector;
     use rusqlite::{params, Connection};
     use std::path::Path;
 
@@ -1062,6 +1382,11 @@ mod tests {
                 // write into their real session store instead of tmp.
                 std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path().join(".claude"));
                 std::env::set_var("CODEX_HOME", tmp.path().join(".codex"));
+                // Same hazard for antigravity: `antigravity_write::store()`
+                // honors ANTIGRAVITY_HOME, so without this a sandboxed test
+                // would write conversations into the operator's real
+                // ~/.gemini store (HANDOFF §sandbox doctrine).
+                std::env::set_var("ANTIGRAVITY_HOME", tmp.path().join(".gemini/antigravity-cli"));
             }
             Sandbox { _tmp: tmp, _guard: guard }
         }
@@ -1201,6 +1526,358 @@ mod tests {
         )])
     }
 
+    /// A registry holding a real antigravity connector rooted in the sandbox,
+    /// so it is both a discovery source and a write target.
+    fn agy_registry(claude_root: PathBuf) -> crate::connector::Registry {
+        crate::connector::Registry::new(vec![
+            Box::new(crate::connectors::claude_code::TestClaudeCode::new(claude_root)),
+            Box::new(crate::connectors::antigravity::AntigravityConnector::new()),
+        ])
+    }
+
+    /// Create the sandbox's antigravity store so `store()`/`detect()` see it.
+    fn make_agy_store() -> PathBuf {
+        let home = crate::antigravity_write::store()
+            .unwrap_or_else(|| crate::connectors::antigravity::write_home().unwrap());
+        fs::create_dir_all(home.join("conversations")).unwrap();
+        home
+    }
+
+    /// Sync must materialize a Claude session **into** antigravity: a body and
+    /// an index row, both discoverable by antigravity's own connector.
+    #[test]
+    fn test_sync_materializes_into_antigravity() {
+        let _sb = Sandbox::new();
+        let live = live_root("claude-code").unwrap();
+        write_native_claude_session(&live, "/tmp/merge-project");
+        let agy_home = make_agy_store();
+        let registry = agy_registry(live);
+
+        let report = sync_into(&registry, Path::new("/tmp/merge-project"), false);
+
+        let agy: Vec<&LinkRecord> = report
+            .created
+            .iter()
+            .filter(|r| r.target_provider == "antigravity")
+            .collect();
+        assert!(!agy.is_empty(), "antigravity must be a sync target: {:?}", report.errors);
+        for r in &agy {
+            assert!(r.dest.is_file(), "body written at {}", r.dest.display());
+            assert!(r.inode != 0, "inode recorded so unsync can verify ownership");
+            assert!(r.title.is_some(), "title recorded for rename detection");
+        }
+        assert_eq!(
+            crate::antigravity_write::count_written(&agy_home),
+            agy.len(),
+            "one marked conversation per manifest row"
+        );
+
+        // And agy's own reader finds them.
+        let connector = crate::connectors::antigravity::AntigravityConnector::new();
+        let ids: Vec<String> = connector
+            .scan()
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .map(|r| r.id)
+            .collect();
+        for r in &agy {
+            let id = r.cache.to_string_lossy().to_string();
+            assert!(ids.contains(&id), "{} must be listed by the connector", id);
+        }
+    }
+
+    /// Re-running must refresh, not accumulate conversations.
+    #[test]
+    fn test_sync_into_antigravity_is_idempotent() {
+        let _sb = Sandbox::new();
+        let live = live_root("claude-code").unwrap();
+        write_native_claude_session(&live, "/tmp/merge-project");
+        let agy_home = make_agy_store();
+        let registry = agy_registry(live);
+
+        sync_into(&registry, Path::new("/tmp/merge-project"), false);
+        let after_first = crate::antigravity_write::count_written(&agy_home);
+        sync_into(&registry, Path::new("/tmp/merge-project"), false);
+        let after_second = crate::antigravity_write::count_written(&agy_home);
+        assert_eq!(after_first, after_second, "no duplicate conversations");
+        assert!(after_first > 0);
+    }
+
+    /// A conversation agentbridge wrote into agy must not be re-materialized as
+    /// if the user had authored it there — that is the loop that multiplies
+    /// sessions on every run (DESIGN.md §6).
+    #[test]
+    fn test_sync_does_not_feed_on_conversations_it_wrote_into_antigravity() {
+        let _sb = Sandbox::new();
+        let live = live_root("claude-code").unwrap();
+        write_native_claude_session(&live, "/tmp/merge-project");
+        let agy_home = make_agy_store();
+        let registry = agy_registry(live);
+
+        sync_into(&registry, Path::new("/tmp/merge-project"), false);
+        let first = crate::antigravity_write::count_written(&agy_home);
+        // Two more passes: a feedback loop would grow the count each time.
+        sync_into(&registry, Path::new("/tmp/merge-project"), false);
+        sync_into(&registry, Path::new("/tmp/merge-project"), false);
+        assert_eq!(
+            crate::antigravity_write::count_written(&agy_home),
+            first,
+            "agentbridge's own antigravity conversations must never become sources"
+        );
+    }
+
+    /// The cross-tool label must be what lands in every target's title, must
+    /// be identical across targets for one session, and must not read as a
+    /// rename on the next pull.
+    #[test]
+    fn test_label_is_written_to_every_target_and_is_not_a_false_rename() {
+        let _sb = Sandbox::new();
+        let live = live_root("claude-code").unwrap();
+        write_native_claude_session(&live, "/tmp/merge-project");
+        make_agy_store();
+        let registry = agy_registry(live);
+
+        let report = sync_into(&registry, Path::new("/tmp/merge-project"), false);
+        let native = report
+            .created
+            .iter()
+            .filter(|r| r.session_id == NATIVE_UUID)
+            .collect::<Vec<_>>();
+        assert!(!native.is_empty(), "the session was materialized somewhere");
+
+        let mut labels: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for r in &native {
+            let title = r.title.as_deref().expect("every row records a title");
+            let l = crate::label::parse(title)
+                .unwrap_or_else(|| panic!("{} title must be a label: {:?}", r.target_provider, title));
+            // The fixture session carries an explicit name; it must survive
+            // verbatim rather than being reworded or clipped.
+            assert_eq!(l.name, "Merge test", "existing name kept as-is");
+            assert!(NATIVE_UUID.starts_with(l.id), "label id prefixes the origin id");
+            assert_eq!(l.provider, "claude-code", "label names the origin tool");
+            labels.insert(title.to_string());
+        }
+        assert_eq!(
+            labels.len(),
+            1,
+            "one session must carry one identical label into every tool: {:?}",
+            labels
+        );
+
+        // The label is what agentbridge wrote, so reading it back is not a
+        // rename — this is the 705-false-rename hazard.
+        let pulled = pull_back(false);
+        assert!(
+            pulled.renamed.is_empty(),
+            "labeling must not report renames: {:?}",
+            pulled.renamed
+        );
+    }
+
+    /// Regression: the antigravity branch always *appended* its manifest rows,
+    /// so every re-sync added another row per conversation. `pull` then read a
+    /// single session as several tools' worth of new work and reported a
+    /// conflict against itself ("antigravity+antigravity+antigravity").
+    #[test]
+    fn test_resync_updates_antigravity_manifest_rows_instead_of_appending() {
+        let _sb = Sandbox::new();
+        let live = live_root("claude-code").unwrap();
+        write_native_claude_session(&live, "/tmp/merge-project");
+        make_agy_store();
+        let registry = agy_registry(live);
+
+        sync_into(&registry, Path::new("/tmp/merge-project"), false);
+        let after_first = read_manifest().len();
+        sync_into(&registry, Path::new("/tmp/merge-project"), false);
+        sync_into(&registry, Path::new("/tmp/merge-project"), false);
+        assert_eq!(
+            read_manifest().len(),
+            after_first,
+            "re-syncing must refresh manifest rows, not add more"
+        );
+
+        // And exactly one row per (session, dest).
+        let rows = read_manifest();
+        let mut seen: std::collections::HashSet<(String, PathBuf)> =
+            std::collections::HashSet::new();
+        for r in rows.iter().filter(|r| r.target_provider == "antigravity") {
+            assert!(
+                seen.insert((r.session_id.clone(), r.dest.clone())),
+                "duplicate manifest row for {} -> {}",
+                r.session_id,
+                r.dest.display()
+            );
+        }
+    }
+
+    /// Write-back out of antigravity: turns appended to the materialized
+    /// conversation are recovered into the overlay, and a rename is detected.
+    #[test]
+    fn test_pull_back_recovers_turns_and_renames_from_antigravity() {
+        let _sb = Sandbox::new();
+        let live = live_root("claude-code").unwrap();
+        write_native_claude_session(&live, "/tmp/merge-project");
+        make_agy_store();
+        let registry = agy_registry(live);
+        sync_into(&registry, Path::new("/tmp/merge-project"), false);
+
+        let rec = read_manifest()
+            .into_iter()
+            .find(|r| r.target_provider == "antigravity")
+            .expect("an antigravity row");
+        let agy_id = rec.cache.to_string_lossy().to_string();
+
+        // Simulate the user continuing the conversation inside agy, and
+        // renaming it, by appending a step and updating the index.
+        let before = crate::antigravity_write::load_written(&rec.dest, &agy_id).unwrap();
+        append_agy_turn(&rec.dest, before.messages.len(), "a reply typed inside agy");
+        rename_agy(&rec.dest, &agy_id, "Renamed inside agy");
+
+        let report = pull_back(false);
+        assert!(
+            report.pulled.iter().any(|(sid, n)| sid == &rec.session_id && *n >= 1),
+            "the appended turn must be recovered: {:?}",
+            report.pulled
+        );
+        let recovered = overlay_messages(&rec.session_id);
+        assert!(
+            recovered.iter().any(|m| m.text.as_deref() == Some("a reply typed inside agy")),
+            "recovered text lands in the overlay"
+        );
+        assert_eq!(
+            overlay_title(&rec.session_id).as_deref(),
+            Some("Renamed inside agy"),
+            "the rename is recovered too"
+        );
+    }
+
+    /// An untitled session gets a derived name in agy. Reading that back must
+    /// not look like the user renamed it — the false-rename regression this
+    /// project hit twice before.
+    #[test]
+    fn test_antigravity_fallback_title_is_not_a_false_rename() {
+        let _sb = Sandbox::new();
+        let live = live_root("claude-code").unwrap();
+        // A session with no title at all.
+        let encoded = crate::convert::ClaudeCodeConverter::encode_project_dir("/tmp/untitled-proj");
+        let dir = live.join(&encoded);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("c1d2e3f4-a5b6-7890-cdef-123456789abc.jsonl"),
+            "{\"uuid\":\"c1d2e3f4-a5b6-7890-cdef-123456789abc\",\"type\":\"conversation_start\",\"cwd\":\"/tmp/untitled-proj\",\"timestamp\":\"2026-07-01T12:00:00Z\"}\n             {\"uuid\":\"d2e3f4a5-b6c7-8901-def1-23456789abcd\",\"type\":\"user_message\",\"cwd\":\"/tmp/untitled-proj\",\"timestamp\":\"2026-07-01T12:00:05Z\",\"content\":\"do the thing\"}\n",
+        )
+        .unwrap();
+        make_agy_store();
+        let registry = agy_registry(live);
+        sync_into(&registry, Path::new("/tmp/untitled-proj"), false);
+
+        let report = pull_back(false);
+        assert!(
+            report.renamed.is_empty(),
+            "a derived title must not read as a rename: {:?}",
+            report.renamed
+        );
+    }
+
+    /// Teardown must remove the bodies *and* their index rows, leaving
+    /// conversations agy authored alone.
+    #[test]
+    fn test_unsync_removes_antigravity_conversations_but_not_agy_own() {
+        let _sb = Sandbox::new();
+        let live = live_root("claude-code").unwrap();
+        write_native_claude_session(&live, "/tmp/merge-project");
+        let agy_home = make_agy_store();
+        let registry = agy_registry(live);
+        sync_into(&registry, Path::new("/tmp/merge-project"), false);
+
+        let written: Vec<PathBuf> = read_manifest()
+            .into_iter()
+            .filter(|r| r.target_provider == "antigravity")
+            .map(|r| r.dest)
+            .collect();
+        assert!(!written.is_empty());
+
+        // A conversation agy authored, which must survive.
+        let native_body = agy_home
+            .join("conversations")
+            .join("75ce4071-a2a8-44d0-9958-6720905cc5e4.db");
+        fs::write(&native_body, b"agy own").unwrap();
+
+        unsync(false);
+
+        for body in &written {
+            assert!(!body.exists(), "{} must be removed", body.display());
+        }
+        assert!(native_body.exists(), "agy's own conversation is untouched");
+        assert_eq!(
+            crate::antigravity_write::count_written(&agy_home),
+            0,
+            "no marked index rows remain"
+        );
+    }
+
+    /// Append a step to a materialized conversation the way agy would, so the
+    /// pull path sees new work. Encodes the same protobuf shape the reader
+    /// expects (`.19.2` for user text).
+    fn append_agy_turn(body: &Path, idx: usize, text: &str) {
+        let conn = rusqlite::Connection::open(body).unwrap();
+        let mut payload = Vec::new();
+        // .1 step_type = 14 (user)
+        payload.extend([0x08, 14]);
+        // .4 status = 3
+        payload.extend([0x20, 3]);
+        // .5.1 created
+        let mut created = Vec::new();
+        created.extend([0x08]);
+        let secs: u64 = 1_785_400_000;
+        let mut v = secs;
+        loop {
+            let mut b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v != 0 {
+                b |= 0x80;
+            }
+            created.push(b);
+            if v == 0 {
+                break;
+            }
+        }
+        created.extend([0x10, 0]);
+        let mut meta = Vec::new();
+        meta.push(0x0a);
+        meta.push(created.len() as u8);
+        meta.extend(&created);
+        payload.push(0x2a);
+        payload.push(meta.len() as u8);
+        payload.extend(&meta);
+        // .19 { .2 = text }
+        let mut inner = vec![0x12, text.len() as u8];
+        inner.extend(text.as_bytes());
+        payload.push(0x9a);
+        payload.push(0x01);
+        payload.push(inner.len() as u8);
+        payload.extend(&inner);
+
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, status, step_payload, step_format) \
+             VALUES (?1, 14, 3, ?2, 0)",
+            rusqlite::params![idx as i64, payload],
+        )
+        .unwrap();
+    }
+
+    /// Rename a materialized conversation in agy's index, the way the app would.
+    fn rename_agy(body: &Path, id: &str, title: &str) {
+        let home = body.parent().unwrap().parent().unwrap();
+        let conn =
+            rusqlite::Connection::open(crate::antigravity_write::summaries_db(home)).unwrap();
+        conn.execute(
+            "UPDATE conversation_summaries SET title = ?1 WHERE conversation_id = ?2",
+            rusqlite::params![title, id],
+        )
+        .unwrap();
+    }
+
     #[test]
     fn test_merge_marker_roundtrip() {
         let _sb = Sandbox::new();
@@ -1297,6 +1974,51 @@ mod tests {
         );
     }
 
+    /// Regression: a Claude-Code-native session synced while standing in a
+    /// *different* directory must reach both that directory and `$HOME`
+    /// (`target_dirs()`'s documented fallback, HANDOFF.md §6 item 1) — before
+    /// `ClaudeCodeConverter::convert_multi` was implemented, the trait's
+    /// default silently dropped every directory past the first.
+    #[test]
+    fn test_sync_materializes_claude_session_into_project_and_home() {
+        let _sb = Sandbox::new();
+        let live = live_root("claude-code").unwrap();
+        let native_project = PathBuf::from("/tmp/merge-project");
+        write_native_claude_session(&live, native_project.to_str().unwrap());
+        let registry = native_registry(live);
+
+        // Sync while standing somewhere other than the session's own project.
+        let elsewhere = PathBuf::from("/tmp/some-other-project");
+        let report = sync_into(&registry, &elsewhere, false);
+
+        let claude_links: Vec<&LinkRecord> =
+            report.created.iter().filter(|r| r.target_provider == "claude-code").collect();
+        assert_eq!(claude_links.len(), 2, "must materialize into both the sync project and $HOME");
+        let elsewhere_tag =
+            crate::convert::ClaudeCodeConverter::encode_project_dir(elsewhere.to_str().unwrap());
+        let home = std::env::var("HOME").unwrap();
+        let home_tag = crate::convert::ClaudeCodeConverter::encode_project_dir(&home);
+        assert!(
+            claude_links.iter().any(|r| r.dest.to_string_lossy().contains(&elsewhere_tag)),
+            "missing a copy under the sync project"
+        );
+        assert!(
+            claude_links.iter().any(|r| r.dest.to_string_lossy().contains(&home_tag)),
+            "missing a copy under $HOME"
+        );
+
+        // The session's own native file must still be untouched (invariant 2)
+        // — neither of the two new dests is the native path itself.
+        let native_file = live_root("claude-code")
+            .unwrap()
+            .join(crate::convert::ClaudeCodeConverter::encode_project_dir(native_project.to_str().unwrap()))
+            .join(format!("{}.jsonl", NATIVE_UUID));
+        assert!(
+            claude_links.iter().all(|r| r.dest != native_file),
+            "must never write onto the session's own native path"
+        );
+    }
+
     #[test]
     fn test_sync_dry_run_writes_nothing() {
         let _sb = Sandbox::new();
@@ -1356,6 +2078,23 @@ mod tests {
             "version": "2.1.220",
             "gitBranch": "",
             "message": { "role": "user", "content": text },
+        }).to_string());
+        body.push('\n');
+        fs::write(dest, body).unwrap();
+    }
+
+    /// Simulate a turn appended in Codex's own rollout format (`event_msg`
+    /// carrying a `payload.message` object — the shape `codex_cli.rs` reads
+    /// a real turn from).
+    fn append_codex_turn(dest: &Path, text: &str) {
+        let mut body = fs::read_to_string(dest).unwrap();
+        if !body.ends_with('\n') {
+            body.push('\n');
+        }
+        body.push_str(&serde_json::json!({
+            "type": "event_msg",
+            "timestamp": "2026-08-01T00:00:01.000Z",
+            "payload": { "message": { "role": "user", "content": text } },
         }).to_string());
         body.push('\n');
         fs::write(dest, body).unwrap();
@@ -1461,6 +2200,169 @@ mod tests {
         );
     }
 
+    /// A resolver that returns a fixed choice and records every session it
+    /// was asked to resolve, so a test can assert both the outcome and that
+    /// the operator was (or wasn't) actually asked — without a real terminal.
+    struct ScriptedResolver {
+        choice: ConflictChoice,
+        asked: Vec<(String, Vec<String>)>,
+    }
+
+    impl ScriptedResolver {
+        fn new(choice: ConflictChoice) -> Self {
+            Self { choice, asked: Vec::new() }
+        }
+    }
+
+    impl ConflictResolver for ScriptedResolver {
+        fn resolve(&mut self, session_id: &str, items: &[ConflictItem]) -> ConflictChoice {
+            let providers: Vec<String> = items.iter().map(|i| i.provider.clone()).collect();
+            self.asked.push((session_id.to_string(), providers));
+            self.choice.clone()
+        }
+    }
+
+    /// New work from exactly one tool must never be reported as a conflict —
+    /// this is the ordinary write-back path every earlier pull_back test
+    /// already exercises, and it must stay prompt-free.
+    #[test]
+    fn test_pull_back_single_tool_new_work_is_not_a_conflict() {
+        let _sb = Sandbox::new();
+        let registry = crate::connectors::all_for_testing(&fixture_root());
+        let project = PathBuf::from("/tmp/some-project");
+        let synced = sync_into(&registry, &project, false);
+        let link = first_claude_link(&synced);
+
+        append_claude_turn(&link.dest, &link.session_id, "ONLY CLAUDE TOUCHED THIS");
+
+        let report = pull_back(false);
+        assert!(
+            report.conflicts.is_empty(),
+            "a single contributing tool must never be reported as a conflict"
+        );
+        assert_eq!(report.pulled.iter().map(|(_, n)| n).sum::<usize>(), 1);
+    }
+
+    /// Two tools both appending new turns to the same session since the last
+    /// pull is exactly the scenario the operator described: continue a
+    /// session in Codex after it was worked on in Claude Code. The default
+    /// resolver (`AutoMerge`, what plain `pull_back` uses) must keep both —
+    /// unchanged behavior from before conflict detection existed — but it
+    /// must still surface the conflict so the operator can see it happened.
+    #[test]
+    fn test_pull_back_two_tools_is_a_conflict_and_auto_merge_keeps_both() {
+        let _sb = Sandbox::new();
+        let registry = crate::connectors::all_for_testing(&fixture_root());
+        let project = PathBuf::from("/tmp/some-project");
+        let synced = sync_into(&registry, &project, false);
+        let claude = first_claude_link(&synced);
+        let codex = synced
+            .created
+            .iter()
+            .find(|r| r.target_provider == "codex-cli" && r.session_id == claude.session_id)
+            .expect("a codex-cli link for the same session")
+            .clone();
+
+        append_claude_turn(&claude.dest, &claude.session_id, "FROM CLAUDE CODE");
+        append_codex_turn(&codex.dest, "FROM CODEX");
+
+        let report = pull_back(false);
+
+        assert_eq!(report.conflicts.len(), 1, "two contributing tools must be one conflict");
+        let (id, providers, choice) = &report.conflicts[0];
+        assert_eq!(id, &claude.session_id);
+        assert_eq!(
+            providers.iter().collect::<std::collections::BTreeSet<_>>(),
+            ["claude-code".to_string(), "codex-cli".to_string()].iter().collect()
+        );
+        assert_eq!(choice, &ConflictChoice::MergeAll);
+
+        let overlay = overlay_messages(&claude.session_id);
+        assert!(overlay.iter().any(|m| m.text.as_deref() == Some("FROM CLAUDE CODE")));
+        assert!(overlay.iter().any(|m| m.text.as_deref() == Some("FROM CODEX")));
+    }
+
+    /// "Continue the written-back session, or only the session from one
+    /// agent, skipping the other" — the operator's own words for this
+    /// feature. `KeepOnly` must keep exactly the chosen tool's new turns and
+    /// discard the other's, permanently (not just this run — re-pulling must
+    /// not re-offer the discarded turns).
+    #[test]
+    fn test_pull_back_keep_only_discards_the_other_tool() {
+        let _sb = Sandbox::new();
+        let registry = crate::connectors::all_for_testing(&fixture_root());
+        let project = PathBuf::from("/tmp/some-project");
+        let synced = sync_into(&registry, &project, false);
+        let claude = first_claude_link(&synced);
+        let codex = synced
+            .created
+            .iter()
+            .find(|r| r.target_provider == "codex-cli" && r.session_id == claude.session_id)
+            .expect("a codex-cli link for the same session")
+            .clone();
+
+        append_claude_turn(&claude.dest, &claude.session_id, "KEEP ME");
+        append_codex_turn(&codex.dest, "DISCARD ME");
+
+        let mut resolver = ScriptedResolver::new(ConflictChoice::KeepOnly("claude-code".to_string()));
+        let report = pull_back_with(false, &mut resolver);
+
+        assert_eq!(resolver.asked.len(), 1, "the resolver must be asked exactly once");
+
+        let overlay = overlay_messages(&claude.session_id);
+        assert!(overlay.iter().any(|m| m.text.as_deref() == Some("KEEP ME")));
+        assert!(
+            !overlay.iter().any(|m| m.text.as_deref() == Some("DISCARD ME")),
+            "the non-chosen tool's new turn must not reach the overlay"
+        );
+        assert_eq!(report.pulled, vec![(claude.session_id.clone(), 1)]);
+
+        // Re-pulling must not re-offer the discarded turn as a conflict — it
+        // was a deliberate, permanent choice, not a deferral.
+        let mut resolver2 = ScriptedResolver::new(ConflictChoice::MergeAll);
+        let second = pull_back_with(false, &mut resolver2);
+        assert!(second.conflicts.is_empty(), "the discarded turn must not resurface");
+        assert!(second.pulled.is_empty());
+    }
+
+    /// `Skip` must decide nothing — the same conflict is offered again next
+    /// time, unlike `KeepOnly` which is a permanent choice for that batch of
+    /// turns.
+    #[test]
+    fn test_pull_back_skip_leaves_manifest_untouched_and_reasks() {
+        let _sb = Sandbox::new();
+        let registry = crate::connectors::all_for_testing(&fixture_root());
+        let project = PathBuf::from("/tmp/some-project");
+        let synced = sync_into(&registry, &project, false);
+        let claude = first_claude_link(&synced);
+        let codex = synced
+            .created
+            .iter()
+            .find(|r| r.target_provider == "codex-cli" && r.session_id == claude.session_id)
+            .expect("a codex-cli link for the same session")
+            .clone();
+
+        append_claude_turn(&claude.dest, &claude.session_id, "FROM CLAUDE CODE");
+        append_codex_turn(&codex.dest, "FROM CODEX");
+
+        let mut resolver = ScriptedResolver::new(ConflictChoice::Skip);
+        let first = pull_back_with(false, &mut resolver);
+        assert!(first.pulled.is_empty(), "skip must recover nothing this round");
+        assert!(overlay_messages(&claude.session_id).is_empty());
+
+        let mut resolver2 = ScriptedResolver::new(ConflictChoice::MergeAll);
+        let second = pull_back_with(false, &mut resolver2);
+        assert_eq!(
+            resolver2.asked.len(),
+            1,
+            "a skipped conflict must be offered again on the next pull"
+        );
+        assert_eq!(second.conflicts[0].2, ConflictChoice::MergeAll);
+        let overlay = overlay_messages(&claude.session_id);
+        assert!(overlay.iter().any(|m| m.text.as_deref() == Some("FROM CLAUDE CODE")));
+        assert!(overlay.iter().any(|m| m.text.as_deref() == Some("FROM CODEX")));
+    }
+
     /// A rename made in a non-native copy must be recovered the same way an
     /// appended turn is — this is the fix for "renamed a session in one tool,
     /// the other tool never saw it."
@@ -1516,7 +2418,21 @@ mod tests {
         // file body (that upsert has its own coverage in codex_write.rs) — so
         // the LinkRecord is the observable point here: it carries the title
         // that will be written into that index (`ensure_codex_row`).
-        assert_eq!(codex.title.as_deref(), Some("renamed-in-claude-code"));
+        //
+        // The written title is the cross-tool label, so the recovered rename
+        // is its *name* field rather than the whole string.
+        let written = codex.title.as_deref().expect("codex link carries a title");
+        let parsed = crate::label::parse(written)
+            .unwrap_or_else(|| panic!("codex title must be a label: {:?}", written));
+        assert_eq!(parsed.name, "renamed-in-claude-code");
+        // And the label still identifies the origin session, which is the
+        // point of carrying it into other tools at all.
+        assert!(
+            link.session_id.starts_with(parsed.id),
+            "label id {:?} must prefix the origin session id {:?}",
+            parsed.id,
+            link.session_id
+        );
     }
 
     /// The overlay is the ONLY durable copy of turns added in a materialized
@@ -1587,22 +2503,33 @@ mod tests {
             .expect("claude fixture")
             .load("normal-multi-turn")
             .expect("fixture loads");
-        let (oc_id, written) =
+        let (oc_id, written, written_title) =
             crate::opencode_write::write_session(&db, &source, "/tmp/some-project").unwrap();
+        // Regression: recording anything other than the title actually
+        // written (e.g. the source's raw, often-`None` title) here makes the
+        // very first `pull_back` below misread OpenCode's own fallback text
+        // as a rename nobody made (found live, outside the sandbox,
+        // 2026-08-14 — see RowWritten::title).
         append_manifest(&[LinkRecord {
             dest: db.clone(),
             cache: PathBuf::from(&oc_id),
             session_id: source.id.clone(),
             source_provider: "claude-code".into(),
             target_provider: "opencode".into(),
-            title: None,
+            title: Some(written_title),
             project: PathBuf::from("/tmp/some-project"),
             inode: 0,
             message_count: written,
         }])
         .unwrap();
 
-        assert!(pull_back(false).pulled.is_empty(), "no new turns yet");
+        let first = pull_back(false);
+        assert!(first.pulled.is_empty(), "no new turns yet");
+        assert!(
+            first.renamed.is_empty(),
+            "recording the title actually written must not look like a rename: {:?}",
+            first.renamed
+        );
 
         // OpenCode appended a turn of its own: rows addressed with its own
         // id scheme (sorts after agentbridge's `msg_0…`), a fresh timestamp.
@@ -1629,6 +2556,11 @@ mod tests {
         let report = pull_back(false);
         let got: usize = report.pulled.iter().map(|(_, n)| n).sum();
         assert_eq!(got, 1, "the opencode-appended turn must be recovered");
+        assert!(
+            report.renamed.is_empty(),
+            "an appended turn is not a rename: {:?}",
+            report.renamed
+        );
 
         let overlay = overlay_messages(&source.id);
         assert!(
@@ -1638,6 +2570,82 @@ mod tests {
             "overlay must hold the opencode turn"
         );
     }
+
+    /// The exact bug found live 2026-08-14: an *untitled* session gets some
+    /// derived fallback text written into OpenCode (`write_session`'s
+    /// `"{provider} session {id}"`), and that fallback is indistinguishable
+    /// from a real title once round-tripped through the database. Recording
+    /// the source's raw title (`None`) as `LinkRecord.title` instead of what
+    /// was actually written made every untitled session look renamed on the
+    /// very next pull — at machine scale, hundreds of false positives from a
+    /// single `pull` run.
+    #[test]
+    fn test_untitled_session_fallback_title_is_not_a_false_rename() {
+        let _sb = Sandbox::new();
+        let home = PathBuf::from(std::env::var("HOME").unwrap());
+        let db = home.join(".local/share/opencode/opencode.db");
+        fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            r#"
+            PRAGMA foreign_keys = ON;
+            CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT NOT NULL,
+                time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+                sandboxes TEXT NOT NULL);
+            CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                parent_id TEXT, slug TEXT NOT NULL, directory TEXT NOT NULL,
+                title TEXT NOT NULL, version TEXT NOT NULL,
+                time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+                metadata TEXT,
+                FOREIGN KEY (project_id) REFERENCES project(id) ON DELETE CASCADE);
+            CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES session(id) ON DELETE CASCADE);
+            CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL,
+                session_id TEXT NOT NULL, time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL, data TEXT NOT NULL,
+                FOREIGN KEY (message_id) REFERENCES message(id) ON DELETE CASCADE);
+            INSERT INTO project VALUES ('global','/',0,0,'[]');
+            "#,
+        )
+        .unwrap();
+        drop(conn);
+
+        let registry = crate::connectors::all_for_testing(&fixture_root());
+        let source = registry
+            .by_id("claude-code")
+            .expect("claude fixture")
+            .load("tool-calls-large-output")
+            .expect("fixture loads");
+        assert!(source.title.is_none(), "fixture must be untitled for this test to mean anything");
+
+        let (oc_id, written, written_title) =
+            crate::opencode_write::write_session(&db, &source, "/tmp/some-project").unwrap();
+        assert!(!written_title.is_empty(), "write_session must fall back to something");
+        append_manifest(&[LinkRecord {
+            dest: db.clone(),
+            cache: PathBuf::from(&oc_id),
+            session_id: source.id.clone(),
+            source_provider: "claude-code".into(),
+            target_provider: "opencode".into(),
+            title: Some(written_title),
+            project: PathBuf::from("/tmp/some-project"),
+            inode: 0,
+            message_count: written,
+        }])
+        .unwrap();
+
+        let report = pull_back(false);
+        assert!(
+            report.renamed.is_empty(),
+            "the fallback title round-tripping through OpenCode must not look like a rename: {:?}",
+            report.renamed
+        );
+    }
+
     #[test]
     fn test_sync_does_not_feed_on_its_own_output() {
         let _sb = Sandbox::new();

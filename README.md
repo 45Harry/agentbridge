@@ -7,7 +7,8 @@ conversation in Claude Code, continue it in Codex or OpenCode — from any
 directory. Sessions you create in one tool automatically appear in every
 other tool, and the work you add anywhere is pulled back and shared everywhere.
 
-Works today, verified live: **Claude Code, Codex CLI, OpenCode, Antigravity CLI**.
+Works today, verified live: **Claude Code, Codex CLI, OpenCode, Antigravity**.
+All four are bidirectional — sessions flow in and out of every one of them.
 
 ## The problem
 
@@ -28,7 +29,10 @@ each directory's view fresh in every tool's own format:
   started elsewhere in the tool of your choice.
 - **Write-back.** Turns you append in one tool are recovered into an
   append-only overlay (`pull`) and folded into the other tools' copies on the
-  next sync. Your original files are never modified.
+  next sync. Your original files are never modified. If a session was
+  continued in *more than one* tool between pulls, `agentbridge pull` asks —
+  merge everyone's new turns, keep only one tool's, or decide later
+  (`--auto-merge` skips the prompt for scripts and non-interactive shells).
 - **Automatic.** `agentbridge auto install` hooks your shell; `auto watch`
   re-syncs within seconds of any session change.
 
@@ -112,20 +116,23 @@ inode, OpenCode rows by marker) and never deletes recovered work.
 | Claude Code | `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl` | yes | yes |
 | Codex CLI | `~/.codex/sessions/<date>/rollout-*.jsonl` + `state_5.sqlite` | yes | yes, incl. picker rows* |
 | OpenCode | `~/.local/share/opencode/opencode.db` (SQLite) | yes | yes, guarded† |
-| Antigravity CLI | `~/.gemini/antigravity-cli/conversations/*.db` (SQLite) | yes | pending‡ |
+| Antigravity | `~/.gemini/antigravity-{cli,ide}/conversations/*.db` (SQLite) | yes, all stores‡ | yes, guarded† |
 
 \* Codex's `/resume` lists from the `threads` table in `state_5.sqlite`, never
 from the rollout files (its disk backfill is a one-time migration — verified).
 agentbridge inserts a `threads` row per synced session so they appear in the
 picker, with the same guards as OpenCode.
 
-† OpenCode is the only tool whose sessions live in a live database. Every
-write backs the database up first, tags its rows (removable by that tag alone),
-and refuses to run while OpenCode is open.
+† OpenCode and Antigravity keep sessions in live databases. Every write backs
+the database up first, tags its rows (removable by that tag alone), and refuses
+to run while the tool is open. Antigravity needs both a conversation body and
+an index row to be visible, so agentbridge writes both — it is the one place
+agentbridge authors protobuf rather than JSON.
 
-‡ Antigravity is read-only: its sessions are surfaced into every other tool,
-but foreign sessions are not yet materialized into it (write path deferred
-until the CLI's model quota resets and the binary can be exercised live).
+‡ Antigravity ships several surfaces (CLI, IDE) that each keep a separate store
+under `~/.gemini/`; all are scanned. Some conversations are stored as encrypted
+`.pb` files with no available key — those are skipped rather than reported as
+corrupt. See `CONNECTORS.md` §7.
 
 ## How it works
 
@@ -138,6 +145,28 @@ until the CLI's model quota resets and the binary can be exercised live).
 3. **Never touch a tool's own sessions.** New turns are recovered into an
    append-only overlay agentbridge owns and folded into the other tools'
    copies. `unsync` deletes only what it created.
+
+## Tracking one session across tools
+
+Every synced copy is titled with the same label, so the four picker rows for
+one conversation are recognizably the same conversation:
+
+```
+claude-code · My Important Session · 2026-08-19 10:00 · aaaaaaaa
+└ origin tool  └ session name        └ session start    └ session id
+```
+
+- **The date is the session's own start time**, read from inside the
+  transcript — not when the sync ran. It never changes, so the same
+  conversation shows the same date in every tool.
+- **A name the tool already has is kept verbatim.** `claude -n`, an in-session
+  rename, agy's `title` column: that name is yours and is never truncated or
+  reworded. Only a session with *no* name gets one derived from its opening
+  message (marked with `…` when shortened).
+- **Renaming a copy in any tool** is picked up by `pull` and republished, with
+  the label rebuilt around your new name and the id and date preserved.
+- Timestamps are UTC and the label is a pure function of the session, so
+  re-syncing never reports a session as renamed just for having been synced.
 
 ## Docs
 

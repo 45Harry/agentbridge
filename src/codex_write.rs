@@ -38,6 +38,12 @@ const APPROVAL_MODE: &str = "on-request";
 /// The picker truncates long titles; keep preview strings modest.
 const PREVIEW_MAX: usize = 120;
 
+/// A *name*, not a preview: short enough to read as a session name in a
+/// picker row rather than a slice of the prompt. Matches the rough length of
+/// a git commit subject line — long enough to be meaningful, short enough to
+/// never wrap.
+const TITLE_MAX: usize = 60;
+
 #[derive(Debug)]
 pub enum WriteError {
     CodexRunning,
@@ -140,13 +146,50 @@ fn first_user_message(session: &Session) -> String {
         .unwrap_or_default()
 }
 
+/// Collapse runs of whitespace — including newlines — to single spaces. A
+/// multi-line prompt used as a fallback preview/title must not carry its
+/// line breaks into a single picker row.
+fn normalize_whitespace(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn clip(s: &str, max: usize) -> String {
-    let s = s.trim();
+    let s = normalize_whitespace(s);
     if s.chars().count() <= max {
-        s.to_string()
+        s
     } else {
         s.chars().take(max).collect()
     }
+}
+
+/// A short, meaningful session name derived from the first user message —
+/// used only as a fallback when the session has no explicit title (a real
+/// Codex rename, or one recovered from another tool via the title overlay).
+/// Unlike `clip`, this never cuts a word in half and marks truncation with
+/// an ellipsis, so what shows up in `codex /resume` reads as a name, not a
+/// raw slice of the prompt (found live, operator report 2026-08-18: an
+/// untitled session synced in from another tool showed a long, mid-word-cut
+/// prompt fragment as its name).
+fn short_title(s: &str, max: usize) -> String {
+    let s = normalize_whitespace(s);
+    if s.chars().count() <= max {
+        return s;
+    }
+    let budget = max.saturating_sub(1); // room for the trailing ellipsis
+    let mut cut = String::new();
+    for word in s.split(' ') {
+        let candidate = if cut.is_empty() { word.to_string() } else { format!("{cut} {word}") };
+        if candidate.chars().count() > budget {
+            break;
+        }
+        cut = candidate;
+    }
+    if cut.is_empty() {
+        // A single word longer than the whole budget: no word boundary to
+        // break on, fall back to a hard clip so this still terminates.
+        cut = s.chars().take(budget).collect();
+    }
+    format!("{cut}…")
 }
 
 /// Anchor timestamp shared with the Codex converter, so the row agrees with
@@ -226,11 +269,20 @@ pub fn ensure_thread_rows(
     let secs = anchor.timestamp();
     let ms = anchor.timestamp_millis();
     let first_user = first_user_message(session);
-    let title = if first_user.is_empty() {
-        session.title.clone().unwrap_or_else(|| "New conversation".to_string())
-    } else {
-        clip(&first_user, PREVIEW_MAX)
+    // An explicit title (real rename, or one recovered from another tool via
+    // the title overlay — see sync.rs's fold_overlay) always wins: it was
+    // deliberately set. Only a session that has never been named falls back
+    // to a message preview, matching Codex's own default before any rename —
+    // and that fallback must read as a *name* (short, word-boundary-safe,
+    // ellipsized), not as a raw slice of the prompt (found live 2026-08-18:
+    // an untitled session synced in from another tool showed a long,
+    // mid-word-cut prompt fragment as its picker name).
+    let title = match &session.title {
+        Some(t) if !t.is_empty() => t.clone(),
+        _ if !first_user.is_empty() => short_title(&first_user, TITLE_MAX),
+        _ => "New conversation".to_string(),
     };
+    report.title = title.clone();
     let has_user = if session.messages.iter().any(|m| m.role == Role::User) { 1 } else { 0 };
 
     for cwd in dirs {
@@ -347,12 +399,24 @@ pub fn remove_thread_rows_for(
 }
 
 /// Outcome of an `ensure_thread_rows` call.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ThreadRowReport {
     /// Rows created (each is one directory the session is now visible from).
     pub inserted: usize,
     /// Rows refreshed (values rewritten, same id — not new visibility).
     pub updated: usize,
+    /// The title actually persisted into every row this call touched (same
+    /// value for all of them — computed once, before the per-directory
+    /// loop). Callers recording "what we wrote" (sync.rs's `LinkRecord`)
+    /// must use this, not `session.title`: this always has a value (falling
+    /// back to a message preview or "New conversation" for an untitled
+    /// session), and round-tripping that fallback back through
+    /// `load_materialized` makes it indistinguishable from a real title —
+    /// recording a bare `session.title` here would make every untitled
+    /// session look renamed on the next `pull` (regression caught
+    /// 2026-08-14 live-testing outside the sandbox, alongside the identical
+    /// OpenCode gap — see `opencode_write::RowWritten::title`).
+    pub title: String,
 }
 
 /// Remove every row agentbridge inserted — matched by the marker, so
@@ -486,6 +550,31 @@ mod tests {
             session_uuid_for_dir(&a_session().id, "/home/harry/work"),
             session_uuid_for_dir(&a_session().id, "/home/harry/work")
         );
+    }
+
+    /// Regression: an explicit title (a real rename, or one recovered from
+    /// another tool via sync.rs's title overlay) must win over the
+    /// first-user-message preview `threads.title` otherwise falls back to —
+    /// previously the preview always won whenever the session had any user
+    /// message at all, silently discarding every rename.
+    #[test]
+    fn test_explicit_title_beats_first_message_preview() {
+        let (_tmp, db) = db_with_schema();
+        let mut s = a_session();
+        s.title = Some("renamed-session".to_string());
+        let report = ensure_thread_rows(
+            &db,
+            &s,
+            Path::new("/home/harry/.codex/sessions/2026/07/30/rollout-x.jsonl"),
+            &["/home/harry/work".to_string()],
+        )
+        .unwrap();
+        assert_eq!(report.inserted, 1);
+        let conn = Connection::open(&db).unwrap();
+        let title: String = conn
+            .query_row("SELECT title FROM threads", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(title, "renamed-session");
     }
 
     /// Two directories means two rows: the session is visible from both.
@@ -673,6 +762,42 @@ mod tests {
         let sid = session_uuid_for_dir(&s.id, "/home/harry/work");
         assert!(thread_row_exists(&db, &sid).unwrap());
         assert!(!thread_row_exists(&db, "missing-id").unwrap());
+    }
+
+    /// Regression (operator report 2026-08-18): an untitled session synced
+    /// in from another tool used to show a long, mid-word-cut prompt
+    /// fragment as its picker name in `codex /resume`. The fallback title
+    /// must read as a name: short, word-boundary-safe, ellipsized, with no
+    /// line breaks.
+    #[test]
+    fn test_untitled_session_gets_a_short_word_safe_title() {
+        let (_tmp, db) = db_with_schema();
+        let mut s = a_session();
+        s.title = None;
+        let long_prompt = "refactor the authentication middleware so that it validates
+            the session tokens generated by the token signing service before
+            they ever reach the request handler layer";
+        s.messages[0].text = Some(long_prompt.to_string());
+        let report = ensure_thread_rows(
+            &db,
+            &s,
+            Path::new("/home/harry/.codex/sessions/2026/07/30/rollout-x.jsonl"),
+            &["/home/harry/work".to_string()],
+        )
+        .unwrap();
+        assert!(report.title.chars().count() <= TITLE_MAX + 1, "title={:?}", report.title);
+        assert!(!report.title.contains('\n'), "title={:?}", report.title);
+        assert!(report.title.ends_with('…'), "title={:?}", report.title);
+        assert!(!report.title.contains("  "), "whitespace not collapsed: {:?}", report.title);
+        assert!(!report.title.contains("token"), "word cut mid-way: {:?}", report.title);
+    }
+
+    /// The fallback title truncation must not fire when the whole first
+    /// message already fits the budget.
+    #[test]
+    fn test_short_title_keeps_short_prompts_whole() {
+        assert_eq!(short_title("build a python program", TITLE_MAX), "build a python program");
+        assert_eq!(short_title("  spaced\nout   ", TITLE_MAX), "spaced out");
     }
 
     #[test]

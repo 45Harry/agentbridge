@@ -5,25 +5,27 @@ use serde_json::Value;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
 use walkdir::WalkDir;
-
-static CODEX_HOME: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
-    std::env::var("CODEX_HOME")
-        .ok()
-        .map(PathBuf::from)
-        .or_else(default_codex_dir)
-});
-
-fn default_codex_dir() -> Option<PathBuf> {
-    dirs_home().map(|h| h.join(".codex"))
-}
 
 /// The resolved codex home (`CODEX_HOME` override or the default), exposed
 /// for the sync write path so materialized copies land where this same
 /// connector reads from — see `sync::live_root`.
+///
+/// Resolved on every call rather than cached in a `LazyLock`. Caching it made
+/// the value depend on whichever code path happened to read it first in the
+/// process: a later `CODEX_HOME` change was ignored for the rest of the run.
+/// The sibling connectors (`claude_code::config_root`,
+/// `antigravity::write_home`) already re-read their env var each time, and the
+/// lookup is a single `getenv`.
 pub(crate) fn config_home() -> Option<PathBuf> {
-    CODEX_HOME.clone()
+    std::env::var("CODEX_HOME")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(default_codex_dir)
+}
+
+fn default_codex_dir() -> Option<PathBuf> {
+    dirs_home().map(|h| h.join(".codex"))
 }
 
 fn dirs_home() -> Option<PathBuf> {
@@ -120,7 +122,7 @@ impl Connector for CodexCliConnector {
 }
 
 fn sessions_dir() -> Option<PathBuf> {
-    CODEX_HOME.as_ref().map(|h| h.join("sessions"))
+    config_home().map(|h| h.join("sessions"))
 }
 
 struct CodexScanIter {

@@ -6,11 +6,15 @@ use clap::{Parser, Subcommand};
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
+mod dashboard;
+mod tui;
+
 #[derive(Parser)]
 #[command(name = "agentbridge", version, about = "Cross-tool session & memory bridge for AI coding agents")]
 struct Cli {
+    /// Open the interactive dashboard when omitted
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -54,6 +58,10 @@ enum Commands {
     #[command(name = "init")]
     Init,
 
+    /// Open the interactive dashboard TUI (same as running bare `agentbridge`)
+    #[command(name = "tui", visible_alias = "dashboard")]
+    Tui,
+
     /// Make every session on the machine visible in a directory, for every
     /// detected tool
     #[command(name = "sync")]
@@ -73,6 +81,12 @@ enum Commands {
         /// Show what would be recovered without writing
         #[arg(long)]
         dry_run: bool,
+
+        /// Skip the interactive prompt when a session has new work from more
+        /// than one tool — keep every tool's contribution, same as before
+        /// this prompt existed. Implied by --dry-run and by a non-TTY stdin.
+        #[arg(long)]
+        auto_merge: bool,
     },
 
     /// Keep sessions synced automatically
@@ -171,24 +185,52 @@ fn main() {
     let registry = connectors::all();
 
     match cli.command {
-        Commands::List { project, provider } => cmd_list(&registry, project, provider),
-        Commands::Index { provider } => cmd_index(&registry, provider),
-        Commands::Start { provider, passthrough, dry_run } => {
+        None => {
+            // Bare `agentbridge` = the dashboard, but only where a TUI can
+            // actually render; a piped/cron run must never enter full-screen
+            // mode. Non-TTY falls back to the static help, like a missing
+            // subcommand used to.
+            if std::io::stdin().is_terminal() {
+                let mut dash = crate::dashboard::Dashboard::new();
+                if let Err(e) = dash.run() {
+                    eprintln!("dashboard: {}", e);
+                    std::process::exit(1);
+                }
+            } else {
+                use clap::CommandFactory;
+                let _ = Cli::command().print_help();
+            }
+        }
+        Some(Commands::List { project, provider }) => cmd_list(&registry, project, provider),
+        Some(Commands::Index { provider }) => cmd_index(&registry, provider),
+        Some(Commands::Start { provider, passthrough, dry_run }) => {
             cmd_start(&registry, &provider, &passthrough, dry_run)
         }
-        Commands::Resume { session_id, target, project, dry_run, merge, copy } => {
+        Some(Commands::Resume { session_id, target, project, dry_run, merge, copy }) => {
             cmd_resume(&registry, &session_id, &target, project.as_deref(), dry_run, merge, copy)
         }
-        Commands::Inject { provider, session_ids, dry_run } => {
+        Some(Commands::Inject { provider, session_ids, dry_run }) => {
             cmd_inject(&registry, &provider, &session_ids, dry_run)
         }
-        Commands::Init => cmd_init(&registry),
-        Commands::Sync { project, dry_run } => cmd_sync(&registry, project.as_deref(), dry_run),
-        Commands::Pull { dry_run } => cmd_pull(dry_run),
-        Commands::Auto { action } => cmd_auto(&registry, action),
-        Commands::Status => cmd_status(),
-        Commands::Unsync { dry_run } => cmd_unsync(dry_run),
-        Commands::Info => cmd_info(&registry),
+        Some(Commands::Init) => cmd_init(&registry),
+        Some(Commands::Tui) => {
+            if std::io::stdin().is_terminal() {
+                let mut dash = crate::dashboard::Dashboard::new();
+                if let Err(e) = dash.run() {
+                    eprintln!("dashboard: {}", e);
+                    std::process::exit(1);
+                }
+            } else {
+                eprintln!("the dashboard needs a terminal — run it from a shell");
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Sync { project, dry_run }) => cmd_sync(&registry, project.as_deref(), dry_run),
+        Some(Commands::Pull { dry_run, auto_merge }) => cmd_pull(dry_run, auto_merge),
+        Some(Commands::Auto { action }) => cmd_auto(&registry, action),
+        Some(Commands::Status) => cmd_status(),
+        Some(Commands::Unsync { dry_run }) => cmd_unsync(dry_run),
+        Some(Commands::Info) => cmd_info(&registry),
     }
 }
 
@@ -487,6 +529,13 @@ fn cmd_resume(
                 });
             vec![data_dir]
         }
+        "antigravity" => match agentbridge::antigravity_write::store() {
+            Some(home) => vec![home],
+            None => {
+                eprintln!("Antigravity store not found (looked under ~/.gemini)");
+                return;
+            }
+        },
         _ => {
             eprintln!("Unknown target provider: {}", target);
             return;
@@ -585,14 +634,40 @@ fn cmd_resume(
                         Err(format!("opencode backup failed: {}", e))
                     } else {
                         match agentbridge::opencode_write::write_session(&db, &session, &dir) {
-                            Ok((id, _)) => Ok(PathBuf::from(id)),
+                            Ok((id, _, _)) => Ok(PathBuf::from(id)),
                             Err(e) => Err(e.to_string()),
                         }
                     }
                 }
             }
         }
-        _ => unreachable!(),
+        "antigravity" => match agentbridge::antigravity_write::ensure_safe_to_write() {
+            Err(e) => Err(e.to_string()),
+            Ok(()) => {
+                let dir = session.project_path().unwrap_or_default();
+                // The conversation is already ours: the write below only
+                // refreshes it, which needs no backup. A new one gets one first.
+                let index = agentbridge::antigravity_write::summaries_db(target_dir);
+                if index.is_file()
+                    && agentbridge::antigravity_write::will_insert(
+                        target_dir,
+                        &session,
+                        std::slice::from_ref(&dir),
+                    )
+                    && let Err(e) = agentbridge::antigravity_write::backup(&index)
+                {
+                    eprintln!("  ! antigravity backup failed: {}", e);
+                }
+                agentbridge::antigravity_write::write_session(target_dir, &session, &dir)
+                    .map(|row| row.body)
+                    .map_err(|e| e.to_string())
+            }
+        },
+        // Every target the CLI accepts must be handled above; `resume` parses
+        // `target` from a fixed list, so anything else is a programming error
+        // rather than bad input — but reporting it beats panicking on a user's
+        // machine.
+        other => Err(format!("resume into {} is not implemented", other)),
     };
 
     match result {
@@ -610,6 +685,15 @@ fn cmd_resume(
                     "run".to_string(),
                     "--session".to_string(),
                     path.to_string_lossy().to_string(),
+                ],
+                // The conversation id is the body's filename stem.
+                // `--conversation` per CONNECTORS.md §4 (verified agy 1.1.8).
+                "antigravity" => vec![
+                    "agy".to_string(),
+                    "--conversation".to_string(),
+                    path.file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default(),
                 ],
                 _ => vec![],
             };
@@ -799,8 +883,18 @@ fn cmd_unsync(dry_run: bool) {
     }
 }
 
-fn cmd_pull(dry_run: bool) {
-    let report = agentbridge::sync::pull_back(dry_run);
+fn cmd_pull(dry_run: bool, auto_merge: bool) {
+    // Dry-run never blocks for input — it only previews. A non-TTY stdin
+    // (piped, scripted, cron) can't answer a prompt either. `--auto-merge`
+    // is the explicit opt-out for scripts that want today's behavior. The
+    // full-screen picker (src/tui.rs) is only ever constructed here.
+    let interactive = !dry_run && !auto_merge && std::io::stdin().is_terminal();
+
+    let report = if interactive {
+        agentbridge::sync::pull_back_with(dry_run, &mut crate::tui::RatatuiConflictResolver)
+    } else {
+        agentbridge::sync::pull_back(dry_run)
+    };
     let total: usize = report.pulled.iter().map(|(_, n)| n).sum();
 
     if report.pulled.is_empty() {
@@ -821,6 +915,24 @@ fn cmd_pull(dry_run: bool) {
         );
         for (id, title) in &report.renamed {
             println!("  {:<40} -> {}", id, title);
+        }
+    }
+    if !report.conflicts.is_empty() {
+        println!(
+            "{} session(s) had new work from more than one tool:",
+            report.conflicts.len()
+        );
+        for (id, providers, choice) in &report.conflicts {
+            use agentbridge::sync::ConflictChoice;
+            let outcome = match choice {
+                ConflictChoice::MergeAll => "merged".to_string(),
+                ConflictChoice::KeepOnly(p) => format!("kept only {}", p),
+                ConflictChoice::Skip => "skipped — will ask again next pull".to_string(),
+            };
+            println!("  {:<40} {} -> {}", id, providers.join("+"), outcome);
+        }
+        if !interactive {
+            println!("  (non-interactive: use `agentbridge pull` from a terminal to choose)");
         }
     }
     for e in report.errors.iter().take(10) {

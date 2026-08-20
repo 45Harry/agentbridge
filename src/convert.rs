@@ -248,6 +248,35 @@ impl SessionConverter for ClaudeCodeConverter {
         Ok(out_path)
     }
 
+    /// Claude Code's directory-per-project layout means each variant needs
+    /// its own subtree, not a shared file distinguished only by name (unlike
+    /// Codex's flat `sessions/<date>/` — see `CodexCliConverter::convert_multi`).
+    /// `convert()` already derives that subtree from `session.project_id`, so
+    /// each directory just gets its own session variant with `project_id`
+    /// (and `cwd` inside the file) pointed at it, then a normal `convert()`.
+    ///
+    /// Was previously the trait's default (single-shot, ignoring `dirs`
+    /// entirely) — every directory past the first was silently dropped, so a
+    /// session materialized only wherever `--project` happened to point that
+    /// run, never at the `$HOME` fallback `target_dirs()` computes.
+    fn convert_multi(
+        &self,
+        session: &Session,
+        target_dir: &Path,
+        dirs: &[String],
+    ) -> Result<Vec<PathBuf>, String> {
+        if dirs.is_empty() {
+            return Err("claude-code materialization needs at least one directory".to_string());
+        }
+        dirs.iter()
+            .map(|dir| {
+                let mut variant = session.clone();
+                variant.project_id = dir.clone();
+                self.convert(&variant, target_dir)
+            })
+            .collect()
+    }
+
     fn resume_cmd(&self, session_path: &Path) -> Vec<String> {
         let session_id = session_path
             .file_stem()
@@ -1122,6 +1151,32 @@ mod tests {
         let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
         let expected: std::time::SystemTime = session.last_event_at.unwrap().into();
         assert_eq!(mtime, expected, "mtime must be the session's last activity, not sync time");
+    }
+
+    /// Regression: `convert_multi` used to fall back to the trait default,
+    /// which ignores every directory past the first — a session materialized
+    /// via `sync` only ever reached wherever `--project` pointed that run,
+    /// never the `$HOME` fallback `target_dirs()` computes.
+    #[test]
+    fn test_claude_convert_multi_writes_one_file_per_directory() {
+        let session = test_session();
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = vec!["/home/user/test-project".to_string(), "/home/user".to_string()];
+        let paths = ClaudeCodeConverter::new()
+            .convert_multi(&session, tmp.path(), &dirs)
+            .expect("conversion should succeed");
+
+        assert_eq!(paths.len(), 2, "one file per directory");
+        assert_ne!(paths[0], paths[1], "files must not collide");
+
+        for (dir, path) in dirs.iter().zip(&paths) {
+            let loaded = crate::connectors::claude_code::load_file(path, &session.id).unwrap();
+            assert_eq!(&loaded.project_id, dir, "cwd must match the requested directory");
+        }
+
+        // Re-running must produce the same paths (idempotency).
+        let again = ClaudeCodeConverter::new().convert_multi(&session, tmp.path(), &dirs).unwrap();
+        assert_eq!(paths, again, "paths must be deterministic");
     }
 
     /// Self-consistency: a file written by the Claude Code converter must be

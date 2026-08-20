@@ -94,6 +94,16 @@ pub fn watch(
                     pulled
                 );
             }
+            if !r.conflicts.is_empty() {
+                // An unattended daemon can't prompt, so it merges (AutoMerge,
+                // same as always) and just flags it for the operator to
+                // revisit interactively if that wasn't the right call.
+                println!(
+                    "[agentbridge] {} session(s) had new work from more than one tool \
+                     (auto-merged) — run `agentbridge pull` from a terminal to choose",
+                    r.conflicts.len()
+                );
+            }
             last = now;
         }
 
