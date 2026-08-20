@@ -914,7 +914,7 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
                     report.errors.push(format!("antigravity {}", e));
                 }
                 for row in rows {
-                    report.created.push(LinkRecord {
+                    let record = LinkRecord {
                         // The body is the artifact a pull re-reads, so it is
                         // the `dest`; `unsync` removes it and its index row
                         // together by the marker.
@@ -932,7 +932,24 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
                         // source's `None` here would make every untitled
                         // session look renamed on the next pull.
                         title: Some(row.title),
-                    });
+                    };
+                    // A re-sync rewrites the same conversation in place, so the
+                    // manifest row must be *updated*, not appended — otherwise
+                    // every run adds another row per conversation and `pull`
+                    // reads one session as several tools' worth of new work
+                    // (observed as "antigravity+antigravity+antigravity" in a
+                    // conflict report). The file targets do the same thing via
+                    // their `unchanged` branch below.
+                    if let Some(existing) = manifest
+                        .iter_mut()
+                        .find(|r| r.session_id == record.session_id && r.dest == record.dest)
+                    {
+                        *existing = record;
+                        manifest_dirty = true;
+                        report.unchanged += 1;
+                    } else {
+                        report.created.push(record);
+                    }
                 }
                 continue;
             }
@@ -1596,6 +1613,42 @@ mod tests {
             first,
             "agentbridge's own antigravity conversations must never become sources"
         );
+    }
+
+    /// Regression: the antigravity branch always *appended* its manifest rows,
+    /// so every re-sync added another row per conversation. `pull` then read a
+    /// single session as several tools' worth of new work and reported a
+    /// conflict against itself ("antigravity+antigravity+antigravity").
+    #[test]
+    fn test_resync_updates_antigravity_manifest_rows_instead_of_appending() {
+        let _sb = Sandbox::new();
+        let live = live_root("claude-code").unwrap();
+        write_native_claude_session(&live, "/tmp/merge-project");
+        make_agy_store();
+        let registry = agy_registry(live);
+
+        sync_into(&registry, Path::new("/tmp/merge-project"), false);
+        let after_first = read_manifest().len();
+        sync_into(&registry, Path::new("/tmp/merge-project"), false);
+        sync_into(&registry, Path::new("/tmp/merge-project"), false);
+        assert_eq!(
+            read_manifest().len(),
+            after_first,
+            "re-syncing must refresh manifest rows, not add more"
+        );
+
+        // And exactly one row per (session, dest).
+        let rows = read_manifest();
+        let mut seen: std::collections::HashSet<(String, PathBuf)> =
+            std::collections::HashSet::new();
+        for r in rows.iter().filter(|r| r.target_provider == "antigravity") {
+            assert!(
+                seen.insert((r.session_id.clone(), r.dest.clone())),
+                "duplicate manifest row for {} -> {}",
+                r.session_id,
+                r.dest.display()
+            );
+        }
     }
 
     /// Write-back out of antigravity: turns appended to the materialized
