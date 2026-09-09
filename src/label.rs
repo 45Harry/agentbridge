@@ -172,6 +172,16 @@ pub fn apply(session: &mut Session) {
     session.title = Some(build(session));
 }
 
+/// The `resume` command's rule, kept in one place so it can be tested: an
+/// on-demand cross-tool copy is labeled exactly like a synced one, but a
+/// native resume into the session's own tool (re)writes the origin file, so
+/// its user-chosen title must never be replaced by a label.
+pub fn apply_for_resume(session: &mut Session, target: &str) {
+    if session.provider != target {
+        apply(session);
+    }
+}
+
 /// The name portion: the session's own name, kept **exactly** as the tool
 /// recorded it, with only any label agentbridge previously wrote removed.
 ///
@@ -452,5 +462,28 @@ mod tests {
         again.title = Some(label.clone());
         apply(&mut again);
         assert_eq!(again.title.unwrap(), label, "still idempotent");
+    }
+
+    /// A `resume` copy written into *another* tool is labeled exactly like a
+    /// synced copy: the original name is kept, and the date is the session's
+    /// own start — never the day the resume happened.
+    #[test]
+    fn test_resume_copy_across_tools_is_labeled_with_original_date_and_name() {
+        let mut s = session("claude-code", Some("Payroll migration"));
+        apply_for_resume(&mut s, "opencode");
+        let label = parse(s.title.as_deref().unwrap()).expect("resumed copy is labeled");
+        assert_eq!(label.provider, "claude-code");
+        assert_eq!(label.name, "Payroll migration");
+        assert_eq!(label.stamp, "2026-07-31 10:00", "original date, not the resume date");
+        assert_eq!(label.id, "aaaaaaaa");
+    }
+
+    /// Resuming a session inside its own tool rewrites the origin file, whose
+    /// title is the user's — `apply_for_resume` must leave it untouched.
+    #[test]
+    fn test_native_resume_never_relabels_the_origin() {
+        let mut s = session("claude-code", Some("My Important Session"));
+        apply_for_resume(&mut s, "claude-code");
+        assert_eq!(s.title.as_deref(), Some("My Important Session"));
     }
 }
