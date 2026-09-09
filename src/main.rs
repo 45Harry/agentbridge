@@ -508,6 +508,15 @@ fn cmd_resume(
         }
     }
 
+    // The copy `resume` writes into the target carries the same cross-tool
+    // label `sync` stamps on every materialized copy (origin tool · name ·
+    // the session's own start time · id). So a resumed conversation correlates
+    // with its siblings in the other pickers, keeps an existing name/title
+    // verbatim, and shows its original date — never the resume date. Native
+    // resume into the session's own tool is excluded: that path (re)writes the
+    // origin file itself, and a tool's own session titles are never rewritten.
+    agentbridge::label::apply_for_resume(&mut session, target);
+
     let target_dirs = match target {
         "claude-code" => {
             let root = agentbridge::sync::claude_live_root().unwrap_or_else(|| {

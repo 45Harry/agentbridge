@@ -4,14 +4,14 @@ Pick this project up cold — new machine, new session, no memory of prior
 conversation. Read this, then `DESIGN.md` (architecture and why), then
 `CONNECTORS.md` (each tool's on-disk format).
 
-**Last updated:** 2026-08-18.
+**Last updated:** 2026-08-19.
 
 ## 0. Start here
 
 ```bash
 git clone git@github.com:45Harry/agentbridge.git
 cd agentbridge
-cargo build && cargo test      # 97 tests pass (+2 ignored: live-verification suites)
+cargo build && cargo test      # 145 tests pass (+2 ignored: live-verification suites)
 cargo run -- init              # read-only: what's on this machine
 ```
 
@@ -32,21 +32,35 @@ Codex anywhere on the box, continue where Claude left off.
 Delivered as a **write-back sync loop**, verified live on the operator's
 machine: `init` once + `auto install` (shell hook) + `auto watch` (daemon).
 New sessions are picked up and propagated within ~15–30s, turns appended in
-one tool are pulled into the overlay and republished. See DECISIONS.md
-(2026-08-01) for why native *picker listing* was dropped as a requirement.
+one tool are pulled into the overlay and republished.
 
-## 2. Current state — verified live 2026-08-01
+DECISIONS.md (2026-08-01) dropped native *picker listing* as a requirement,
+but that was later reversed per tool once each vendor's index was actually
+understood: Codex gets `threads` rows (2026-08-01), OpenCode gets `session`
+rows, and Antigravity gets a `conversation_summaries` row plus a conversation
+body (2026-08-19). So synced sessions **do** appear in each tool's own picker
+today — read those three decisions together rather than the first one alone.
+
+## 2. Current state — verified live 2026-08-19
 
 **On the operator's machine, the loop is running and proven:**
 
-- `auto watch` (PID noted in §7) re-scans every 15s; `init` reports 50
-  sessions across 4 tools (Claude Code, Codex CLI, OpenCode, Antigravity CLI).
+- `auto watch` (PID noted in §7) re-scans every 15s; `init` reports 11,219
+  sessions across 4 tools (Claude Code 3,714, Codex CLI 5,365, OpenCode 2,115,
+  Antigravity 25) in 23 project directories.
+- **All four connectors are bidirectional** — every tool is both a discovery
+  source and a write target. Antigravity was the last read-only one (§2g).
+- Every synced copy carries a cross-tool label in its title —
+  `provider · name · started_at · id[..8]` — so one conversation is
+  recognizable in all four pickers (§2h).
 - A fake Codex session dropped into `~/.codex/sessions/` surfaced as a
   UUIDv5 claude artifact in `~/.claude/projects/<encoded-dir>/` within 35s,
   then cleaned up.
-- Antigravity: **read and write, all stores** — see §2g. 24 conversations /
-  733 messages load across `antigravity-cli` and `antigravity-ide`; foreign
-  sessions materialize into agy's own picker.
+- Antigravity: **read and write, all stores** — see §2g. 25 conversations
+  load across `antigravity-cli` (12) and `antigravity-ide` (13); foreign
+  sessions materialize into agy's own picker. The IDE store gained one
+  conversation between the §2g measurement (24 / 733 messages) and this one,
+  which is the multi-home scan working.
 - Write-back: `sync` pulls turns appended in any tool into the overlay and
   republishes (WRITE-BACK-OK markers verified in the claude copies).
 - OpenCode write path proven against the real database (sessions created by
@@ -896,8 +910,9 @@ invariant 2, `ClaudeCodeConverter::convert_multi`, and the Codex
 
 ## 7. Repo hygiene
 
-- Public: `https://github.com/45Harry/agentbridge`, branch `master`.
-- Keep tests green (143 + 2 ignored); add a regression test for every bug, and
+- Public: `https://github.com/45Harry/agentbridge`. Work lands on `develop`;
+  `master` is the release branch (merged via PR).
+- Keep tests green (145 + 2 ignored); add a regression test for every bug, and
   verify format changes against the real binary before believing them.
 - Never commit session data. `~/.agentbridge` is never the source of fixtures.
 - Ignored tests are the real-data checks: run them explicitly after any

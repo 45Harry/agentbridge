@@ -75,7 +75,9 @@ agentbridge sync                        # surface all sessions here, for all too
 claude --resume <id>                    # continue any session in Claude Code
 codex resume <id>                       # ...or in Codex
 agentbridge resume <id> opencode        # ...or in OpenCode
+agentbridge resume <id> antigravity     # ...or in Antigravity
 agentbridge status                      # what has new work since the last sync
+agentbridge pull                        # recover turns/renames made in any tool
 ```
 
 ### Try it safely first
@@ -87,8 +89,11 @@ agentbridge status                      # what has new work since the last sync
 agentbridge sync --dry-run
 ```
 
-`agentbridge unsync` removes exactly what `sync` created (files verified by
-inode, OpenCode rows by marker) and never deletes recovered work.
+`agentbridge unsync` removes exactly what `sync` created — files verified by
+inode, and database rows by a marker column no tool of its own uses (OpenCode
+`session`, Codex `threads`, Antigravity `conversation_summaries` plus the
+conversation body). It never deletes recovered work: turns pulled back from
+another tool live in an overlay `unsync` leaves alone.
 
 ## Commands
 
@@ -149,7 +154,8 @@ corrupt. See `CONNECTORS.md` §7.
 ## Tracking one session across tools
 
 Every synced copy is titled with the same label, so the four picker rows for
-one conversation are recognizably the same conversation:
+one conversation are recognizably the same conversation. `resume` stamps the
+copies it writes with that same label too:
 
 ```
 claude-code · My Important Session · 2026-08-19 10:00 · aaaaaaaa
