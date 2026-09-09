@@ -196,7 +196,12 @@ fn display_name(session: &Session) -> String {
         // Whitespace is collapsed so the name occupies one picker row; the
         // wording itself is untouched.
         let bare = normalize_whitespace(strip(t));
-        if !bare.is_empty() {
+        // A bare-id placeholder (`"{provider} session {id}"`) is not a name a
+        // user or tool chose: versions before labels wrote it for every
+        // nameless session, so keeping it verbatim would list a bare id
+        // forever. Treat such a session as unnamed and derive a real name
+        // from the opening message.
+        if !bare.is_empty() && !is_generic_fallback(session, &bare) {
             return bare;
         }
     }
@@ -217,6 +222,23 @@ fn display_name(session: &Session) -> String {
 
 fn normalize_whitespace(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// True when `title` is agentbridge's own generic placeholder
+/// (`"{provider} session {id}"`), which versions before labels wrote into
+/// copies of nameless sessions. Such a placeholder looks exactly like a bare
+/// id once round-tripped, so `display_name` skips it and derives a name from
+/// the opening message. A real user title never matches: the tail must be
+/// id-shaped and at least 8 chars, which user-chosen wording effectively
+/// never is.
+fn is_generic_fallback(session: &Session, title: &str) -> bool {
+    let Some(rest) = title.strip_prefix(&format!("{} session ", session.provider)) else {
+        return false;
+    };
+    rest.chars().count() >= ID_LEN
+        && rest
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 /// Truncate on a word boundary. A name that changed shape between runs would
@@ -285,6 +307,37 @@ mod tests {
         assert_eq!(parsed.name, "Wire up the bridge");
         assert_eq!(parsed.stamp, "2026-07-31 10:00");
         assert_eq!(parsed.id, "aaaaaaaa");
+    }
+
+    /// The exact complaint found live 2026-09-09: pre-label agentbridge wrote
+    /// the generic `"{provider} session {id}"` placeholder into nameless
+    /// copies, and it round-tripped into their source titles. Keeping it
+    /// verbatim would list a bare id in every picker forever, so the label
+    /// must treat it as "no name" and derive a real one from the opening
+    /// message instead.
+    #[test]
+    fn test_generic_placeholder_is_not_kept_as_a_name() {
+        let s = session(
+            "claude-code",
+            Some("claude-code session aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
+        );
+        let label = build(&s);
+        let parsed = parse(&label).expect("own label must parse");
+        assert_eq!(
+            parsed.name,
+            "wire up the bridge",
+            "the placeholder must be replaced by the message preview"
+        );
+    }
+
+    /// A real title that merely *starts* like the placeholder (but is not
+    /// id-shaped) is a user-chosen name and must be kept exactly.
+    #[test]
+    fn test_real_title_looking_like_a_placeholder_is_kept() {
+        let s = session("claude-code", Some("claude-code session notes"));
+        let label = build(&s);
+        let parsed = parse(&label).expect("own label must parse");
+        assert_eq!(parsed.name, "claude-code session notes");
     }
 
     /// The whole point: the same origin session labels identically no matter

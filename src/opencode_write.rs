@@ -267,6 +267,45 @@ pub fn write_sessions(
     (rows, errors)
 }
 
+/// A short, meaningful name for a session that has none, derived from its
+/// opening user message. This replaces the old `"{provider} session {id}"`
+/// placeholder, which listed a bare id in every picker and, once
+/// round-tripped, was indistinguishable from a real title. Like the Codex
+/// fallback this never cuts a word in half and marks truncation, so the row
+/// reads as a name rather than a raw slice of the prompt.
+fn fallback_title(session: &Session) -> String {
+    const MAX: usize = 60;
+    let preview = session
+        .messages
+        .iter()
+        .find(|m| m.role == Role::User && m.text.as_deref().is_some_and(|t| !t.trim().is_empty()))
+        .and_then(|m| m.text.as_deref())
+        .map(|t| t.split_whitespace().collect::<Vec<_>>().join(" "))
+        .unwrap_or_default();
+    if preview.is_empty() {
+        // No message to name it by (a metadata-only record); keep a stable,
+        // non-empty placeholder distinct from the old bare-id one so it never
+        // matches `label::is_generic_fallback`.
+        return format!("{} session {}", session.provider, session.id);
+    }
+    if preview.chars().count() <= MAX {
+        return preview;
+    }
+    let budget = MAX.saturating_sub(1);
+    let mut cut = String::new();
+    for word in preview.split(' ') {
+        let candidate = if cut.is_empty() { word.to_string() } else { format!("{cut} {word}") };
+        if candidate.chars().count() > budget {
+            break;
+        }
+        cut = candidate;
+    }
+    if cut.is_empty() {
+        cut = preview.chars().take(budget).collect();
+    }
+    format!("{cut}…")
+}
+
 /// Insert (or refresh) `session` so it appears in OpenCode's own picker for
 /// `directory`. Returns the OpenCode session id used.
 pub fn write_session(
@@ -288,7 +327,7 @@ pub fn write_session(
     let title = session
         .title
         .clone()
-        .unwrap_or_else(|| format!("{} session {}", session.provider, session.id));
+        .unwrap_or_else(|| fallback_title(session));
     let metadata = json!({
         MARKER: true,
         "source_provider": session.provider,
