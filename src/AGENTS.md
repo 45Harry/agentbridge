@@ -28,6 +28,7 @@ The whole crate. The library (`lib.rs` and the modules it lists) does discovery,
 - Code outside `connectors/` works on `model.rs` types, not on a tool's native shapes.
 - Every module that writes into another tool's live database follows the same gates: back the database up before the first real insert of a run, tag every row agentbridge creates, refuse to write while that tool is running, and render statements under `--dry-run` without running them.
 - Read env overrides on every call. Do not cache them in a `LazyLock` or a static; that made `CODEX_HOME` first reader wins.
+- Tests that need the built binary (a CLI flag, an env override) live in `tests/*.rs` and run it with every store variable pointed at a temp dir.
 - Tests live beside the code in `#[cfg(test)]` modules. Tests that touch env vars go through `Sandbox::new()` in `sync.rs`, which holds a lock and redirects `HOME` and every store variable into a temp dir.
 - Assert on content, not on "not empty". A test that cannot tell 1 message from 40 is not testing the decoder.
 
@@ -40,6 +41,9 @@ The whole crate. The library (`lib.rs` and the modules it lists) does discovery,
 - A copy must say it is a copy without the manifest: its title is a label naming another origin, or (Codex, which has no title) its first record carries an `agentbridge` origin. `label::is_copy` reads both. Judge it on the entry's own file, since a copy can share its origin's id.
 - `sync` and `pull` take `sync.lock` in the data dir. The shell hook starts many runs at once; without the lock they copy each other's copies.
 - Before writing a file target, check what is already there. A file that is not in the manifest and is not a copy belongs to the tool and is left alone.
+- agy rebuilds its index when it starts and blanks the title and marker on rows it did not write. Recognise and replace agentbridge's agy rows by their version 5 id (`antigravity_write::is_derived_id`), never by the marker alone.
+- A fresh OpenCode database has no `global` project row. `opencode_write::write_session` creates it; any other insert path must too, or the foreign key fails.
+- The shell hook runs `sync --changed`: it compares a stored fingerprint and shares only sessions changed since the last run (`sync_into_since`). Leave SQLite's `-shm` file out of that fingerprint; reading a database changes it.
 - SQLite WAL writes do not change the `.db` mtime. The fingerprint also stats the `-wal` and `-shm` siblings.
 - `proto_varint` returns the end offset, not a length. Use `i = n`, not `i += n`.
 - Rank and label sessions by timestamps inside the file, not by file mtime. Tools rewrite files on compaction and title changes.

@@ -28,6 +28,9 @@ cargo test
 # Real data checks (ignored by default, run after any connector change)
 cargo test -- --ignored
 
+# Live check across the real tools (real model calls; --quick for fewer)
+python3 test.py
+
 # Install the binary from this checkout
 cargo install --path .
 ```

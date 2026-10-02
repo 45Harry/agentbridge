@@ -21,6 +21,8 @@ One reader per supported tool. Each file implements the `Connector` trait from `
 - `detect()` is existence checks only. `roots()` honors the tool's own env override before the default path.
 - `scan()` is lazy and metadata only. One unreadable session becomes an `Err` item; it never aborts the scan.
 - If a body is missing but metadata survives, yield a `RawSession` with `body_available: false` instead of dropping the session.
+- For Claude Code, sessions are only the files under `projects/` in the config folder. Other `.jsonl` files beside it (`history.jsonl`) are not sessions.
+- When a format has no title, `load` hands the first record through in `raw_payload` (Codex does), so `label::is_copy` can see an origin record agentbridge wrote.
 - Read the project path from the `cwd` or project field inside the records. Never decode it from the directory name; that encoding is lossy.
 - Open another tool's SQLite database with `SQLITE_OPEN_READ_ONLY | SQLITE_OPEN_URI`, never for writing and never with `immutable=1`.
 - Tolerate a truncated last line, bytes that are not UTF-8, and empty files without a panic.
