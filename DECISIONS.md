@@ -683,7 +683,8 @@ launches it: `opencode run -s` answers but never exits when `PWD` does not
 match the working folder, so `test.py` sets `PWD` for every tool it starts.
 
 **Result.** `python3 test.py` across all four tools: 4 sessions created, the
-same label and date in every tool, 12 of 12 cross tool questions answered from
+same label and date in every tool, 11 of 12 cross tool questions answered from
 history, 12 of 12 written back into the remaining tools, and a repeat sync
-changed nothing. (One run had a single model refusal from Codex; the question
-was reworded and a refused question is now asked once more.) Tests 175 → 181.
+changed nothing. The one miss was Codex declining to repeat the word on a
+session started in Claude Code. The question was reworded, a declined question
+is now asked once more, and that pair passed on a rerun. Tests 175 → 181.
