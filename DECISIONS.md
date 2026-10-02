@@ -650,3 +650,40 @@ Result with Claude Code 2.1.287, Codex 0.160.0 (logged in) and agy 1.1.27:
 every access and write back check passed in a full run (9 pairs) and a quick
 run, and a repeat sync changed nothing. OpenCode 1.18.30 still cannot answer
 on this machine, so it was checked as a session origin only. Tests 174 → 175.
+
+## 2026-10-02 (late) — The hook only works when something is new; partial unsync; OpenCode upgrade
+
+**The hook no longer runs a full sync in every shell.** Measured under the
+operator's default Claude profile: 23,780 sessions, 68,143 copies, over eight
+minutes per new terminal. Their objection was the right one: a sync should
+happen when a session is created, not whenever a terminal opens.
+
+`sync --changed` is what the hook runs now. It takes one cheap look at every
+store (the fingerprint `auto watch` already used) and stops if it matches the
+last run. Otherwise it shares only sessions whose last event or file time is
+at or after the previous run's start; the first run reaches back 7 days. State
+lives in `~/.agentbridge/last-sync.json`. Same machine: 83 copies in 6 seconds
+for the first run, then "Nothing new" in under a second.
+
+SQLite's `-shm` file is left out of the stored fingerprint. It changes when a
+database is only read, so agentbridge's own look at OpenCode made every run
+see a change.
+
+A full `agentbridge sync` is unchanged and still publishes everything.
+
+**`unsync --project <dir>` and `--session <id>`.** Removes only those copies,
+one at a time, and keeps every other manifest row. It waits behind a running
+sync. `test.py` uses it to clean up after itself (`--keep` leaves things).
+agy's removal helpers now also match by version 5 id, since agy blanks the
+marker.
+
+**OpenCode 1.18.30 could not answer; 1.18.34 can.** The crash was in that
+build. With 1.18.34, OpenCode is checked both ways. One trap for anything that
+launches it: `opencode run -s` answers but never exits when `PWD` does not
+match the working folder, so `test.py` sets `PWD` for every tool it starts.
+
+**Result.** `python3 test.py` across all four tools: 4 sessions created, the
+same label and date in every tool, 12 of 12 cross tool questions answered from
+history, 12 of 12 written back into the remaining tools, and a repeat sync
+changed nothing. (One run had a single model refusal from Codex; the question
+was reworded and a refused question is now asked once more.) Tests 175 → 181.

@@ -852,6 +852,55 @@ fn merge_back_native(
 }
 
 pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncReport {
+    sync_into_since(registry, project, dry_run, None)
+}
+
+/// When a session last changed, as far as a cheap look can tell: its own last
+/// event, or the time its file was last written. Tools append to a transcript
+/// long after the first record a scan reads, so the file time is what catches
+/// a session that is still being worked on.
+fn changed_at(e: &crate::index::IndexEntry) -> Option<chrono::DateTime<chrono::Utc>> {
+    // OpenCode's file is one database shared by every session; its time says
+    // nothing about any one of them.
+    let file = (e.provider != "opencode")
+        .then(|| fs::metadata(&e.source_path).ok()?.modified().ok())
+        .flatten()
+        .map(chrono::DateTime::<chrono::Utc>::from);
+    [e.last_event_at, e.started_at, file].into_iter().flatten().max()
+}
+
+/// The state `sync --changed` keeps between runs: when the last one started,
+/// and a fingerprint of every session store as it finished.
+fn sync_state_path() -> PathBuf {
+    data_dir().join("last-sync.json")
+}
+
+pub fn last_sync_state() -> Option<(chrono::DateTime<chrono::Utc>, String)> {
+    let v: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(sync_state_path()).ok()?).ok()?;
+    let at = chrono::DateTime::parse_from_rfc3339(v.get("at")?.as_str()?).ok()?;
+    Some((at.with_timezone(&chrono::Utc), v.get("fingerprint")?.as_str()?.to_string()))
+}
+
+pub fn record_sync_state(at: chrono::DateTime<chrono::Utc>, fingerprint: &str) -> std::io::Result<()> {
+    fs::create_dir_all(data_dir())?;
+    fs::write(
+        sync_state_path(),
+        serde_json::json!({ "at": at.to_rfc3339(), "fingerprint": fingerprint }).to_string(),
+    )
+}
+
+/// `sync_into`, limited to sessions that changed at or after `since`.
+///
+/// This is what makes an automatic sync cheap: a machine holds thousands of
+/// old sessions, and re-publishing all of them every time one new session
+/// appears costs minutes. `None` means every session, as `sync_into` does.
+pub fn sync_into_since(
+    registry: &Registry,
+    project: &Path,
+    dry_run: bool,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+) -> SyncReport {
     let mut report = SyncReport::default();
     let _lock = if dry_run {
         None
@@ -864,7 +913,12 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
             }
         }
     };
-    let index: Index = discover(registry);
+    let mut index: Index = discover(registry);
+    if let Some(since) = since {
+        // Dropped before anything is opened: judging whether an entry is a
+        // copy means reading its file, and that is the cost being avoided.
+        index.entries.retain(|e| changed_at(e).is_some_and(|t| t >= since));
+    }
 
     // OpenCode and Antigravity have no live_root (rows/per-conversation
     // databases, not linkable files) but are still valid targets.
@@ -1450,6 +1504,119 @@ fn ensure_codex_row(
 
 /// Remove exactly the files agentbridge created. A destination whose inode
 /// no longer matches the manifest belongs to something else now and is kept.
+/// Which copies a partial `unsync` takes away. Empty means everything.
+#[derive(Debug, Default, Clone)]
+pub struct UnsyncFilter {
+    /// Copies written by a sync of this folder.
+    pub project: Option<PathBuf>,
+    /// Copies of these sessions, wherever they were written.
+    pub sessions: Vec<String>,
+}
+
+impl UnsyncFilter {
+    fn is_empty(&self) -> bool {
+        self.project.is_none() && self.sessions.is_empty()
+    }
+
+    fn matches(&self, r: &LinkRecord) -> bool {
+        self.project.as_deref() == Some(r.project.as_path())
+            || self.sessions.contains(&r.session_id)
+    }
+}
+
+/// `unsync` for part of the machine: only the copies `filter` names are
+/// removed, one by one, and every other manifest row is kept. A copy whose
+/// tool is open is left in the manifest for a later run.
+pub fn unsync_matching(dry_run: bool, filter: &UnsyncFilter) -> UnsyncReport {
+    if filter.is_empty() {
+        return unsync(dry_run);
+    }
+    let mut report = UnsyncReport::default();
+    // This rewrites the manifest, so it waits its turn behind a running sync
+    // rather than racing it. After two minutes it goes ahead: a lock that old
+    // is far more likely a run that died than one still working.
+    let _lock = if dry_run {
+        None
+    } else {
+        let mut lock = acquire_run_lock();
+        for _ in 0..240 {
+            if lock.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            lock = acquire_run_lock();
+        }
+        lock
+    };
+    let records = read_manifest();
+    let mut keep: Vec<LinkRecord> = Vec::new();
+
+    for r in records {
+        if !filter.matches(&r) {
+            keep.push(r);
+            continue;
+        }
+        if dry_run {
+            report.removed.push(r.dest.clone());
+            continue;
+        }
+        let id = materialized_id(&r);
+        let removed = match r.target_provider.as_str() {
+            "opencode" => {
+                crate::opencode_write::ensure_safe_to_write().is_ok()
+                    && crate::opencode_write::remove_one(&r.dest, &id).is_ok()
+            }
+            "antigravity" => {
+                crate::antigravity_write::ensure_safe_to_write().is_ok()
+                    && crate::antigravity_write::store()
+                        .is_some_and(|home| crate::antigravity_write::remove_one(&home, &id).is_ok())
+            }
+            _ => match fs::metadata(&r.dest) {
+                Err(_) => {
+                    report.missing += 1;
+                    continue;
+                }
+                Ok(meta) if meta.ino() != r.inode => {
+                    report.kept_foreign.push(r.dest.clone());
+                    keep.push(r);
+                    continue;
+                }
+                Ok(_) => {
+                    if r.target_provider == "codex-cli"
+                        && let Some(db) = crate::codex_write::state_db()
+                        && crate::codex_write::ensure_safe_to_write().is_ok()
+                    {
+                        let _ = crate::codex_write::remove_rows_for_path(&db, &r.dest);
+                    }
+                    let gone = fs::remove_file(&r.dest).is_ok();
+                    if gone
+                        && let Some(parent) = r.dest.parent()
+                        && fs::read_dir(parent).map(|mut d| d.next().is_none()).unwrap_or(false)
+                    {
+                        let _ = fs::remove_dir(parent);
+                    }
+                    gone
+                }
+            },
+        };
+        if removed {
+            report.removed.push(r.dest.clone());
+        } else {
+            report.kept_foreign.push(r.dest.clone());
+            keep.push(r);
+        }
+    }
+
+    if !dry_run {
+        let body: String = keep
+            .iter()
+            .map(|r| serde_json::to_string(r).unwrap_or_default() + "\n")
+            .collect();
+        let _ = fs::write(manifest_path(), body);
+    }
+    report
+}
+
 pub fn unsync(dry_run: bool) -> UnsyncReport {
     let mut report = UnsyncReport::default();
     let records = read_manifest();
@@ -2237,6 +2404,89 @@ mod tests {
             before,
             "the session file Claude Code owns must be byte for byte untouched"
         );
+    }
+
+    /// `unsync --project` takes away what one folder's sync wrote and nothing
+    /// else: the other folder's copies, the manifest rows for them, and every
+    /// session a tool owns all stay.
+    #[test]
+    fn test_unsync_for_one_project_leaves_the_rest() {
+        let _sb = Sandbox::new();
+        let live = live_root("claude-code").unwrap();
+        write_native_claude_session(&live, "/tmp/merge-project");
+        let db = make_opencode_db();
+        insert_native_opencode_session(&db, "ses_native0001tailAAAA", "/tmp/other", "started in opencode");
+        let registry = opencode_registry(live.clone());
+
+        sync_into(&registry, Path::new("/tmp/project-a"), false);
+        sync_into(&registry, Path::new("/tmp/project-b"), false);
+        let before = read_manifest();
+        let in_a = before.iter().filter(|r| r.project == Path::new("/tmp/project-a")).count();
+        assert!(in_a > 0 && in_a < before.len(), "both folders have copies: {in_a} of {}", before.len());
+
+        let report = unsync_matching(
+            false,
+            &UnsyncFilter { project: Some(PathBuf::from("/tmp/project-a")), sessions: vec![] },
+        );
+        assert_eq!(report.removed.len(), in_a, "exactly that folder's copies");
+
+        let after = read_manifest();
+        assert_eq!(after.len(), before.len() - in_a, "the other rows are kept");
+        assert!(after.iter().all(|r| r.project != Path::new("/tmp/project-a")));
+        for r in &after {
+            if r.target_provider == "claude-code" {
+                assert!(r.dest.exists(), "another folder's copy must survive: {}", r.dest.display());
+            }
+        }
+        let conn = Connection::open(&db).unwrap();
+        let native: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session WHERE id = 'ses_native0001tailAAAA'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(native, 1, "OpenCode's own session is untouched");
+
+        // By session: every copy of one session, wherever it was written.
+        let report = unsync_matching(
+            false,
+            &UnsyncFilter { project: None, sessions: vec![NATIVE_UUID.to_string()] },
+        );
+        assert!(!report.removed.is_empty());
+        assert!(read_manifest().iter().all(|r| r.session_id != NATIVE_UUID));
+    }
+
+    /// A sync limited to what changed leaves older sessions alone. This is
+    /// what lets an automatic sync run without re-publishing a machine's whole
+    /// history every time.
+    #[test]
+    fn test_sync_since_only_touches_sessions_that_changed() {
+        let _sb = Sandbox::new();
+        let live = live_root("claude-code").unwrap();
+        write_native_claude_session(&live, "/tmp/merge-project");
+        let db = make_opencode_db();
+        let registry = opencode_registry(live);
+        let project = Path::new("/tmp/elsewhere");
+
+        // Nothing changed after this moment, so nothing is written.
+        let later = chrono::Utc::now() + chrono::Duration::hours(1);
+        let report = sync_into_since(&registry, project, false, Some(later));
+        assert!(report.created.is_empty(), "an old session is left alone: {:?}", report.created);
+        assert_eq!(crate::opencode_write::count_written(&db), 0);
+
+        // The session file was written a moment ago, so a window that starts
+        // before that takes it.
+        let earlier = chrono::Utc::now() - chrono::Duration::hours(1);
+        let report = sync_into_since(&registry, project, false, Some(earlier));
+        assert!(!report.created.is_empty(), "a session changed since then is published");
+    }
+
+    #[test]
+    fn test_sync_state_round_trips() {
+        let _sb = Sandbox::new();
+        assert!(last_sync_state().is_none(), "no state before the first run");
+        let at = chrono::Utc::now();
+        record_sync_state(at, "abc123").unwrap();
+        let (read_at, fp) = last_sync_state().expect("state is read back");
+        assert_eq!(fp, "abc123");
+        assert_eq!(read_at.timestamp(), at.timestamp());
     }
 
     /// Two syncs at once is the race above. The second one must stand down.

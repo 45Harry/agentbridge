@@ -564,6 +564,19 @@ pub fn remove_all(db: &Path) -> Result<usize, WriteError> {
     .map_err(|e| WriteError::Sql(e.to_string()))
 }
 
+/// Remove one session row agentbridge inserted. A row without the marker is
+/// OpenCode's own and is left alone.
+pub fn remove_one(db: &Path, id: &str) -> Result<usize, WriteError> {
+    let conn = Connection::open(db).map_err(|e| WriteError::Sql(e.to_string()))?;
+    conn.execute_batch("PRAGMA foreign_keys = ON;")
+        .map_err(|e| WriteError::Sql(e.to_string()))?;
+    conn.execute(
+        "DELETE FROM session WHERE id = ?1 AND metadata LIKE ?2",
+        params![id, format!("%{}%", MARKER)],
+    )
+    .map_err(|e| WriteError::Sql(e.to_string()))
+}
+
 /// The ids of every session row agentbridge inserted, read from the marker.
 /// Loop prevention uses this so those rows are never taken for sessions the
 /// user started in OpenCode, even when the manifest no longer lists them.

@@ -23,8 +23,9 @@ you launched it from. Most of your history is on disk but invisible.
   started in another tool, in the tool you choose.
 - **Work follows you.** Turns you add in one tool are pulled back (`pull`) and
   folded into the other tools' copies. Your original files are never modified.
-- **Set and forget.** `auto install` hooks your shell so every new terminal
-  syncs itself. `auto watch` adds a live re-sync daemon.
+- **Set and forget.** `auto install` hooks your shell. A new terminal then
+  shares only the sessions created or changed since the last run, and does
+  nothing at all when there are none. `auto watch` adds a live re-sync daemon.
 
 ## Install
 
@@ -41,7 +42,7 @@ Works on Linux, macOS and Windows. Building from a local checkout:
 
 ```bash
 agentbridge init          # look around: what sessions are on this machine?
-agentbridge auto install  # new terminals sync from now on
+agentbridge auto install  # new and changed sessions are shared from now on
 agentbridge sync          # surface sessions in this directory, for all tools
 ```
 
@@ -80,7 +81,8 @@ agentbridge pull                        # recover that new work
 | `resume <id> <tool>` | Copy one session into one tool. | yes |
 | `inject <tool> <ids...>` | Feed session context into a tool's startup. | yes |
 | `start <tool>` | Launch an agent with cross-tool context injected. | yes |
-| `unsync` | Remove exactly what `sync` created. | yes |
+| `sync --changed` | Share only what is new since the last run (what the hook runs). | yes |
+| `unsync` | Remove exactly what `sync` created. `--project <dir>` or `--session <id>` limits it. | yes |
 | `auto install` / `uninstall` | Add / remove the shell hook. | yes |
 | `auto watch` | Re-sync whenever sessions change. | yes |
 
@@ -133,7 +135,8 @@ and refuses to run while the tool is open. Details per tool in `CONNECTORS.md`.
 - `DECISIONS.md` — dated record of every design choice.
 - `SPEC.md` — the original build spec.
 - `test.py` — live check across the real tools: `python3 test.py` (makes real
-  model calls; `--quick` for fewer).
+  model calls; `--quick` for fewer). It removes what it made unless you pass
+  `--keep`.
 
 ## License
 

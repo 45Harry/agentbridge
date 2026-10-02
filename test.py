@@ -3,7 +3,7 @@
 
 This drives the REAL tools on this machine, against their real session stores:
 
-    1. create   start a new session in each tool and give it a code word
+    1. create   start a new session in each tool and give it a codename
     2. sync     run `agentbridge sync` in the test folder
     3. names    every copy of a session carries one identical label and date
     4. access   open each session from every OTHER tool and ask for the code
@@ -18,9 +18,14 @@ part of `cargo test`. Run it by hand:
     python3 test.py                 # every tool, every pair
     python3 test.py --quick         # each session is opened from one other tool
     python3 test.py --tools claude,codex
+    python3 test.py --keep          # leave the test sessions for a look
 
-Nothing is cleaned up afterwards: `agentbridge unsync` is machine wide, so the
-test leaves its few sessions in place and tells you where they are.
+When it finishes it removes what it made: the copies agentbridge wrote for
+the test folder, the sessions it started in each tool, and the folder itself.
+Pass `--keep` to leave everything in place and look at it in the tools.
+
+OpenCode needs a model it can reach. If your default one is not available, set
+one, for example `AB_TEST_OPENCODE_MODEL=openrouter/deepseek/deepseek-v4-flash`.
 
 Needs Python 3.9 or newer and nothing outside the standard library.
 """
@@ -97,9 +102,14 @@ def agy_home() -> Path:
 def run(cmd: list[str], cwd: Path, timeout: int) -> tuple[int, str]:
     """Run a command, return (exit code, stdout+stderr). Never hangs: the whole
     process group is stopped when the time is up."""
+    # PWD has to follow the working folder. Tools that read it (OpenCode does)
+    # otherwise think they are in the folder this script was started from, and
+    # `opencode run -s` then answers but never exits.
+    env = dict(os.environ, PWD=str(cwd))
     proc = subprocess.Popen(
         cmd,
         cwd=str(cwd),
+        env=env,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -380,6 +390,52 @@ def stored_title(row: dict) -> str | None:
     return None  # Codex keeps titles in an index that is not safe to read live
 
 
+def cleanup(folder: Path, tools: dict, origins: dict, timeout: int) -> None:
+    """Take away what this run made: agentbridge's copies for the test folder
+    and of the test sessions, the sessions themselves, and the folder."""
+    cmd = ["agentbridge", "unsync", "--project", str(folder)]
+    for o in origins.values():
+        cmd += ["--session", o["id"]]
+    rc, out = run(cmd, folder, max(timeout, 300))
+    print(f"  copies:   {tail(out, 2)}")
+
+    for name, o in origins.items():
+        sid, note = o["id"], "removed"
+        try:
+            if name == "claude":
+                for p in claude_projects().glob(f"*/{sid}.jsonl"):
+                    p.unlink()
+            elif name == "codex":
+                rc, out = run(["codex", "delete", sid, "--force"], folder, 60)
+                for p in (codex_home() / "sessions").rglob(f"*{sid}*.jsonl"):
+                    p.unlink()
+            elif name == "opencode":
+                rc, out = run(["opencode", "session", "delete", sid], folder, 60)
+                if rc != 0:
+                    note = f"`opencode session delete` failed: {tail(out, 1)}"
+            else:  # agy has no delete command; the conversation is one file plus one index row
+                for p in (agy_home() / "conversations").glob(f"{sid}.db*"):
+                    p.unlink()
+                index = agy_home() / "conversation_summaries.db"
+                if index.is_file():
+                    conn = sqlite3.connect(index, timeout=10)
+                    conn.execute("delete from conversation_summaries where conversation_id = ?", (sid,))
+                    conn.commit()
+                    conn.close()
+        except (OSError, sqlite3.Error) as e:
+            note = f"could not remove: {e}"
+        # What agentbridge recovered for this session is test data too.
+        for p in (data_dir() / "overlay").glob(f"{sid}*"):
+            p.unlink(missing_ok=True)
+        print(f"  session:  {name:9} {sid}  {note}")
+
+    # Claude Code keeps one folder per project; this one only ever held the test.
+    encoded = re.sub(r"[^A-Za-z0-9]", "-", str(folder))
+    shutil.rmtree(claude_projects() / encoded, ignore_errors=True)
+    shutil.rmtree(folder, ignore_errors=True)
+    print(f"  folder:   {folder} removed")
+
+
 # --------------------------------------------------------------------------
 # the test
 # --------------------------------------------------------------------------
@@ -390,6 +446,7 @@ def main() -> int:
     ap.add_argument("--quick", action="store_true", help="open each session from one other tool, not all of them")
     ap.add_argument("--timeout", type=int, default=240, help="seconds allowed per tool call (default 240)")
     ap.add_argument("--folder", help="test folder to use (default: a new one under ~/agentbridge-live-test)")
+    ap.add_argument("--keep", action="store_true", help="leave the test sessions and copies in place")
     args = ap.parse_args()
 
     names = [t.strip() for t in args.tools.split(",") if t.strip()]
@@ -407,7 +464,12 @@ def main() -> int:
     if not (folder / "README.md").exists():
         (folder / "README.md").write_text("Throwaway folder for the agentbridge live test.\n")
     if shutil.which("git") and not (folder / ".git").exists():
+        # A real repository with one commit, so every tool treats the folder as
+        # a project of its own rather than a catch-all one.
         run(["git", "init", "-q", "."], folder, 30)
+        run(["git", "add", "README.md"], folder, 30)
+        run(["git", "-c", "user.name=agentbridge-test", "-c", "user.email=test@example.invalid",
+             "commit", "-q", "-m", "test folder"], folder, 30)
 
     nonce = "".join(random.choices("0123456789", k=4))
     report = Report()
@@ -426,7 +488,7 @@ def main() -> int:
         word = f"{random.choice(WORDS)}-{nonce}-{name.upper()}"
         prompt = (
             "Do not use any tools or run any commands. "
-            f"Remember this code word for later: {word}. Reply with exactly: noted."
+            f"My project codename is {word}. Remember it for later. Reply with exactly: noted."
         )
         started = dt.datetime.now(dt.timezone.utc)
         sid, rc, answer = tool.create(prompt)
@@ -439,7 +501,7 @@ def main() -> int:
             tool.can_answer = False
             report.add("WARN", "create", name, f"{sid}: the question was saved but {name} did not answer")
         else:
-            report.add("PASS", "create", name, f"{sid}  code word {word}")
+            report.add("PASS", "create", name, f"{sid}  codename {word}")
 
     if len(origins) < 2:
         print("\nFewer than two tools produced a session, so there is nothing to cross check.")
@@ -486,7 +548,7 @@ def main() -> int:
                            f"the tool holds {held!r}" + (" (agy clears titles it did not write)" if status == "WARN" else ""))
 
     # 4. access -----------------------------------------------------------
-    print("\n4. open each session from the other tools and ask for its code word")
+    print("\n4. open each session from the other tools and ask for its codename")
     asked: list[dict] = []
     order = list(tools)
     for name, o in origins.items():
@@ -510,10 +572,14 @@ def main() -> int:
                 continue
             marker = f"WB-{nonce}-{name}-via-{target}"
             prompt = (
-                "Do not use any tools or run any commands. Reply with only the code word "
-                f"I asked you to remember earlier in this conversation. (reference {marker})"
+                "Do not use any tools or run any commands. What is my project codename, which I "
+                f"told you earlier in this conversation? Reply with only that. (reference {marker})"
             )
             rc, answer = tool.ask(copy_id(row), prompt)
+            if o["word"] not in answer:
+                # A model now and then declines or rambles. The history is what
+                # is under test, so it gets one more chance to read it.
+                rc, answer = tool.ask(copy_id(row), prompt)
             if o["word"] in answer:
                 report.add("PASS", "access", subject, f"answered {o['word']}")
                 asked.append({"origin": name, "via": target, "marker": marker})
@@ -565,9 +631,15 @@ def main() -> int:
     for status, step, subject, detail in report.rows:
         if status in ("FAIL", "WARN", "SKIP"):
             print(f"  {status:4} {step:8} {subject}: {detail}")
-    print(f"\nTest sessions were left in place under: {folder}")
-    print("To remove everything agentbridge wrote on this machine: agentbridge unsync")
-    return 1 if report.count("FAIL") else 0
+    failed = report.count("FAIL")
+    if args.keep:
+        print(f"\nTest sessions were left in place under: {folder}")
+        ids = " ".join(f"--session {o['id']}" for o in origins.values())
+        print(f"To remove the copies later: agentbridge unsync --project {folder} {ids}")
+    else:
+        print("\n8. clean up")
+        cleanup(folder, tools, origins, args.timeout)
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

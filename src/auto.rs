@@ -59,6 +59,27 @@ fn fingerprint_files(paths: &[PathBuf]) -> Vec<(PathBuf, u64, Option<SystemTime>
     out
 }
 
+/// `fingerprint`, reduced to one short string that can be kept on disk.
+pub fn fingerprint_digest(registry: &Registry) -> String {
+    digest_of(&fingerprint(registry))
+}
+
+/// SQLite's `-shm` file is left out. It is rewritten whenever the database is
+/// merely *read*, so with it in, agentbridge's own look at a store changed
+/// the digest and every run saw "something new" (found on a real machine).
+/// New rows land in `-wal`, which is kept.
+fn digest_of(files: &[(PathBuf, u64, Option<SystemTime>)]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for entry in files {
+        if entry.0.to_string_lossy().ends_with("-shm") {
+            continue;
+        }
+        entry.hash(&mut hasher);
+    }
+    format!("{:016x}", hasher.finish())
+}
+
 pub struct WatchReport {
     pub rounds: u64,
     pub synced: u64,
@@ -123,10 +144,11 @@ const HOOK_END: &str = "# <<< agentbridge <<<";
 fn hook_body() -> String {
     format!(
         r#"{begin}
-# Keeps every agent session visible in whatever directory you're in.
-# Runs one quick sync per new shell; remove with: agentbridge auto uninstall
+# Shares new and changed agent sessions with your other tools.
+# Does nothing unless a session was created or changed since the last run.
+# Remove with: agentbridge auto uninstall
 if command -v agentbridge >/dev/null 2>&1; then
-  agentbridge sync >/dev/null 2>&1 &
+  agentbridge sync --changed >/dev/null 2>&1 &
 fi
 {end}
 "#,
@@ -192,6 +214,28 @@ pub fn uninstall_hook(dry_run: bool) -> std::io::Result<(PathBuf, bool)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The hook must not re-publish every session in every new shell. On a
+    /// real machine that was 68,000 copies and eight minutes per terminal.
+    #[test]
+    fn test_hook_only_syncs_what_changed() {
+        assert!(hook_body().contains("agentbridge sync --changed"));
+    }
+
+    #[test]
+    fn test_digest_ignores_a_file_that_changes_on_read() {
+        let t0 = SystemTime::UNIX_EPOCH;
+        let t1 = t0 + Duration::from_secs(60);
+        let files = |shm_time, wal_len| {
+            vec![
+                (PathBuf::from("/s/opencode.db"), 10u64, Some(t0)),
+                (PathBuf::from("/s/opencode.db-wal"), wal_len, Some(t0)),
+                (PathBuf::from("/s/opencode.db-shm"), 32768u64, Some(shm_time)),
+            ]
+        };
+        assert_eq!(digest_of(&files(t0, 0)), digest_of(&files(t1, 0)), "a read is not a change");
+        assert_ne!(digest_of(&files(t0, 0)), digest_of(&files(t0, 4096)), "a write is");
+    }
 
     #[test]
     fn test_hook_install_is_idempotent() {
