@@ -73,6 +73,11 @@ enum Commands {
         /// Show what would happen without writing anything
         #[arg(long)]
         dry_run: bool,
+
+        /// Do nothing unless a session was created or changed since the last
+        /// run, and then share only those sessions. What the shell hook uses.
+        #[arg(long)]
+        changed: bool,
     },
 
     /// Recover turns other tools appended to synced sessions
@@ -106,6 +111,14 @@ enum Commands {
         /// Show what would be removed without removing it
         #[arg(long)]
         dry_run: bool,
+
+        /// Only remove what a sync of this folder wrote
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Only remove the copies of this session (repeatable)
+        #[arg(long)]
+        session: Vec<String>,
     },
 
     /// Resume a session across tools
@@ -225,11 +238,13 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Some(Commands::Sync { project, dry_run }) => cmd_sync(&registry, project.as_deref(), dry_run),
+        Some(Commands::Sync { project, dry_run, changed }) => {
+            cmd_sync(&registry, project.as_deref(), dry_run, changed)
+        }
         Some(Commands::Pull { dry_run, auto_merge }) => cmd_pull(dry_run, auto_merge),
         Some(Commands::Auto { action }) => cmd_auto(&registry, action),
         Some(Commands::Status) => cmd_status(),
-        Some(Commands::Unsync { dry_run }) => cmd_unsync(dry_run),
+        Some(Commands::Unsync { dry_run, project, session }) => cmd_unsync(dry_run, project, session),
         Some(Commands::Info) => cmd_info(&registry),
     }
 }
@@ -530,13 +545,10 @@ fn cmd_resume(
             vec![PathBuf::from(&home).join(".codex")]
         }
         "opencode" => {
-            let data_dir = std::env::var("XDG_DATA_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| {
-                    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-                    PathBuf::from(&home).join(".local").join("share").join("opencode")
-                });
-            vec![data_dir]
+            // The same path the reader and `sync` use. Built by hand here it
+            // dropped the `opencode/` folder whenever `XDG_DATA_HOME` was set.
+            let db = agentbridge::opencode_write::default_db();
+            vec![db.parent().map(PathBuf::from).unwrap_or_default()]
         }
         "antigravity" => match agentbridge::antigravity_write::store() {
             Some(home) => vec![home],
@@ -628,6 +640,12 @@ fn cmd_resume(
             let db = target_dir.join("opencode.db");
             match agentbridge::opencode_write::ensure_safe_to_write() {
                 Err(e) => Err(e.to_string()),
+                // Opening a missing path would create an empty database that
+                // OpenCode never made. Only ever write into one it owns.
+                Ok(()) if !db.is_file() => Err(format!(
+                    "OpenCode database not found at {} (open OpenCode once so it creates it)",
+                    db.display()
+                )),
                 Ok(()) => {
                     let dir = session.project_path().unwrap_or_default();
                     // The row is already ours: the write below only refreshes
@@ -819,7 +837,16 @@ fn cmd_init(registry: &agentbridge::connector::Registry) {
     }
 }
 
-fn cmd_sync(registry: &agentbridge::connector::Registry, project: Option<&str>, dry_run: bool) {
+/// How far back the first `sync --changed` on a machine reaches. Later runs
+/// start from the previous run.
+const FIRST_CHANGED_WINDOW_DAYS: i64 = 7;
+
+fn cmd_sync(
+    registry: &agentbridge::connector::Registry,
+    project: Option<&str>,
+    dry_run: bool,
+    changed: bool,
+) {
     let dir = match project {
         Some(p) => match std::fs::canonicalize(p) {
             Ok(d) => d,
@@ -829,6 +856,26 @@ fn cmd_sync(registry: &agentbridge::connector::Registry, project: Option<&str>, 
             }
         },
         None => std::env::current_dir().unwrap_or_default(),
+    };
+
+    // `--changed`: one cheap look at every store. If nothing was created or
+    // written since the last run there is nothing to do, and a new terminal
+    // costs a stat sweep instead of a full sync.
+    let started = chrono::Utc::now();
+    let since = if changed {
+        let state = agentbridge::sync::last_sync_state();
+        let now = agentbridge::auto::fingerprint_digest(registry);
+        if state.as_ref().is_some_and(|(_, seen)| *seen == now) {
+            println!("Nothing new since the last sync.");
+            return;
+        }
+        Some(
+            state
+                .map(|(at, _)| at)
+                .unwrap_or_else(|| started - chrono::Duration::days(FIRST_CHANGED_WINDOW_DAYS)),
+        )
+    } else {
+        None
     };
 
     // Recover anything other tools appended before re-materializing, so the
@@ -843,8 +890,21 @@ fn cmd_sync(registry: &agentbridge::connector::Registry, project: Option<&str>, 
         );
     }
 
-    println!("Surfacing all machine sessions in {}", dir.display());
-    let report = agentbridge::sync::sync_into(registry, &dir, dry_run);
+    match since {
+        Some(t) => println!(
+            "Sharing sessions changed since {} in {}",
+            t.format("%Y-%m-%d %H:%M UTC"),
+            dir.display()
+        ),
+        None => println!("Surfacing all machine sessions in {}", dir.display()),
+    }
+    let report = agentbridge::sync::sync_into_since(registry, &dir, dry_run, since);
+    if changed && !dry_run && !report.errors.iter().any(|e| e.contains("another agentbridge")) {
+        // Taken after the run, so the copies this run wrote are part of what
+        // the next run compares against and do not count as a change.
+        let seen = agentbridge::auto::fingerprint_digest(registry);
+        let _ = agentbridge::sync::record_sync_state(started, &seen);
+    }
 
     if dry_run {
         println!("[dry-run] would materialize {} session(s); nothing written", report.created.len());
@@ -857,6 +917,9 @@ fn cmd_sync(registry: &agentbridge::connector::Registry, project: Option<&str>, 
     }
     if report.skipped_native > 0 {
         println!("  skipped   {} (already native here)", report.skipped_native);
+    }
+    if report.skipped_copies > 0 {
+        println!("  skipped   {} (agentbridge's own copies, never a source)", report.skipped_copies);
     }
     if report.merged_native > 0 {
         println!(
@@ -874,8 +937,14 @@ fn cmd_sync(registry: &agentbridge::connector::Registry, project: Option<&str>, 
     }
 }
 
-fn cmd_unsync(dry_run: bool) {
-    let report = agentbridge::sync::unsync(dry_run);
+fn cmd_unsync(dry_run: bool, project: Option<String>, sessions: Vec<String>) {
+    let filter = agentbridge::sync::UnsyncFilter {
+        // The same resolution `sync --project` applies, so the two agree on
+        // what a folder is called. A folder already deleted is taken as given.
+        project: project.map(|p| std::fs::canonicalize(&p).unwrap_or_else(|_| PathBuf::from(p))),
+        sessions,
+    };
+    let report = agentbridge::sync::unsync_matching(dry_run, &filter);
     if dry_run {
         println!("[dry-run] would remove {} file(s)", report.removed.len());
     } else {

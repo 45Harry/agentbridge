@@ -585,12 +585,14 @@ fn write_summary(
         .unwrap_or(-1);
 
     // Replace wholesale so a re-run refreshes rather than failing on the
-    // primary key. Scoped by the marker so a conversation agy authored under
-    // the same id (impossible in practice, but the guarantee is cheap) is
-    // never overwritten.
+    // primary key. Matched on the id alone: agy rebuilds its index when it
+    // starts and blanks the marker (and title) of rows it did not write, so
+    // a marker-scoped delete left the old row behind and the insert below
+    // failed. The id is safe to match on by itself — it is a version 5 UUID
+    // derived in `derive_id`, which agy never generates.
     conn.execute(
-        "DELETE FROM conversation_summaries WHERE conversation_id = ?1 AND agent_name = ?2",
-        params![id, MARKER],
+        "DELETE FROM conversation_summaries WHERE conversation_id = ?1",
+        params![id],
     )
     .map_err(|e| WriteError::Sql(e.to_string()))?;
     conn.execute(
@@ -661,41 +663,62 @@ pub fn remove_all(home: &Path) -> Result<usize, WriteError> {
         return Ok(0);
     }
     let conn = Connection::open(&db).map_err(|e| WriteError::Sql(e.to_string()))?;
+    // By marker, and by id: agy blanks the marker of rows it did not write
+    // when it rebuilds its index, so the marker alone misses every copy agy
+    // has seen since. A version 5 id is one `derive_id` made.
     let ids: Vec<String> = {
         let mut stmt = conn
-            .prepare("SELECT conversation_id FROM conversation_summaries WHERE agent_name = ?1")
+            .prepare("SELECT conversation_id, agent_name FROM conversation_summaries")
             .map_err(|e| WriteError::Sql(e.to_string()))?;
         let rows = stmt
-            .query_map(params![MARKER], |r| r.get::<_, String>(0))
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
             .map_err(|e| WriteError::Sql(e.to_string()))?;
-        rows.filter_map(|r| r.ok()).collect()
+        rows.filter_map(|r| r.ok())
+            .filter(|(id, agent)| agent == MARKER || is_derived_id(id))
+            .map(|(id, _)| id)
+            .collect()
     };
+    drop(conn);
     for id in &ids {
-        let _ = std::fs::remove_file(body_path(home, id));
+        remove_one(home, id)?;
     }
-    conn.execute(
-        "DELETE FROM conversation_summaries WHERE agent_name = ?1",
-        params![MARKER],
-    )
-    .map_err(|e| WriteError::Sql(e.to_string()))?;
     Ok(ids.len())
 }
 
+/// True for an id `derive_id` produced: a version 5 UUID. agy's own are
+/// version 4.
+pub fn is_derived_id(id: &str) -> bool {
+    uuid::Uuid::parse_str(id).is_ok_and(|u| u.get_version_num() == 5)
+}
+
 /// Remove one materialized conversation, body and index row together.
+///
+/// The row is ours when it carries the marker, or when its id is one
+/// `derive_id` made: agy blanks the marker of rows it did not write, so the
+/// marker alone would leave every copy agy has seen since.
 pub fn remove_one(home: &Path, id: &str) -> Result<bool, WriteError> {
     let db = summaries_db(home);
     if !db.is_file() {
         return Ok(false);
     }
     let conn = Connection::open(&db).map_err(|e| WriteError::Sql(e.to_string()))?;
-    let removed = conn
-        .execute(
+    let removed = if is_derived_id(id) {
+        conn.execute(
+            "DELETE FROM conversation_summaries WHERE conversation_id = ?1",
+            params![id],
+        )
+    } else {
+        conn.execute(
             "DELETE FROM conversation_summaries WHERE conversation_id = ?1 AND agent_name = ?2",
             params![id, MARKER],
         )
-        .map_err(|e| WriteError::Sql(e.to_string()))?;
-    if removed > 0 {
-        let _ = std::fs::remove_file(body_path(home, id));
+    }
+    .map_err(|e| WriteError::Sql(e.to_string()))?;
+    if removed > 0 || is_derived_id(id) {
+        let body = body_path(home, id);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{}", body.display(), suffix));
+        }
     }
     Ok(removed > 0)
 }
@@ -826,6 +849,35 @@ mod tests {
 
         let connector = crate::connectors::antigravity::AntigravityConnector::with_root(home.clone());
         assert_eq!(connector.scan().unwrap().count(), 1, "listed once");
+    }
+
+    /// Found by `test.py` against real agy 1.1.27: when agy starts it rebuilds
+    /// its index and blanks the title and the marker agentbridge wrote. The
+    /// next sync then failed on every conversation with `UNIQUE constraint
+    /// failed: conversation_summaries.conversation_id`, because the old row
+    /// was only replaced when it still carried the marker.
+    #[test]
+    fn test_rewrite_survives_agy_wiping_the_marker() {
+        let (_tmp, home) = store_dir();
+        let s = session(Some("Dark mode"), "/tmp/proj");
+        let first = write_session(&home, &s, "/tmp/proj").unwrap();
+        let conn = Connection::open(summaries_db(&home)).unwrap();
+        conn.execute("UPDATE conversation_summaries SET agent_name = '', title = ''", [])
+            .unwrap();
+        drop(conn);
+
+        let second = write_session(&home, &s, "/tmp/proj").expect("the rewrite goes through");
+        assert_eq!(first.id, second.id);
+        let conn = Connection::open(summaries_db(&home)).unwrap();
+        let (rows, title): (i64, String) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(title) FROM conversation_summaries WHERE conversation_id = ?1",
+                params![second.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(rows, 1, "still one row");
+        assert_eq!(title, second.title, "and the label is back");
     }
 
     /// A session materialized into two directories must get two distinct

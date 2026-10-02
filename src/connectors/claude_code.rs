@@ -5,19 +5,7 @@ use serde_json::Value;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
 use walkdir::WalkDir;
-
-static CLAUDE_CONFIG_DIR: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
-    std::env::var("CLAUDE_CONFIG_DIR")
-        .ok()
-        .map(PathBuf::from)
-        .or_else(default_claude_dir)
-});
-
-fn default_claude_dir() -> Option<PathBuf> {
-    dirs_home().map(|h| h.join(".claude").join("projects"))
-}
 
 /// The base config directory (`CLAUDE_CONFIG_DIR` override, or `~/.claude`
 /// by default) — always the parent of `projects/`, regardless of source.
@@ -30,11 +18,11 @@ fn config_base() -> Option<PathBuf> {
 
 /// Where materialized session copies must be written for the real Claude
 /// Code binary's `projects/<encoded-dir>/<uuid>.jsonl` convention to find
-/// them, honoring `CLAUDE_CONFIG_DIR` the same way reads do. Unlike
-/// `CLAUDE_CONFIG_DIR`/`roots()` (which point at the raw override and rely
-/// on `scan()`'s recursive walk to find `projects/` underneath it), this
-/// always appends `projects` explicitly — used by `sync::live_root`, never
-/// by `scan()`.
+/// them, honoring `CLAUDE_CONFIG_DIR`. Reads use the same folder: sessions
+/// live only under `projects/`. Walking the raw override instead listed
+/// `history.jsonl` and every other `.jsonl` Claude Code keeps beside it as a
+/// session. Resolved on every call — a cached value made the override
+/// first-reader-wins.
 pub(crate) fn write_root() -> Option<PathBuf> {
     config_base().map(|b| b.join("projects"))
 }
@@ -62,18 +50,11 @@ impl Connector for ClaudeCodeConnector {
     }
 
     fn detect(&self) -> bool {
-        CLAUDE_CONFIG_DIR
-            .as_ref()
-            .map(|d| d.exists())
-            .unwrap_or(false)
+        write_root().is_some_and(|d| d.exists())
     }
 
     fn roots(&self) -> Vec<PathBuf> {
-        CLAUDE_CONFIG_DIR
-            .as_ref()
-            .cloned()
-            .into_iter()
-            .collect()
+        write_root().into_iter().collect()
     }
 
     fn scan(&self) -> ConnectorResult<SessionStream<'_>> {

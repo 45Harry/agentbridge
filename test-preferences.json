@@ -1,0 +1,9 @@
+{
+  "tool": "cargo test",
+  "gate": null,
+  "additionalTools": ["tempfile"],
+  "e2eTool": "none",
+  "testDir": "src (inline #[cfg(test)] modules) and tests/ (binary level)",
+  "filePattern": "*.rs",
+  "packageManager": "cargo"
+}

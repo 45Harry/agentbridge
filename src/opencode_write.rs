@@ -68,6 +68,12 @@ impl std::fmt::Display for WriteError {
     }
 }
 
+/// Where OpenCode keeps its database on this machine — the one path the
+/// reader, `sync` and `resume` must all agree on.
+pub fn default_db() -> PathBuf {
+    crate::connectors::opencode::default_db_path()
+}
+
 /// True when an `opencode` process is live. Writing under a running instance
 /// risks racing its own writes and having it serve stale cached state.
 pub fn is_opencode_running() -> bool {
@@ -267,6 +273,45 @@ pub fn write_sessions(
     (rows, errors)
 }
 
+/// A short, meaningful name for a session that has none, derived from its
+/// opening user message. This replaces the old `"{provider} session {id}"`
+/// placeholder, which listed a bare id in every picker and, once
+/// round-tripped, was indistinguishable from a real title. Like the Codex
+/// fallback this never cuts a word in half and marks truncation, so the row
+/// reads as a name rather than a raw slice of the prompt.
+fn fallback_title(session: &Session) -> String {
+    const MAX: usize = 60;
+    let preview = session
+        .messages
+        .iter()
+        .find(|m| m.role == Role::User && m.text.as_deref().is_some_and(|t| !t.trim().is_empty()))
+        .and_then(|m| m.text.as_deref())
+        .map(|t| t.split_whitespace().collect::<Vec<_>>().join(" "))
+        .unwrap_or_default();
+    if preview.is_empty() {
+        // No message to name it by (a metadata-only record); keep a stable,
+        // non-empty placeholder distinct from the old bare-id one so it never
+        // matches `label::is_generic_fallback`.
+        return format!("{} session {}", session.provider, session.id);
+    }
+    if preview.chars().count() <= MAX {
+        return preview;
+    }
+    let budget = MAX.saturating_sub(1);
+    let mut cut = String::new();
+    for word in preview.split(' ') {
+        let candidate = if cut.is_empty() { word.to_string() } else { format!("{cut} {word}") };
+        if candidate.chars().count() > budget {
+            break;
+        }
+        cut = candidate;
+    }
+    if cut.is_empty() {
+        cut = preview.chars().take(budget).collect();
+    }
+    format!("{cut}…")
+}
+
 /// Insert (or refresh) `session` so it appears in OpenCode's own picker for
 /// `directory`. Returns the OpenCode session id used.
 pub fn write_session(
@@ -278,6 +323,20 @@ pub fn write_session(
     let tx = conn.transaction().map_err(|e| WriteError::Sql(e.to_string()))?;
 
     let project_id = resolve_project_id(&tx, directory)?;
+    if project_id == PROJECT_ID {
+        // A database only ever used inside git folders has no `global` row
+        // yet, and the session insert below would fail its foreign key.
+        // OpenCode writes exactly this row the first time it runs outside a
+        // project (read off a real 1.18.30 database): worktree `/`, empty
+        // sandboxes, every other column null.
+        let now = chrono::Utc::now().timestamp_millis();
+        tx.execute(
+            "INSERT OR IGNORE INTO project (id, worktree, time_created, time_updated, sandboxes) \
+             VALUES (?1, '/', ?2, ?2, '[]')",
+            params![PROJECT_ID, now],
+        )
+        .map_err(|e| WriteError::Sql(e.to_string()))?;
+    }
     let id = derive_id(&session.provider, &session.id, &project_id);
     let created = session.started_at.map(|t| t.timestamp_millis()).unwrap_or(0);
     let updated = session
@@ -288,7 +347,7 @@ pub fn write_session(
     let title = session
         .title
         .clone()
-        .unwrap_or_else(|| format!("{} session {}", session.provider, session.id));
+        .unwrap_or_else(|| fallback_title(session));
     let metadata = json!({
         MARKER: true,
         "source_provider": session.provider,
@@ -429,7 +488,7 @@ pub fn write_session(
                 &msg_id,
                 json!({
                     "type": "text",
-                    "text": "(agentbridge: continuing a previous conversation)"
+                    "text": crate::label::CONTINUATION_PLACEHOLDER
                 }),
                 ts,
                 idx,
@@ -503,6 +562,35 @@ pub fn remove_all(db: &Path) -> Result<usize, WriteError> {
         params![format!("%{}%", MARKER)],
     )
     .map_err(|e| WriteError::Sql(e.to_string()))
+}
+
+/// Remove one session row agentbridge inserted. A row without the marker is
+/// OpenCode's own and is left alone.
+pub fn remove_one(db: &Path, id: &str) -> Result<usize, WriteError> {
+    let conn = Connection::open(db).map_err(|e| WriteError::Sql(e.to_string()))?;
+    conn.execute_batch("PRAGMA foreign_keys = ON;")
+        .map_err(|e| WriteError::Sql(e.to_string()))?;
+    conn.execute(
+        "DELETE FROM session WHERE id = ?1 AND metadata LIKE ?2",
+        params![id, format!("%{}%", MARKER)],
+    )
+    .map_err(|e| WriteError::Sql(e.to_string()))
+}
+
+/// The ids of every session row agentbridge inserted, read from the marker.
+/// Loop prevention uses this so those rows are never taken for sessions the
+/// user started in OpenCode, even when the manifest no longer lists them.
+pub fn written_ids(db: &Path) -> Vec<String> {
+    let Ok(conn) = Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    else {
+        return Vec::new();
+    };
+    let Ok(mut stmt) = conn.prepare("SELECT id FROM session WHERE metadata LIKE ?1") else {
+        return Vec::new();
+    };
+    stmt.query_map(params![format!("%{}%", MARKER)], |r| r.get::<_, String>(0))
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
 }
 
 /// How many agentbridge-inserted sessions are present.
@@ -626,6 +714,29 @@ mod tests {
     /// directory-independent id the second write died on `UNIQUE constraint
     /// failed: session.id` — found live on 2026-08-03 materializing one
     /// session into a second folder.
+    /// Found on the operator's real machine with opencode 1.18.30: a database
+    /// that has only ever been used inside git folders has no `global`
+    /// project row yet, and every insert failed with `FOREIGN KEY constraint
+    /// failed`. OpenCode creates that row itself the first time it runs
+    /// outside a project; the same row is created here when it is missing.
+    #[test]
+    fn test_write_creates_the_global_project_when_opencode_has_not_yet() {
+        let (_tmp, db) = db_with_schema();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON; DELETE FROM project;").unwrap();
+        drop(conn);
+
+        write_session(&db, &a_session(), "/home/u/p").expect("the row is written");
+
+        let conn = Connection::open(&db).unwrap();
+        let (worktree, sandboxes): (String, String) = conn
+            .query_row("SELECT worktree, sandboxes FROM project WHERE id='global'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .expect("the global project exists");
+        assert_eq!((worktree.as_str(), sandboxes.as_str()), ("/", "[]"), "the shape OpenCode itself writes");
+    }
+
     #[test]
     fn test_two_projects_each_get_their_own_row() {
         let (_t, db) = db_with_schema();

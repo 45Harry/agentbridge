@@ -421,6 +421,16 @@ pub struct ThreadRowReport {
 
 /// Remove every row agentbridge inserted — matched by the marker, so
 /// Codex's own sessions are never touched. Returns the number removed.
+/// Remove the `threads` rows agentbridge wrote for one rollout file.
+pub fn remove_rows_for_path(db: &Path, rollout: &Path) -> Result<usize, WriteError> {
+    let conn = Connection::open(db).map_err(|e| WriteError::Sql(e.to_string()))?;
+    conn.execute(
+        "DELETE FROM threads WHERE thread_source = ?1 AND rollout_path = ?2",
+        rusqlite::params![MARKER, rollout.to_string_lossy()],
+    )
+    .map_err(|e| WriteError::Sql(e.to_string()))
+}
+
 pub fn remove_all(db: &Path) -> Result<usize, WriteError> {
     let conn = Connection::open(db).map_err(|e| WriteError::Sql(e.to_string()))?;
     let removed = conn
