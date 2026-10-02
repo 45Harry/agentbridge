@@ -455,3 +455,180 @@ label carried the session's real date (2026-08-18/19), never the sync date; the
 same label appeared in both the agy index and the Claude Code copy; a rename
 made inside agy was recovered bare (not labeled) into the overlay and
 republished with the label rebuilt around it. Tests 128 → 143.
+
+## 2026-10-02 — Live pass with real Claude Code and OpenCode: label names, and two OpenCode sync bugs
+
+Run in a sandbox (`HOME`, `AGENTBRIDGE_DATA_DIR`, `CLAUDE_CONFIG_DIR`,
+`CODEX_HOME`, `ANTIGRAVITY_HOME`, `XDG_DATA_HOME` all redirected) with the real
+`claude` 2.1.287 and `opencode` 1.18.30 binaries. Codex is not installed on
+this machine, so nothing here was checked against a real Codex.
+
+**Label names.** Three things made names say nothing:
+
+- OpenCode's own placeholder, `New session - <ISO time>`, was kept as if a
+  person had chosen it: `opencode · New session - 2026-10-02T07:56:04.904Z ·
+  2026-10-02 07:56 · ses_f046`. It now counts as no name. Only the exact shape
+  matches (the rest must parse as RFC 3339).
+- Derived names came from whatever user turn was first, including tool wrapper
+  blocks (`<command-name>/resume</command-name>…`, `<environment_context>…`)
+  and agentbridge's own `(agentbridge: continuing a previous conversation)`
+  turn. The operator's real manifest had hundreds of each. The name now comes
+  from the first thing a person wrote: leading blocks whose tag name contains
+  `-` or `_` are dropped (ordinary `<div>` text is not), the placeholder turn
+  is skipped, and quotes wrapping a whole prompt (`opencode run "…"`) go.
+- The id field was the first 8 characters. OpenCode ids are `ses_` plus a
+  time-ordered run, so every session made within a few minutes showed
+  `ses_f045` or `ses_f046`. Ids starting `ses_` now give their last 8.
+  Old labels still parse, so they are rebuilt, not nested.
+
+The date stays UTC with no zone marker (a session started 13:40 local, +05:45,
+reads `07:55`). That was a deliberate choice in the label decision above and
+is left for the operator to revisit.
+
+**Bug: OpenCode sessions stopped syncing after the first sync.** Every
+OpenCode manifest row has the database as its `dest`, and loop prevention
+skipped any source whose path is a known `dest` — so once one row was written,
+every session OpenCode owns looked generated. A new OpenCode session never
+reached Claude Code (0 copies, live). Loop prevention for OpenCode now goes by
+row id: the manifest's `cache`, plus the marker in the row itself, so it also
+holds when the manifest is gone.
+
+**Bug: the OpenCode branch appended its manifest rows.** Same bug the
+antigravity branch had. 22 → 26 → 30 → 38 rows live; one turn typed in
+OpenCode was reported as 5 turns and `opencode+opencode+opencode+opencode+opencode
+-> merged`. The branch now updates its row in place, and `read_manifest`
+collapses repeats left by older builds (same session, same `dest`, same row id
+for OpenCode), so the first `pull` after upgrading is already correct.
+
+**Bug: `resume <id> opencode` with `XDG_DATA_HOME` set.** It built the path by
+hand and dropped the `opencode/` folder, created an empty `opencode.db` and an
+empty backup at the wrong path, then failed with `no such table: project`. It
+now uses the reader's path and refuses to write when no database exists.
+
+Verified after the fixes, same sandbox: a turn the real Claude Code appended
+to a copy of an OpenCode session was pulled (3 turns) and republished; a turn
+the real OpenCode appended to a copy of a Claude session was pulled once with
+no conflict; a rename made with the real `claude -n` came back as
+`opencode · Renamed in Claude · 2026-10-02 07:56 · 55eg5M31`; a second sync
+changed nothing (24 rows, stable); `unsync` removed 24 entries and left the 2
+native Claude files, the 9 native OpenCode rows and the overlay. Tests 147 → 161.
+
+Not done: real OpenCode could not complete a model turn on this machine (it
+throws inside its own `SystemPrompt.environment` before any model call), so
+"continue the conversation in OpenCode with a real answer" is unverified; the
+turns above are the user turns it wrote before failing.
+
+## 2026-10-02 (later) — Four tools, real binaries: copies were being copied, and an original was overwritten
+
+Second pass the same day, now with real Codex 0.160.0 (installed into a scratch
+folder, model through OpenRouter) and real agy 1.1.27 beside Claude Code and
+OpenCode.
+
+**What the operator's real machine showed.** The shell hook runs `agentbridge
+sync` in every new shell, and Codex and agy start login shells of their own.
+The moment those two tools had stores, several syncs of the installed build ran
+at once. Each read the manifest before the others wrote it, so each took the
+others' copies for sessions. Read only inspection afterwards found:
+
+- one Claude session listed in agy four times, twice as `codex-cli · …`;
+- an agy session listed in Codex as `claude-code · What Does UTC Mean · …`;
+- names `<environment_context>…`, dates `1970-01-01 00:00`, `0000-00-00 00:00`
+  and `+58579-08-17 12:37`, and one label nested inside another;
+- **a Claude session's own file replaced by a 13 line converted copy** titled
+  `codex-cli · …`. A Codex copy keeps its origin's id, so writing that copy
+  "into Claude Code" for the session's own folder lands on the original.
+
+The 123k row manifest (19,297 of 19,299 "source" sessions are agentbridge's
+own files) is the same thing accumulated over weeks.
+
+**Decisions.**
+
+- *A copy says it is a copy.* Loop prevention no longer rests on the manifest
+  alone. A copy is one whose title is a label naming another origin (another
+  tool, or the same tool under another id), or, for a Codex rollout, which has
+  no title, one whose `session_meta` carries an `agentbridge` origin record.
+  Real Codex 0.160 accepts the extra field: it resumed three such rollouts and
+  answered from their history. Judged on the entry's own file, because a copy
+  can share its origin's id.
+- *One writer at a time.* `sync` and `pull` take `~/.agentbridge/sync.lock`;
+  a second run stands down. A lock older than 30 minutes is taken over.
+- *A tool's own file is never written over.* Checked at the write: a file
+  already at the destination that is not in the manifest and is not a copy is
+  left alone.
+- *`CLAUDE_CONFIG_DIR` is the config folder; sessions are under `projects/`.*
+  The reader walked the whole folder and listed `history.jsonl` and friends as
+  sessions. Also no longer cached in a `LazyLock`.
+- *A zero or absurd time is a missing time* in the label, never a date.
+- *A title that is only the opening message is a preview, not a name* (agy's
+  untitled conversations), so it is clipped like any derived name.
+- *Bookkeeping and empty turns do not travel.* Real Codex writes
+  `<environment_context>…` and `<skills_instructions>…` as turns when it
+  resumes; pull counted them as things said.
+
+**Verified with real binaries after the fixes** (sandboxed stores; the dev
+build was not run against the real stores):
+
+| Asked in | On a session started in | Answer |
+| --- | --- | --- |
+| Codex | Claude Code | `MARMALADE` |
+| Codex | agy | `LYCHEE` |
+| Codex | OpenCode | `PERSIMMON-88` |
+| Claude Code | Codex | `KUMQUAT` |
+| agy (real store, installed build's copy) | Claude Code | `MARMALADE` |
+
+Each session carried one identical label in all four stores, for example
+`claude-code · Do not use any tools. In one short sentence,… · 2026-10-02 08:39
+· 6148e6d9`, and the date column each tool shows matched it. The question
+asked in Codex and its answer were pulled once and appeared in the OpenCode and
+agy copies; Claude's answer on the Codex session reached OpenCode and agy the
+same way. A repeat sync changed nothing (22 rows). Tests 161 → 172.
+
+**Still open.**
+
+- Real OpenCode cannot complete a turn on this machine (it throws in its own
+  prompt builder), so nothing was *asked in* OpenCode.
+- After real Codex resumes a copy it adds a `threads` row of its own, titled
+  with the first message, beside the labeled one. After real agy was started
+  again, two copies in its index had blank titles. Neither tool's picker was
+  driven by hand, so what a person sees there is unverified.
+- The labeled `threads` row has a per folder id that is not the rollout's id;
+  `codex exec resume <that id>` fails with `no rollout found`. Resuming by the
+  rollout's id works.
+- Subagent transcripts under a Claude project folder are still read as
+  sessions.
+- The real stores still hold what the installed build wrote. `unsync` with the
+  fixed build, then `sync`, is the intended cleanup; not run.
+
+## 2026-10-02 (evening) — The fixed build on the real stores, and the cleanup
+
+Run on the operator's instruction: install, `unsync`, clean, `sync`.
+
+- `unsync` removed 81,938 files and kept 3,476 whose inode no longer matched.
+  87 sessions existed only as manifest copies; they were hardlinked aside
+  first and put back afterwards.
+- A new Terminal window fired the shell hook mid-way. Under the default Claude
+  profile it began publishing about 19,000 leftover session ids into Codex and
+  agy (500 files each in under a minute). That run was stopped and the hook
+  removed with `auto uninstall`. It stays off until the operator decides how
+  much of that backlog should be published.
+- `~/.claude/projects` held 188,519 files of which 5,122 were originals.
+  164,598 repeat copies, 517 marked Codex rollouts and 619 agy conversations
+  with version 5 ids were moved to `~/.agentbridge/removed-2026-10-02/`
+  (moved, not deleted). Every original stayed, and one copy stayed for each
+  of the 18,799 sessions whose original is gone.
+
+Two more fixes came out of it:
+
+- **agy wipes what agentbridge writes into its index.** After agy restarted,
+  108 of 109 rows had a blank title and no marker. Those copies are now
+  recognized by their id: agentbridge names its agy conversations with a
+  version 5 UUID, agy's own are version 4.
+- **A fresh OpenCode database has no `global` project.** Every insert failed
+  its foreign key. The row OpenCode itself writes (worktree `/`, sandboxes
+  `[]`) is created when missing.
+
+Result on the real stores, from `~/Developer/agentbridge` under the
+`.claude-jyasa` profile: 283 copies written, a second run changed nothing,
+and the real `opencode session list` shows the same labels agy and Codex
+hold. Codex's index rows were refused because Codex was open; the rollout
+files are in place. Tests 172 → 174.

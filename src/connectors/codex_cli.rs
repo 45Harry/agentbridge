@@ -418,6 +418,9 @@ fn load_from_path(path: &Path, id: &str) -> ConnectorResult<Session> {
     let mut last_event_at: Option<DateTime<Utc>> = None;
     let mut project_path: Option<String> = None;
     let mut model_provider: Option<String> = None;
+    // The leading record, kept so a copy agentbridge wrote can be told from a
+    // session Codex owns (`label::is_copy`).
+    let mut meta_payload = serde_json::Value::Null;
     let mut ordinal: u64 = 0;
 
     for line_result in reader.lines() {
@@ -459,6 +462,9 @@ fn load_from_path(path: &Path, id: &str) -> ConnectorResult<Session> {
         match event_type {
             "session_meta" => {
                 if let Some(p) = payload {
+                    if meta_payload.is_null() {
+                        meta_payload = p.clone();
+                    }
                     if model_provider.is_none() {
                         model_provider = p.get("model_provider").and_then(|v| v.as_str()).map(|s| s.to_string());
                     }
@@ -620,7 +626,7 @@ fn load_from_path(path: &Path, id: &str) -> ConnectorResult<Session> {
         title: None,
         token_totals: TokenTotals::default(),
         source_path: path.to_path_buf(),
-        raw_payload: serde_json::Value::Null,
+        raw_payload: meta_payload,
         body_available: true,
         messages,
         artifacts: vec![],

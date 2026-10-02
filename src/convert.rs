@@ -388,6 +388,13 @@ impl SessionConverter for CodexCliConverter {
                     "cli_version": CODEX_CLI_VERSION,
                     "source": "cli",
                     "thread_source": "user",
+                    // A rollout has no title to carry the cross-tool label,
+                    // so the copy names its origin here. Sync reads this back
+                    // to know it must never treat the file as a source.
+                    crate::label::ORIGIN_KEY: {
+                        "source_provider": session.provider,
+                        "source_id": session.id,
+                    },
                 },
             }));
 

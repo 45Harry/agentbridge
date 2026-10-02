@@ -530,13 +530,10 @@ fn cmd_resume(
             vec![PathBuf::from(&home).join(".codex")]
         }
         "opencode" => {
-            let data_dir = std::env::var("XDG_DATA_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| {
-                    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-                    PathBuf::from(&home).join(".local").join("share").join("opencode")
-                });
-            vec![data_dir]
+            // The same path the reader and `sync` use. Built by hand here it
+            // dropped the `opencode/` folder whenever `XDG_DATA_HOME` was set.
+            let db = agentbridge::opencode_write::default_db();
+            vec![db.parent().map(PathBuf::from).unwrap_or_default()]
         }
         "antigravity" => match agentbridge::antigravity_write::store() {
             Some(home) => vec![home],
@@ -628,6 +625,12 @@ fn cmd_resume(
             let db = target_dir.join("opencode.db");
             match agentbridge::opencode_write::ensure_safe_to_write() {
                 Err(e) => Err(e.to_string()),
+                // Opening a missing path would create an empty database that
+                // OpenCode never made. Only ever write into one it owns.
+                Ok(()) if !db.is_file() => Err(format!(
+                    "OpenCode database not found at {} (open OpenCode once so it creates it)",
+                    db.display()
+                )),
                 Ok(()) => {
                     let dir = session.project_path().unwrap_or_default();
                     // The row is already ours: the write below only refreshes
@@ -857,6 +860,9 @@ fn cmd_sync(registry: &agentbridge::connector::Registry, project: Option<&str>, 
     }
     if report.skipped_native > 0 {
         println!("  skipped   {} (already native here)", report.skipped_native);
+    }
+    if report.skipped_copies > 0 {
+        println!("  skipped   {} (agentbridge's own copies, never a source)", report.skipped_copies);
     }
     if report.merged_native > 0 {
         println!(

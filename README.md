@@ -97,7 +97,10 @@ claude-code · My Important Session · 2026-08-19 10:00 · aaaaaaaa
 - The date is the session's **own start time**, never the sync date — so the
   same conversation shows the same date in every tool.
 - A name the tool already has is kept **verbatim**. Only a session with no name
-  gets one derived from its opening message.
+  gets one derived from the first thing you wrote in it. A tool's own
+  placeholder (OpenCode's `New session - <time>`) counts as no name.
+- The id is the part that tells sessions apart: the first 8 characters, or the
+  last 8 for OpenCode's `ses_…` ids, which all start alike.
 - Renaming a copy in any tool is picked up by `pull` and republished, keeping
   your new name and the original id and date.
 
