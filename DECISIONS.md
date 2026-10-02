@@ -632,3 +632,21 @@ Result on the real stores, from `~/Developer/agentbridge` under the
 and the real `opencode session list` shows the same labels agy and Codex
 hold. Codex's index rows were refused because Codex was open; the rollout
 files are in place. Tests 172 → 174.
+
+## 2026-10-02 (night) — `test.py`: the live cross tool check, kept in the repo
+
+The checks done by hand all day are now one script. `python3 test.py` starts
+a session in each real tool with a code word, syncs, checks that every copy
+carries one identical label and date, opens each session from the other tools
+and asks for the code word, syncs again, and checks each question reached the
+remaining tools. It makes real model calls, so it stays out of `cargo test`.
+
+Its first run found one more bug: once agy has restarted, the next sync failed
+on every agy conversation with `UNIQUE constraint failed`, because the old
+index row was only replaced while it still carried the marker agy blanks. The
+row is now replaced by id alone (the id is a version 5 UUID agy never makes).
+
+Result with Claude Code 2.1.287, Codex 0.160.0 (logged in) and agy 1.1.27:
+every access and write back check passed in a full run (9 pairs) and a quick
+run, and a repeat sync changed nothing. OpenCode 1.18.30 still cannot answer
+on this machine, so it was checked as a session origin only. Tests 174 → 175.

@@ -132,6 +132,8 @@ and refuses to run while the tool is open. Details per tool in `CONNECTORS.md`.
 - `HANDOFF.md` — pick the project up on a new machine.
 - `DECISIONS.md` — dated record of every design choice.
 - `SPEC.md` — the original build spec.
+- `test.py` — live check across the real tools: `python3 test.py` (makes real
+  model calls; `--quick` for fewer).
 
 ## License
 

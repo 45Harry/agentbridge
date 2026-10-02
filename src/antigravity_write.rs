@@ -585,12 +585,14 @@ fn write_summary(
         .unwrap_or(-1);
 
     // Replace wholesale so a re-run refreshes rather than failing on the
-    // primary key. Scoped by the marker so a conversation agy authored under
-    // the same id (impossible in practice, but the guarantee is cheap) is
-    // never overwritten.
+    // primary key. Matched on the id alone: agy rebuilds its index when it
+    // starts and blanks the marker (and title) of rows it did not write, so
+    // a marker-scoped delete left the old row behind and the insert below
+    // failed. The id is safe to match on by itself — it is a version 5 UUID
+    // derived in `derive_id`, which agy never generates.
     conn.execute(
-        "DELETE FROM conversation_summaries WHERE conversation_id = ?1 AND agent_name = ?2",
-        params![id, MARKER],
+        "DELETE FROM conversation_summaries WHERE conversation_id = ?1",
+        params![id],
     )
     .map_err(|e| WriteError::Sql(e.to_string()))?;
     conn.execute(
@@ -826,6 +828,35 @@ mod tests {
 
         let connector = crate::connectors::antigravity::AntigravityConnector::with_root(home.clone());
         assert_eq!(connector.scan().unwrap().count(), 1, "listed once");
+    }
+
+    /// Found by `test.py` against real agy 1.1.27: when agy starts it rebuilds
+    /// its index and blanks the title and the marker agentbridge wrote. The
+    /// next sync then failed on every conversation with `UNIQUE constraint
+    /// failed: conversation_summaries.conversation_id`, because the old row
+    /// was only replaced when it still carried the marker.
+    #[test]
+    fn test_rewrite_survives_agy_wiping_the_marker() {
+        let (_tmp, home) = store_dir();
+        let s = session(Some("Dark mode"), "/tmp/proj");
+        let first = write_session(&home, &s, "/tmp/proj").unwrap();
+        let conn = Connection::open(summaries_db(&home)).unwrap();
+        conn.execute("UPDATE conversation_summaries SET agent_name = '', title = ''", [])
+            .unwrap();
+        drop(conn);
+
+        let second = write_session(&home, &s, "/tmp/proj").expect("the rewrite goes through");
+        assert_eq!(first.id, second.id);
+        let conn = Connection::open(summaries_db(&home)).unwrap();
+        let (rows, title): (i64, String) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(title) FROM conversation_summaries WHERE conversation_id = ?1",
+                params![second.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(rows, 1, "still one row");
+        assert_eq!(title, second.title, "and the label is back");
     }
 
     /// A session materialized into two directories must get two distinct
