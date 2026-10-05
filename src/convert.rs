@@ -356,8 +356,17 @@ impl SessionConverter for CodexCliConverter {
 
         let sid = ClaudeCodeConverter::session_uuid(&session.id);
         let mut out_paths = Vec::with_capacity(dirs.len());
-        // One user message is echoed as an `event_msg` so Codex's head scan
-        // finds a preview; without it the picker drops the session.
+        // Codex keeps two views of a session in one file. `response_item`
+        // records are what the model reads. `event_msg` records
+        // (`user_message`, `agent_message`) are what Codex's own screen
+        // replays when a session is opened. Written with only the first kind,
+        // a copy opened in Codex showed an empty conversation while the model
+        // could still answer from all of it (found live: 935 messages, and
+        // Codex's app server reported one turn with one item).
+        //
+        // The first user message is written up front as well: Codex's head
+        // scan needs one near the top for a preview, or the picker drops the
+        // session.
         let first_user = session
             .messages
             .iter()
@@ -388,6 +397,13 @@ impl SessionConverter for CodexCliConverter {
                     "cli_version": CODEX_CLI_VERSION,
                     "source": "cli",
                     "thread_source": "user",
+                    // A rollout has no title to carry the cross-tool label,
+                    // so the copy names its origin here. Sync reads this back
+                    // to know it must never treat the file as a source.
+                    crate::label::ORIGIN_KEY: {
+                        "source_provider": session.provider,
+                        "source_id": session.id,
+                    },
                 },
             }));
 
@@ -414,6 +430,31 @@ impl SessionConverter for CodexCliConverter {
 
             for msg in &session.messages {
                 let ts = format_timestamp_z(msg.timestamp);
+                // The screen's copy of this turn. Only turns with something to
+                // show: a tool result or an empty text would be a blank line.
+                let said = msg.text.as_deref().filter(|t| !t.trim().is_empty());
+                let is_first_user = first_user.is_some_and(|f| std::ptr::eq(f, msg));
+                match (&msg.role, said, msg.tool_name.is_some()) {
+                    (Role::User, Some(text), _) if !is_first_user => records.push(json!({
+                        "timestamp": ts,
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "user_message",
+                            "message": text,
+                            "images": [],
+                            "local_images": [],
+                            "audio": [],
+                            "local_audio": [],
+                            "text_elements": [],
+                        },
+                    })),
+                    (Role::Assistant, Some(text), false) => records.push(json!({
+                        "timestamp": ts,
+                        "type": "event_msg",
+                        "payload": { "type": "agent_message", "message": text },
+                    })),
+                    _ => {}
+                }
                 let payload = match msg.role {
                     Role::User => json!({
                         "type": "message",
@@ -1023,12 +1064,45 @@ mod tests {
         assert_eq!(recs[1]["payload"]["type"], "user_message");
         assert_eq!(recs[1]["payload"]["message"], "Hello");
 
-        // Turn records are response_item with a payload wrapper.
+        // Turn records are response_item with a payload wrapper. Beside them
+        // sits the screen's copy of each spoken turn.
         for r in &recs[2..] {
-            assert_eq!(r["type"], "response_item");
+            assert!(r["type"] == "response_item" || r["type"] == "event_msg", "{}", r["type"]);
             assert!(r["payload"].is_object(), "payload wrapper is required");
             assert!(r["timestamp"].is_string());
         }
+
+        // Found live 2026-10-05: a copy opened in Codex showed no conversation
+        // although the model could read all of it. Codex's screen replays
+        // `event_msg` records, so every turn that says something has one, and
+        // each sits just before the model's copy of the same turn.
+        let said = |role: Role| {
+            session
+                .messages
+                .iter()
+                .filter(|m| m.role == role && m.tool_name.is_none())
+                .filter(|m| m.text.as_deref().is_some_and(|t| !t.trim().is_empty()))
+                .count()
+        };
+        let events = |kind: &str| {
+            recs.iter()
+                .filter(|r| r["type"] == "event_msg" && r["payload"]["type"] == kind)
+                .count()
+        };
+        assert_eq!(events("user_message"), said(Role::User), "one screen record per user turn");
+        assert_eq!(events("agent_message"), said(Role::Assistant), "and one per answer");
+        assert!(said(Role::Assistant) > 0, "the fixture has an answer to show");
+        let answer = recs
+            .iter()
+            .position(|r| r["payload"]["type"] == "agent_message")
+            .unwrap();
+        assert_eq!(recs[answer + 1]["type"], "response_item");
+        assert_eq!(recs[answer + 1]["payload"]["role"], "assistant");
+        assert!(recs[answer]["payload"]["message"].is_string());
+
+        // And reading the file back counts each turn once, not twice.
+        let back = crate::connectors::codex_cli::load_file(&path, &session.id).unwrap();
+        assert_eq!(back.messages.len(), session.messages.len(), "screen records are not turns");
 
         let user = recs
             .iter()
