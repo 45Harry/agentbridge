@@ -130,6 +130,7 @@ and refuses to run while the tool is open. Details per tool in `CONNECTORS.md`.
 
 ## Docs
 
+- `ARCHITECTURE.md` — diagrams of the parts and of what each command does today.
 - `DESIGN.md` — architecture and the bugs real testing found.
 - `CONNECTORS.md` — each tool's on-disk format, reverse-engineered.
 - `HANDOFF.md` — pick the project up on a new machine.

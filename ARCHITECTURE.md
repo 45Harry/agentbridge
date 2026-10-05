@@ -33,13 +33,13 @@ flowchart LR
     end
 
     ab["agentbridge<br/>(single Rust binary)"]
-    data[("~/.agentbridge<br/>cache · overlay · manifest")]
+    data[("~/.agentbridge<br/>manifest · overlay · state")]
     shell["Shell rc hook<br/>sync --changed"]
 
     user -->|"CLI / dashboard"| ab
     shell -->|"each new shell"| ab
     ab -->|"read only scan + load"| cc & cx & oc & ag
-    ab -->|"hardlink converted copies"| cc & cx
+    ab -->|"write converted copies"| cc & cx
     ab -->|"INSERT tagged rows"| oc & cx
     ab -->|"write conversation db + summary row"| ag
     ab <--> data
@@ -85,14 +85,14 @@ flowchart TB
     core --> conns
     conns -->|"read only"| stores
     writers -->|"gated writes"| stores
-    orch -->|"hardlinks"| stores
+    orch -->|"converted files"| stores
     orch <--> abdata
 ```
 
 The library never imports UI code. `sync.rs` reaches the conflict screen only
 through the `ConflictResolver` trait, which the binary implements.
 
-## 1.4 Core data flow: index in place, derive once, link many
+## 1.4 Core data flow: index in place, convert once, write into the tool's store
 
 ```mermaid
 flowchart LR
@@ -101,7 +101,7 @@ flowchart LR
     norm["Normalized Session<br/>model.rs"]
     ovl["+ overlay turns<br/>+ overlay title"]
     lbl["+ cross tool label<br/>label::apply"]
-    cache[("cache/&lt;target&gt;/...<br/>one artifact per target")]
+    stage["staging/&lt;pid&gt;/&lt;target&gt;/...<br/>this run only, removed at the end"]
     d1["Claude Code dir A"]
     d2["Claude Code dir B"]
     d3["Codex rollout path"]
@@ -111,19 +111,27 @@ flowchart LR
     src -->|"Connector::scan"| idx
     idx -->|"Connector::load"| norm
     norm --> ovl --> lbl
-    lbl -->|"convert"| cache
-    cache -->|"hardlink (same inode)"| d1 & d2 & d3
+    lbl -->|"convert"| stage
+    stage -->|"placed in the tool's store"| d1 & d2 & d3
     lbl -->|"opencode_write"| oc
     lbl -->|"antigravity_write"| ag
 ```
 
-Three rules hold it together (full reasoning in `DESIGN.md` §4):
+Three rules hold it together:
 
 1. Never copy a session body into agentbridge. The index is metadata plus a pointer.
-2. One derived artifact per session and target format, kept in `~/.agentbridge/cache`.
-3. Presence in a directory is a hardlink to that artifact, not a copy.
+2. A tool cannot read another tool's format, so one converted file per session
+   and target has to exist. It lives in that tool's own store and nowhere else.
+3. agentbridge keeps no copy. A session is converted into a staging folder for
+   the length of one run, placed in the tool's store, and the staging folder is
+   removed. A copy already there is replaced only when its content changed.
 
-OpenCode and Antigravity have no linkable files, so they get gated database writes instead.
+`DESIGN.md` §4 describes an earlier scheme for rules 2 and 3 (a permanent
+`~/.agentbridge/cache` hardlinked into each store). It was dropped on
+2026-10-05: once a link broke, the cache entry was a stray full copy, and the
+folder reached 28 GB on a real machine. See `DECISIONS.md`.
+
+OpenCode and Antigravity keep sessions in databases, so they get gated database writes instead.
 
 ## 1.5 The sync loop (write-back)
 
@@ -138,14 +146,14 @@ sequenceDiagram
 
     U->>A: works in a session
     AB->>A: scan + load (read only)
-    AB->>D: convert into cache, record in manifest
-    AB->>B: hardlink or insert copy
+    AB->>B: convert, then place the file or insert the rows
+    AB->>D: record the copy in the manifest
     U->>B: resumes the copy, adds turns
     AB->>B: pull: read copy, turns past message_count are new
     AB->>D: append new turns to overlay/<id>.jsonl
     Note over A: origin file is never touched
-    AB->>D: re-sync: origin + overlay → refreshed cache
-    Note over AB,B: every hardlinked copy updates at once (same inode)
+    AB->>B: re-sync: origin + overlay, converted again
+    Note over AB,B: each copy is replaced only if its content changed
 ```
 
 `agentbridge resume --merge` is the only opt-in exception: it sets a merge
@@ -172,9 +180,8 @@ flowchart LR
 
 ```text
 ~/.agentbridge/                (or $AGENTBRIDGE_DATA_DIR)
-├── cache/
-│   ├── claude-code/...        converted Claude Code JSONL (hardlink source)
-│   └── codex-cli/...          converted Codex rollouts (hardlink source)
+├── staging/<pid>/...          converted files for the run in progress only;
+│                              removed when the run ends
 ├── overlay/
 │   ├── <session-id>.jsonl     turns recovered from other tools' copies
 │   └── <session-id>.title     rename recovered from another tool
@@ -184,12 +191,15 @@ flowchart LR
 └── sync.lock                  single-writer lock (stale after 30 min)
 ```
 
+No session is stored here. An older `cache/` folder, if present, is deleted by
+the next sync.
+
 ## 1.8 Non-functional guarantees
 
 | Concern | How it is met |
 |---|---|
 | Safety of tool data | Origin files never modified; DB writes back up first, tag rows, refuse while the tool runs |
-| Storage | Body stored once in cache; extra directories cost one inode entry |
+| Storage | No copy in `~/.agentbridge`; one converted file per session and target, in that tool's store |
 | Idempotency | UUID v5 ids, paths from the session's own start time, manifest dedup |
 | Reversibility | `unsync` removes exactly the manifest rows, and only when the inode still matches |
 | Concurrency | `sync.lock` in the data dir; a busy run stands down |
@@ -315,7 +325,7 @@ classDiagram
     class SessionConverter {
         <<trait>>
         +convert(session, root)
-        +convert_multi(session, cache, dirs)
+        +convert_multi(session, staging, dirs)
     }
     class ConflictResolver {
         <<trait>>
@@ -364,18 +374,19 @@ flowchart TB
     s["Labeled Session<br/>(re-homed to project + $HOME)"]
     s --> t{target}
 
-    t -->|claude-code| cc1["ClaudeCodeConverter.convert_multi<br/>→ cache/claude-code/..."]
-    cc1 --> cc2["hardlink into<br/>~/.claude/projects/&lt;dir&gt;/&lt;uuid&gt;.jsonl<br/>(inode check, temp+rename if different)"]
+    t -->|claude-code| cc1["ClaudeCodeConverter.convert_multi<br/>→ staging/&lt;pid&gt;/claude-code/..."]
+    cc1 --> cc2["place in<br/>~/.claude/projects/&lt;dir&gt;/&lt;uuid&gt;.jsonl<br/>(never over a file the tool owns,<br/>replaced only if content changed)"]
 
-    t -->|codex-cli| cx1["CodexCliConverter.convert_multi<br/>one rollout per target dir"]
-    cx1 --> cx2["hardlink into ~/.codex/sessions/..."]
-    cx2 --> cx3["codex_write::ensure_thread_rows<br/>INSERT threads row in state_5.sqlite"]
+    t -->|codex-cli| cx1["CodexCliConverter.convert_multi<br/>one rollout per target dir<br/>model view + screen view of each turn"]
+    cx1 --> cx2["place in ~/.codex/sessions/..."]
+    cx2 --> cx3["codex_write::ensure_thread_name<br/>label → session_index.jsonl"]
+    cx3 --> cx4["codex_write::ensure_thread_rows<br/>INSERT threads row in state_5.sqlite"]
 
     t -->|opencode| oc1["opencode_write::write_sessions<br/>INSERT session/message/part rows<br/>(creates 'global' project if missing)"]
 
     t -->|antigravity| ag1["antigravity_write::write_sessions<br/>conversation .db body (protobuf)<br/>+ summaries row"]
 
-    cc2 & cx3 & oc1 & ag1 --> m["LinkRecord → manifest.jsonl"]
+    cc2 & cx4 & oc1 & ag1 --> m["LinkRecord → manifest.jsonl"]
 ```
 
 Every database writer follows the same four gates before touching another
@@ -391,9 +402,10 @@ flowchart LR
     d --> e["--dry-run: plan() renders<br/>statements instead"]
 ```
 
-Ids are deterministic: `derive_id(source_provider, source_id, project)` is a
-UUID v5, so a re-sync rewrites the same row in place and the manifest row is
-updated, not appended.
+Ids are deterministic, so a re-sync rewrites the same row in place and the
+manifest row is updated, not appended. Antigravity copies get a UUID v5.
+OpenCode copies get an id of OpenCode's own shape (`ses_`, 12 hex, 14 letters
+or digits), built from the same kind of hash.
 
 ## 2.5 `sync` in detail (`sync::sync_into_since`)
 
@@ -430,6 +442,10 @@ flowchart TB
     save --> st["record last-sync.json<br/>(fingerprint taken after run)"]
 ```
 
+Before discovery, a writing sync also deletes an old `cache/` folder if one is
+left over and renames OpenCode rows still under an old id shape (the manifest
+follows them). `sync --changed` does both even when nothing else is new.
+
 ## 2.6 `pull` in detail (`sync::pull_back_with`)
 
 ```mermaid
@@ -457,7 +473,9 @@ flowchart TB
 ```
 
 `message_count` moves by everything the copy gained, bookkeeping included, so a
-dropped turn is never offered again.
+dropped turn is never offered again. For a Codex copy the title compared here
+is the name from Codex's own name list, and only when it was given after
+agentbridge's label (`codex_write::renamed_in_codex`).
 
 ## 2.7 `unsync` (`sync::unsync_matching`)
 
@@ -467,7 +485,7 @@ flowchart LR
     u1 --> u2{{"each matching LinkRecord"}}
     u2 --> u3{"target"}
     u3 -->|file target| u4{"inode still<br/>matches?"}
-    u4 -- yes --> u5["remove link"]
+    u4 -- yes --> u5["remove file"]
     u4 -- no --> u6["kept_foreign<br/>(tool replaced it)"]
     u3 -->|opencode| u7["opencode_write::remove_one(row id)"]
     u3 -->|antigravity| u8["antigravity_write::remove_one(v5 id)"]
@@ -484,7 +502,7 @@ The overlay survives `unsync`: recovered work is never thrown away.
 |---|---|
 | `init` / `index` / `ls` | `index::discover` → print by provider and project dir. Read only |
 | `status` | `sync::status` → `StatusRow::drift()` = messages on disk minus `message_count` |
-| `resume <id> --in <tool> [--merge]` | load → `label::apply_for_resume` → write into the target (same writers as sync) → optional `sync::set_merge` → print the target tool's resume command (from the converter's `resume_cmd`, or `opencode run --session` / `agy --conversation`) |
+| `resume <id> <tool> [--merge]` | load → `label::apply_for_resume` → write into the target (same writers as sync) → optional `sync::set_merge` → print the target tool's resume command (from the converter's `resume_cmd`, or `opencode run --session` / `agy --conversation`) |
 | `start` | load recent sessions for the project → `convert::build_cross_tool_brief` → `inject::agentbridge_start` |
 | `inject` | `Connector::inject` with fenced begin/end markers (`inject.rs`) so it can be removed exactly |
 | `auto install` / `uninstall` | `auto::install_hook` / `uninstall_hook` edit a fenced block in the shell rc |
@@ -512,8 +530,37 @@ A copy must say it is a copy even without the manifest:
   (`antigravity_write::is_derived_id`), because agy blanks titles on rows it
   did not write when it rebuilds its index.
 
-## 2.11 Known gaps
+## 2.11 What each tool needs before it treats a copy as its own
 
+Each of these was found by opening a synced session in the real tool.
+
+- **Codex, the conversation.** A rollout holds two views of every turn:
+  `response_item` records for the model and `event_msg` records
+  (`user_message`, `agent_message`) that Codex's screen replays. A copy with
+  only the first opens as an empty conversation the model can still read.
+- **Codex, the name.** The name Codex shows is the last line for the session's
+  id in `~/.codex/session_index.jsonl`, not `threads.title`. agentbridge writes
+  its label there (`codex_write::ensure_thread_name`); otherwise Codex names
+  the session itself the first time someone types in it. A name given in Codex
+  after the label was there is a rename and is pulled to the other tools.
+- **OpenCode, the id.** OpenCode sends the session id with each model request
+  and its free tier refuses one that is not shaped like its own. Rows written
+  under an older id shape are renamed in place by `opencode_write::migrate_ids`.
+- **OpenCode, the project.** A database only ever used inside git folders has
+  no `global` project row; the writer creates it.
+- **Antigravity.** agy rebuilds its index when it starts and blanks the title
+  and marker on rows it did not write, so its copies are recognised and
+  replaced by their UUID v5 id.
+
+To check what Codex's screen will show, ask its app server (`thread/read` with
+turns). `codex exec resume` only proves what the model can read.
+
+## 2.12 Known gaps
+
+- Codex `threads` rows written by agentbridge use a per folder id that is not
+  the rollout's own id, so resuming by that row's id fails; resuming by the
+  session's id works.
+- `DESIGN.md` §4 rules 2 and 3 still describe the dropped cache and hardlinks.
 - Redaction (`src/redact.rs`) required by `DESIGN.md` invariant 6 is not built yet.
 - Topic threading across directories (`DESIGN.md` §10) is undecided.
 - Merge-back into Antigravity and OpenCode origins is deliberately unsupported.
