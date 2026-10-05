@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [master, develop]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --locked
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Tests (and check nothing escapes its sandbox)
+        shell: bash
+        run: |
+          touch "$RUNNER_TEMP/before-tests"
+          cargo test --locked
+          # Tests build their own fake HOME. A file that appears anywhere in the
+          # real one means a test wrote into a real session store.
+          leaked="$(find "$HOME" \
+            \( -path "$HOME/.cargo" -o -path "$HOME/.rustup" -o -path "$HOME/.cache" \
+               -o -path "$GITHUB_WORKSPACE" -o -path "$RUNNER_TEMP" \) -prune \
+            -o -type f -newer "$RUNNER_TEMP/before-tests" -print | head -20)"
+          if [ -n "$leaked" ]; then
+            echo "::error::tests wrote outside their sandbox:"
+            echo "$leaked"
+            exit 1
+          fi
+
+      - name: Smoke test the built binary
+        run: scripts/smoke.sh
+
+      - name: Performance (100 MB session)
+        run: cargo test --release --locked --lib -- --ignored test_perf
+
+  msrv:
+    name: minimum Rust version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked
