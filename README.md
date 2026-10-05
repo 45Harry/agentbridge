@@ -23,8 +23,9 @@ you launched it from. Most of your history is on disk but invisible.
   started in another tool, in the tool you choose.
 - **Work follows you.** Turns you add in one tool are pulled back (`pull`) and
   folded into the other tools' copies. Your original files are never modified.
-- **Set and forget.** `auto install` hooks your shell so every new terminal
-  syncs itself. `auto watch` adds a live re-sync daemon.
+- **Set and forget.** `auto install` hooks your shell. A new terminal then
+  shares only the sessions created or changed since the last run, and does
+  nothing at all when there are none. `auto watch` adds a live re-sync daemon.
 
 ## Install
 
@@ -41,7 +42,7 @@ Works on Linux, macOS and Windows. Building from a local checkout:
 
 ```bash
 agentbridge init          # look around: what sessions are on this machine?
-agentbridge auto install  # new terminals sync from now on
+agentbridge auto install  # new and changed sessions are shared from now on
 agentbridge sync          # surface sessions in this directory, for all tools
 ```
 
@@ -80,7 +81,8 @@ agentbridge pull                        # recover that new work
 | `resume <id> <tool>` | Copy one session into one tool. | yes |
 | `inject <tool> <ids...>` | Feed session context into a tool's startup. | yes |
 | `start <tool>` | Launch an agent with cross-tool context injected. | yes |
-| `unsync` | Remove exactly what `sync` created. | yes |
+| `sync --changed` | Share only what is new since the last run (what the hook runs). | yes |
+| `unsync` | Remove exactly what `sync` created. `--project <dir>` or `--session <id>` limits it. | yes |
 | `auto install` / `uninstall` | Add / remove the shell hook. | yes |
 | `auto watch` | Re-sync whenever sessions change. | yes |
 
@@ -97,7 +99,10 @@ claude-code · My Important Session · 2026-08-19 10:00 · aaaaaaaa
 - The date is the session's **own start time**, never the sync date — so the
   same conversation shows the same date in every tool.
 - A name the tool already has is kept **verbatim**. Only a session with no name
-  gets one derived from its opening message.
+  gets one derived from the first thing you wrote in it. A tool's own
+  placeholder (OpenCode's `New session - <time>`) counts as no name.
+- The id is the part that tells sessions apart: the first 8 characters, or the
+  last 8 for OpenCode's `ses_…` ids, which all start alike.
 - Renaming a copy in any tool is picked up by `pull` and republished, keeping
   your new name and the original id and date.
 
@@ -117,18 +122,23 @@ and refuses to run while the tool is open. Details per tool in `CONNECTORS.md`.
 
 1. **Index in place.** Sessions are never copied — the index points at the
    files already on disk.
-2. **Convert once, link many.** Each session is converted once into
-   `~/.agentbridge/cache`; every directory gets a hardlink to that one file.
+2. **No second copy.** A tool cannot read another tool's format, so each
+   session is converted once and written into that tool's own store.
+   agentbridge keeps no copy of it in `~/.agentbridge`.
 3. **Never touch a tool's own sessions.** Recovered work lives in an
    agentbridge-owned overlay; `unsync` removes only what agentbridge created.
 
 ## Docs
 
+- `ARCHITECTURE.md` — diagrams of the parts and of what each command does today.
 - `DESIGN.md` — architecture and the bugs real testing found.
 - `CONNECTORS.md` — each tool's on-disk format, reverse-engineered.
 - `HANDOFF.md` — pick the project up on a new machine.
 - `DECISIONS.md` — dated record of every design choice.
 - `SPEC.md` — the original build spec.
+- `test.py` — live check across the real tools: `python3 test.py` (makes real
+  model calls; `--quick` for fewer). It removes what it made unless you pass
+  `--keep`.
 
 ## License
 

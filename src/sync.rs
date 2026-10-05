@@ -200,7 +200,16 @@ fn append_overlay(session_id: &str, messages: &[crate::model::Message]) -> std::
 fn load_materialized(target: &str, path: &Path, id: &str) -> Option<crate::model::Session> {
     match target {
         "claude-code" => crate::connectors::claude_code::load_file(path, id).ok(),
-        "codex-cli" => crate::connectors::codex_cli::load_file(path, id).ok(),
+        "codex-cli" => {
+            let mut s = crate::connectors::codex_cli::load_file(path, id).ok()?;
+            // A rollout carries no title; a name given inside Codex lives in
+            // Codex's name list, keyed by the id the copy has there.
+            if let Some(home) = crate::connectors::codex_cli::config_home() {
+                let thread = crate::convert::ClaudeCodeConverter::session_uuid(id);
+                s.title = crate::codex_write::renamed_in_codex(&home, &thread);
+            }
+            Some(s)
+        }
         "opencode" => crate::connectors::opencode::load_from_db(path, id).ok(),
         // Antigravity's `dest` is the conversation body agentbridge wrote; the
         // title lives in the separate summaries index, so it is layered on
@@ -287,6 +296,9 @@ pub fn pull_back(dry_run: bool) -> PullReport {
 struct Pending {
     manifest_idx: usize,
     new_messages: Vec<crate::model::Message>,
+    /// Turns the copy gained since the last pull, including bookkeeping turns
+    /// that were dropped from `new_messages`.
+    seen: usize,
     new_title: Option<String>,
 }
 
@@ -297,8 +309,22 @@ struct Pending {
 /// always.
 pub fn pull_back_with(dry_run: bool, resolver: &mut dyn ConflictResolver) -> PullReport {
     let mut report = PullReport::default();
+    let _lock = if dry_run {
+        None
+    } else {
+        match acquire_run_lock() {
+            Some(lock) => Some(lock),
+            None => {
+                report.errors.push(BUSY.to_string());
+                return report;
+            }
+        }
+    };
+    // Repeated rows for one copy would each report the same new turn, and
+    // read as a conflict of a tool against itself.
+    let rows_on_disk = read_manifest_raw().len();
     let mut manifest = read_manifest();
-    let mut changed = false;
+    let mut changed = manifest.len() != rows_on_disk;
 
     // Pass 1: read every materialized copy once and record what is new since
     // the last pull. Two or more entries for the same session id here means
@@ -329,14 +355,33 @@ pub fn pull_back_with(dry_run: bool, resolver: &mut dyn ConflictResolver) -> Pul
         } else {
             Vec::new()
         };
+        // How far the copy has grown, bookkeeping included. The manifest count
+        // moves by this, so turns left behind below are not offered again.
+        let seen = new_messages.len();
+        // A tool resuming a session writes its own bookkeeping as turns
+        // (`<environment_context>…`, `<skills_instructions>…`). Those are not
+        // things anyone said and must not travel to the other tools.
+        let new_messages: Vec<crate::model::Message> = new_messages
+            .into_iter()
+            .filter(|m| !m.text.as_deref().is_some_and(crate::label::is_bookkeeping))
+            // Nor does a turn that says nothing: no text and no tool use
+            // (Claude Code writes one ahead of its answer).
+            .filter(|m| {
+                m.text.as_deref().is_some_and(|t| !t.trim().is_empty())
+                    || m.tool_name.is_some()
+                    || m.tool_input.is_some()
+                    || m.tool_result.is_some()
+            })
+            .collect();
 
-        if new_title.is_none() && new_messages.is_empty() {
+        if new_title.is_none() && seen == 0 {
             continue;
         }
 
         pending_by_session.entry(rec.session_id.clone()).or_default().push(Pending {
             manifest_idx: idx,
             new_messages,
+            seen,
             new_title,
         });
     }
@@ -393,13 +438,16 @@ pub fn pull_back_with(dry_run: bool, resolver: &mut dyn ConflictResolver) -> Pul
                 }
             }
 
-            if pending.new_messages.is_empty() {
+            if pending.seen == 0 {
                 continue;
             }
-            let new_count = manifest[pending.manifest_idx].message_count + pending.new_messages.len();
+            let new_count = manifest[pending.manifest_idx].message_count + pending.seen;
 
             if keep {
-                if dry_run {
+                if pending.new_messages.is_empty() {
+                    // Only bookkeeping arrived: nothing to carry, but the
+                    // count below still moves past it.
+                } else if dry_run {
                     report.pulled.push((session_id.clone(), pending.new_messages.len()));
                 } else {
                     match append_overlay(&session_id, &pending.new_messages) {
@@ -438,6 +486,9 @@ pub struct SyncReport {
     /// Skipped because the session is already native to that tool *in this
     /// directory*; agentbridge must not touch a tool's own sessions.
     pub skipped_native: usize,
+    /// Skipped because the session is itself a copy agentbridge made (it says
+    /// so in its own title or first record), whatever the manifest holds.
+    pub skipped_copies: usize,
     /// Native origin files updated in place because the session opted into
     /// merge-back (`agentbridge resume --merge`); turns pulled from other
     /// tools' copies were appended to the tool's own session file.
@@ -460,6 +511,53 @@ fn home() -> PathBuf {
     std::env::var("HOME").map(PathBuf::from).unwrap_or_default()
 }
 
+/// Held by the one run allowed to rewrite the manifest. Released on drop.
+pub struct RunLock(PathBuf);
+
+impl Drop for RunLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// A lock older than this belongs to a run that died.
+const LOCK_STALE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// What a run reports when it stands down for another.
+const BUSY: &str = "another agentbridge sync is running; skipped (that run covers it)";
+
+/// One writer at a time. The shell hook starts a `sync` per new shell and a
+/// tool's own startup shells count, so several runs begin together; each read
+/// the manifest before the others wrote it and took their copies for
+/// sessions. `None` means another run holds the lock.
+fn acquire_run_lock() -> Option<RunLock> {
+    let dir = data_dir();
+    fs::create_dir_all(&dir).ok()?;
+    let path = dir.join("sync.lock");
+    for _ in 0..2 {
+        match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut f) => {
+                use std::io::Write;
+                let _ = write!(f, "{}", std::process::id());
+                return Some(RunLock(path));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .is_some_and(|age| age > LOCK_STALE);
+                if !stale {
+                    return None;
+                }
+                let _ = fs::remove_file(&path);
+            }
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
 /// agentbridge's own data dir. Overridable for tests and for operators who
 /// keep state elsewhere.
 pub fn data_dir() -> PathBuf {
@@ -468,8 +566,27 @@ pub fn data_dir() -> PathBuf {
         .unwrap_or_else(|_| home().join(".agentbridge"))
 }
 
-fn cache_root(target: &str) -> PathBuf {
-    data_dir().join("cache").join(target)
+/// Where a converted session is written before it is moved into the target
+/// tool's own store. Nothing stays here: agentbridge keeps no copy of any
+/// session. A tool cannot read another tool's format, so one converted file
+/// per session has to exist, and it lives in that tool's store and nowhere
+/// else. (An earlier design kept every artifact in `~/.agentbridge/cache` and
+/// hardlinked it out; leftovers there grew to 28 GB on a real machine.)
+fn staging_root(target: &str) -> PathBuf {
+    staging_dir().join(target)
+}
+
+/// This run's staging folder. Per process, so two runs never share files.
+fn staging_dir() -> PathBuf {
+    data_dir().join("staging").join(std::process::id().to_string())
+}
+
+/// True when both files hold the same bytes.
+fn same_content(a: &Path, b: &Path) -> bool {
+    match (fs::metadata(a), fs::metadata(b)) {
+        (Ok(x), Ok(y)) if x.len() == y.len() => fs::read(a).ok() == fs::read(b).ok(),
+        _ => false,
+    }
 }
 
 fn manifest_path() -> PathBuf {
@@ -586,7 +703,15 @@ fn inode_of(path: &Path) -> u64 {
     fs::metadata(path).map(|m| m.ino()).unwrap_or(0)
 }
 
+/// The manifest as `status`, `pull` and `unsync` should see it: one row per
+/// session written to one place.
 pub fn read_manifest() -> Vec<LinkRecord> {
+    dedup_manifest(read_manifest_raw())
+}
+
+/// Every row on disk, repeats included. Callers that rewrite the manifest use
+/// this to tell whether collapsing the repeats changed anything.
+fn read_manifest_raw() -> Vec<LinkRecord> {
     let path = manifest_path();
     let Ok(content) = fs::read_to_string(&path) else {
         return Vec::new();
@@ -642,6 +767,29 @@ fn append_manifest(records: &[LinkRecord]) -> std::io::Result<()> {
         existing.push('\n');
     }
     fs::write(&path, existing)
+}
+
+/// Drop repeated manifest rows, keeping the newest of each.
+///
+/// Two rows are the same entry when they describe the same session written to
+/// the same place: `dest`, plus the row id (`cache`) for OpenCode, whose
+/// `dest` is one database shared by every session. Rows for different
+/// sessions that share a `dest` are left alone — `append_manifest` owns that
+/// rule.
+fn dedup_manifest(rows: Vec<LinkRecord>) -> Vec<LinkRecord> {
+    let key = |r: &LinkRecord| {
+        let row_id = (r.target_provider == "opencode").then(|| r.cache.clone());
+        (r.session_id.clone(), r.dest.clone(), row_id)
+    };
+    let mut last: std::collections::HashMap<_, usize> = std::collections::HashMap::new();
+    for (i, r) in rows.iter().enumerate() {
+        last.insert(key(r), i);
+    }
+    rows.into_iter()
+        .enumerate()
+        .filter(|(i, r)| last.get(&key(r)) == Some(i))
+        .map(|(_, r)| r)
+        .collect()
 }
 
 /// Make every session on the machine visible in `project` for every detected
@@ -711,7 +859,8 @@ fn merge_back_native(
             let Some(live) = live_root("codex-cli") else {
                 return Err("merge-back: no codex-cli live root".to_string());
             };
-            let cache = cache_root("codex-cli");
+            let cache = staging_root("codex-cli");
+            let _staged = StagingGuard;
             let dir = session.project_path().unwrap_or_default();
             let artifact = CodexCliConverter::new()
                 .convert_multi(&session, &cache, std::slice::from_ref(&dir))?
@@ -731,9 +880,139 @@ fn merge_back_native(
     }
 }
 
+/// Delete the folder older builds kept every converted session in. Copies
+/// already in the tools' stores are their own files and are not affected;
+/// this only frees what nothing else points at. Returns true if it was there.
+pub fn drop_legacy_cache() -> bool {
+    let cache = data_dir().join("cache");
+    cache.exists() && fs::remove_dir_all(cache).is_ok()
+}
+
+/// Removes this run's staging folder when it goes out of scope, so no
+/// converted file outlives the run that made it.
+struct StagingGuard;
+
+impl Drop for StagingGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(staging_dir());
+        // The parent goes too once no other run is using it.
+        let _ = fs::remove_dir(data_dir().join("staging"));
+    }
+}
+
 pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncReport {
-    let index: Index = discover(registry);
+    sync_into_since(registry, project, dry_run, None)
+}
+
+/// When a session last changed, as far as a cheap look can tell: its own last
+/// event, or the time its file was last written. Tools append to a transcript
+/// long after the first record a scan reads, so the file time is what catches
+/// a session that is still being worked on.
+fn changed_at(e: &crate::index::IndexEntry) -> Option<chrono::DateTime<chrono::Utc>> {
+    // OpenCode's file is one database shared by every session; its time says
+    // nothing about any one of them.
+    let file = (e.provider != "opencode")
+        .then(|| fs::metadata(&e.source_path).ok()?.modified().ok())
+        .flatten()
+        .map(chrono::DateTime::<chrono::Utc>::from);
+    [e.last_event_at, e.started_at, file].into_iter().flatten().max()
+}
+
+/// The state `sync --changed` keeps between runs: when the last one started,
+/// and a fingerprint of every session store as it finished.
+fn sync_state_path() -> PathBuf {
+    data_dir().join("last-sync.json")
+}
+
+pub fn last_sync_state() -> Option<(chrono::DateTime<chrono::Utc>, String)> {
+    let v: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(sync_state_path()).ok()?).ok()?;
+    let at = chrono::DateTime::parse_from_rfc3339(v.get("at")?.as_str()?).ok()?;
+    Some((at.with_timezone(&chrono::Utc), v.get("fingerprint")?.as_str()?.to_string()))
+}
+
+pub fn record_sync_state(at: chrono::DateTime<chrono::Utc>, fingerprint: &str) -> std::io::Result<()> {
+    fs::create_dir_all(data_dir())?;
+    fs::write(
+        sync_state_path(),
+        serde_json::json!({ "at": at.to_rfc3339(), "fingerprint": fingerprint }).to_string(),
+    )
+}
+
+/// Rename OpenCode rows still under an old id shape and point `manifest` at
+/// the new ids. Returns how many rows moved. Does nothing while OpenCode is
+/// open.
+fn rename_opencode_rows(manifest: &mut [LinkRecord]) -> usize {
+    let Some(db) = opencode_db().filter(|db| db.is_file()) else {
+        return 0;
+    };
+    if crate::opencode_write::ensure_safe_to_write().is_err() {
+        return 0;
+    }
+    let moves = crate::opencode_write::migrate_ids(&db).unwrap_or_default();
+    for (old, new) in &moves {
+        for r in manifest
+            .iter_mut()
+            .filter(|r| r.target_provider == "opencode" && r.cache.as_os_str() == old.as_str())
+        {
+            r.cache = PathBuf::from(new);
+        }
+    }
+    moves.len()
+}
+
+/// The same rename, for a caller that is not about to sync. `sync --changed`
+/// stops early when nothing is new, and old rows must not wait for a new
+/// session before they become usable.
+pub fn migrate_opencode_rows() -> usize {
+    let Some(_lock) = acquire_run_lock() else {
+        return 0;
+    };
+    let mut manifest = read_manifest();
+    let moved = rename_opencode_rows(&mut manifest);
+    if moved > 0 {
+        let body: String = manifest
+            .iter()
+            .map(|r| serde_json::to_string(r).unwrap_or_default() + "\n")
+            .collect();
+        let _ = fs::write(manifest_path(), body);
+    }
+    moved
+}
+
+/// `sync_into`, limited to sessions that changed at or after `since`.
+///
+/// This is what makes an automatic sync cheap: a machine holds thousands of
+/// old sessions, and re-publishing all of them every time one new session
+/// appears costs minutes. `None` means every session, as `sync_into` does.
+pub fn sync_into_since(
+    registry: &Registry,
+    project: &Path,
+    dry_run: bool,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+) -> SyncReport {
     let mut report = SyncReport::default();
+    let _lock = if dry_run {
+        None
+    } else {
+        match acquire_run_lock() {
+            Some(lock) => Some(lock),
+            None => {
+                report.errors.push(BUSY.to_string());
+                return report;
+            }
+        }
+    };
+    let _staged = StagingGuard;
+    if !dry_run {
+        drop_legacy_cache();
+    }
+    let mut index: Index = discover(registry);
+    if let Some(since) = since {
+        // Dropped before anything is opened: judging whether an entry is a
+        // copy means reading its file, and that is the cost being avoided.
+        index.entries.retain(|e| changed_at(e).is_some_and(|t| t >= since));
+    }
 
     // OpenCode and Antigravity have no live_root (rows/per-conversation
     // databases, not linkable files) but are still valid targets.
@@ -754,8 +1033,18 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
     // Same for Antigravity's summaries index.
     let mut antigravity_backed_up = false;
 
+    // Manifests written before the OpenCode branch refreshed its rows in
+    // place hold one extra copy of each row per past sync. `read_manifest`
+    // collapses them; rewrite the file when that removed anything.
+    let rows_on_disk = read_manifest_raw().len();
     let mut manifest = read_manifest();
-    let mut manifest_dirty = false;
+    let mut manifest_dirty = manifest.len() != rows_on_disk;
+    // Rows written before OpenCode copies took OpenCode's own id shape are
+    // renamed in place, and the manifest follows them. Until then OpenCode's
+    // free models refuse those sessions.
+    if !dry_run && rename_opencode_rows(&mut manifest) > 0 {
+        manifest_dirty = true;
+    }
     let already: Vec<(String, PathBuf)> = manifest
         .iter()
         .map(|r| (r.session_id.clone(), r.dest.clone()))
@@ -765,8 +1054,55 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
     // so the next discovery pass sees those files as ordinary sessions. Left
     // unguarded they get re-materialized on every run and the session count
     // multiplies. A file agentbridge created is never a source.
-    let generated: std::collections::HashSet<PathBuf> =
-        manifest.iter().map(|r| r.dest.clone()).collect();
+    //
+    // OpenCode is keyed differently: every row agentbridge writes there has
+    // the *database* as its `dest`, and every session OpenCode owns has that
+    // same database as its source path. Matching on the path would mark all
+    // of OpenCode's own sessions as generated the moment one row is written
+    // (found live: a new OpenCode session never reached another tool). The
+    // row id is what identifies agentbridge's output there — from the
+    // manifest, and from the marker in the row itself.
+    let generated: std::collections::HashSet<PathBuf> = manifest
+        .iter()
+        .filter(|r| r.target_provider != "opencode")
+        .map(|r| r.dest.clone())
+        .collect();
+    let mut generated_opencode: std::collections::HashSet<String> = manifest
+        .iter()
+        .filter(|r| r.target_provider == "opencode")
+        .map(|r| r.cache.to_string_lossy().to_string())
+        .collect();
+    if let Some(db) = opencode_db() {
+        generated_opencode.extend(crate::opencode_write::written_ids(&db));
+    }
+    let in_manifest = |e: &crate::index::IndexEntry| {
+        if e.provider == "opencode" {
+            generated_opencode.contains(&e.id)
+        } else {
+            generated.contains(&e.source_path)
+        }
+    };
+    // The manifest is not the only witness. A copy made by a run this one
+    // raced, or tracked by a manifest since lost, still says it is a copy in
+    // its own title or first record. Judged on the entry's *own* file: a copy
+    // can share its origin's id, so loading by id could read the wrong one.
+    let self_declared: std::collections::HashSet<(String, String, PathBuf)> = index
+        .entries
+        .iter()
+        .filter(|e| !in_manifest(e))
+        .filter(|e| {
+            let own = match e.provider.as_str() {
+                "claude-code" | "codex-cli" => load_materialized(&e.provider, &e.source_path, &e.id),
+                _ => registry.by_id(&e.provider).and_then(|c| c.load(&e.id).ok()),
+            };
+            own.is_some_and(|s| crate::label::is_copy(&s))
+        })
+        .map(|e| (e.provider.clone(), e.id.clone(), e.source_path.clone()))
+        .collect();
+    let declares_copy = |e: &crate::index::IndexEntry| {
+        self_declared.contains(&(e.provider.clone(), e.id.clone(), e.source_path.clone()))
+    };
+    let is_generated = |e: &crate::index::IndexEntry| in_manifest(e) || declares_copy(e);
 
     // Two index entries can carry the same (provider, id) — e.g. a generated
     // file sits alongside its own source. They resolve to one destination, so
@@ -786,7 +1122,7 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
             }
             Some(&i) => {
                 let kept = entries[i];
-                if generated.contains(&kept.source_path) && !generated.contains(&e.source_path) {
+                if is_generated(kept) && !is_generated(e) {
                     entries[i] = e;
                 }
             }
@@ -794,7 +1130,10 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
     }
 
     for entry in entries {
-        if generated.contains(&entry.source_path) {
+        if is_generated(entry) {
+            if declares_copy(entry) {
+                report.skipped_copies += 1;
+            }
             continue;
         }
         for target in &targets {
@@ -879,7 +1218,7 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
                     } else {
                         live_root(target).unwrap_or_default().join("(planned)")
                     },
-                    cache: cache_root(target).join("(planned)"),
+                    cache: staging_root(target).join("(planned)"),
                     session_id: entry.id.clone(),
                     source_provider: entry.provider.clone(),
                     target_provider: target.clone(),
@@ -995,7 +1334,7 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
                     report.errors.push(format!("opencode {}", e));
                 }
                 for row in rows {
-                    report.created.push(LinkRecord {
+                    let record = LinkRecord {
                         dest: db.clone(),
                         cache: PathBuf::from(row.id),
                         session_id: entry.id.clone(),
@@ -1014,13 +1353,30 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
                         // would make every untitled session look renamed on
                         // the next pull (see RowWritten::title).
                         title: Some(row.title),
-                    });
+                    };
+                    // A re-sync rewrites the same row in place, so its
+                    // manifest entry is updated, not appended — the same rule
+                    // the antigravity branch follows, for the same reason: an
+                    // appended copy per run made `pull` report one typed turn
+                    // as several and a conflict of OpenCode against itself.
+                    if let Some(existing) = manifest.iter_mut().find(|r| {
+                        r.target_provider == "opencode"
+                            && r.dest == record.dest
+                            && r.cache == record.cache
+                    }) {
+                        *existing = record;
+                        manifest_dirty = true;
+                        report.unchanged += 1;
+                    } else {
+                        report.created.push(record);
+                    }
                 }
                 continue;
             }
 
-            // Rule 2: derive once into the cache.
-            let cache = cache_root(target);
+            // Convert once, into this run's staging folder. Each file is moved
+            // on into the tool's store below and the folder is emptied.
+            let cache = staging_root(target);
             let live = live_root(target).unwrap_or_default();
             let converter = match converter_for(target) { Some(c) => c, None => continue };
             // Codex scopes the resume picker to the rollout's session_meta
@@ -1082,22 +1438,31 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
                 let dest = live.join(rel);
 
                 if already.iter().any(|(id, d)| id == &entry.id && d == &dest) && dest.exists() {
-                    // The artifact was just re-converted and the live copy shares
-                    // its inode (hardlink), so the copy *is* refreshed even though
-                    // nothing is linked. The manifest count must follow, or the
-                    // next pull reads agentbridge's own refresh as tool drift.
+                    // Already in the tool's store. Replace it only when the
+                    // session really changed, so an idle sync rewrites nothing.
+                    // The manifest count must follow, or the next pull reads
+                    // agentbridge's own refresh as tool drift.
                     //
                     // Title tracks session.title here, unlike the OpenCode branch
                     // below: `load_materialized` for codex-cli reads the rollout
                     // *file*, which never carries a title in the modern format —
                     // never `ensure_codex_row`'s DB-side fallback, which pull_back
                     // can never observe through that read path anyway.
+                    if !same_content(artifact, &dest)
+                        && let Err(e) = link_or_copy(artifact, &dest)
+                    {
+                        report.errors.push(format!("refresh {}: {}", entry.id, e));
+                        continue;
+                    }
                     if let Some(row) = manifest
                         .iter_mut()
                         .find(|r| r.session_id == entry.id && r.dest == dest)
                     {
                         row.message_count = session.messages.len();
                         row.title = session.title.clone();
+                        // The file may be a new one now; `unsync` checks this.
+                        row.inode = inode_of(&dest);
+                        row.cache = dest.clone();
                         manifest_dirty = true;
                     }
                     // A materialized rollout still needs its `threads` row for
@@ -1110,15 +1475,30 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
                     continue;
                 }
 
-                // Rule 3: presence by hardlink, not copy.
+                // Invariant 2, enforced where the write happens: a file already
+                // at `dest` that agentbridge did not make is a session the tool
+                // owns. That can only be reached when a copy sharing its
+                // origin's id is mistaken for a source, and then the
+                // destination *is* the original. Leave it alone.
+                if dest.exists()
+                    && !generated.contains(&dest)
+                    && load_materialized(target, &dest, &entry.id)
+                        .is_some_and(|s| !crate::label::is_copy(&s))
+                {
+                    report.skipped_native += 1;
+                    continue;
+                }
+
+                // Into the tool's store. The staged file is removed when the
+                // run ends, leaving this as the only one.
                 match link_or_copy(artifact, &dest) {
                     Ok(inode) => {
                         if is_codex {
                             ensure_codex_row(&mut report, &mut codex_backed_up, &session, &dest, std::slice::from_ref(dir));
                         }
                         report.created.push(LinkRecord {
+                            cache: dest.clone(),
                             dest,
-                            cache: artifact.clone(),
                             session_id: entry.id.clone(),
                             source_provider: entry.provider.clone(),
                             target_provider: target.clone(),
@@ -1197,6 +1577,15 @@ fn ensure_codex_row(
     rollout_path: &Path,
     dirs: &[String],
 ) -> Option<String> {
+    // The name Codex shows. Done before the index guard on purpose: this is
+    // an append to a file Codex itself appends to, so it is safe while Codex
+    // is open, and waiting would leave the session to be named by Codex.
+    if let (Some(home), Some(label)) =
+        (crate::connectors::codex_cli::config_home(), session.title.as_deref())
+    {
+        let thread = crate::convert::ClaudeCodeConverter::session_uuid(&session.id);
+        crate::codex_write::ensure_thread_name(&home, &thread, label);
+    }
     let db = crate::codex_write::state_db()?;
     if let Err(e) = crate::codex_write::ensure_safe_to_write() {
         report.errors.push(e.to_string());
@@ -1235,6 +1624,119 @@ fn ensure_codex_row(
 
 /// Remove exactly the files agentbridge created. A destination whose inode
 /// no longer matches the manifest belongs to something else now and is kept.
+/// Which copies a partial `unsync` takes away. Empty means everything.
+#[derive(Debug, Default, Clone)]
+pub struct UnsyncFilter {
+    /// Copies written by a sync of this folder.
+    pub project: Option<PathBuf>,
+    /// Copies of these sessions, wherever they were written.
+    pub sessions: Vec<String>,
+}
+
+impl UnsyncFilter {
+    fn is_empty(&self) -> bool {
+        self.project.is_none() && self.sessions.is_empty()
+    }
+
+    fn matches(&self, r: &LinkRecord) -> bool {
+        self.project.as_deref() == Some(r.project.as_path())
+            || self.sessions.contains(&r.session_id)
+    }
+}
+
+/// `unsync` for part of the machine: only the copies `filter` names are
+/// removed, one by one, and every other manifest row is kept. A copy whose
+/// tool is open is left in the manifest for a later run.
+pub fn unsync_matching(dry_run: bool, filter: &UnsyncFilter) -> UnsyncReport {
+    if filter.is_empty() {
+        return unsync(dry_run);
+    }
+    let mut report = UnsyncReport::default();
+    // This rewrites the manifest, so it waits its turn behind a running sync
+    // rather than racing it. After two minutes it goes ahead: a lock that old
+    // is far more likely a run that died than one still working.
+    let _lock = if dry_run {
+        None
+    } else {
+        let mut lock = acquire_run_lock();
+        for _ in 0..240 {
+            if lock.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            lock = acquire_run_lock();
+        }
+        lock
+    };
+    let records = read_manifest();
+    let mut keep: Vec<LinkRecord> = Vec::new();
+
+    for r in records {
+        if !filter.matches(&r) {
+            keep.push(r);
+            continue;
+        }
+        if dry_run {
+            report.removed.push(r.dest.clone());
+            continue;
+        }
+        let id = materialized_id(&r);
+        let removed = match r.target_provider.as_str() {
+            "opencode" => {
+                crate::opencode_write::ensure_safe_to_write().is_ok()
+                    && crate::opencode_write::remove_one(&r.dest, &id).is_ok()
+            }
+            "antigravity" => {
+                crate::antigravity_write::ensure_safe_to_write().is_ok()
+                    && crate::antigravity_write::store()
+                        .is_some_and(|home| crate::antigravity_write::remove_one(&home, &id).is_ok())
+            }
+            _ => match fs::metadata(&r.dest) {
+                Err(_) => {
+                    report.missing += 1;
+                    continue;
+                }
+                Ok(meta) if meta.ino() != r.inode => {
+                    report.kept_foreign.push(r.dest.clone());
+                    keep.push(r);
+                    continue;
+                }
+                Ok(_) => {
+                    if r.target_provider == "codex-cli"
+                        && let Some(db) = crate::codex_write::state_db()
+                        && crate::codex_write::ensure_safe_to_write().is_ok()
+                    {
+                        let _ = crate::codex_write::remove_rows_for_path(&db, &r.dest);
+                    }
+                    let gone = fs::remove_file(&r.dest).is_ok();
+                    if gone
+                        && let Some(parent) = r.dest.parent()
+                        && fs::read_dir(parent).map(|mut d| d.next().is_none()).unwrap_or(false)
+                    {
+                        let _ = fs::remove_dir(parent);
+                    }
+                    gone
+                }
+            },
+        };
+        if removed {
+            report.removed.push(r.dest.clone());
+        } else {
+            report.kept_foreign.push(r.dest.clone());
+            keep.push(r);
+        }
+    }
+
+    if !dry_run {
+        let body: String = keep
+            .iter()
+            .map(|r| serde_json::to_string(r).unwrap_or_default() + "\n")
+            .collect();
+        let _ = fs::write(manifest_path(), body);
+    }
+    report
+}
+
 pub fn unsync(dry_run: bool) -> UnsyncReport {
     let mut report = UnsyncReport::default();
     let records = read_manifest();
@@ -1387,6 +1889,10 @@ mod tests {
                 // would write conversations into the operator's real
                 // ~/.gemini store (HANDOFF §sandbox doctrine).
                 std::env::set_var("ANTIGRAVITY_HOME", tmp.path().join(".gemini/antigravity-cli"));
+                // And OpenCode: its database path honors XDG_DATA_HOME, so an
+                // operator shell that exports it would send a sandboxed test
+                // to their real database. Same location HOME alone gives.
+                std::env::set_var("XDG_DATA_HOME", tmp.path().join(".local/share"));
             }
             Sandbox { _tmp: tmp, _guard: guard }
         }
@@ -1708,6 +2214,512 @@ mod tests {
                 r.dest.display()
             );
         }
+    }
+
+    /// An empty OpenCode database at the sandboxed default path, with the
+    /// schema the write path and the reader both need.
+    fn make_opencode_db() -> PathBuf {
+        let db = crate::connectors::opencode::default_db_path();
+        fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            r#"
+            PRAGMA foreign_keys = ON;
+            CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT NOT NULL,
+                time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+                sandboxes TEXT NOT NULL);
+            CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                parent_id TEXT, slug TEXT NOT NULL, directory TEXT NOT NULL,
+                title TEXT NOT NULL, version TEXT NOT NULL,
+                time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+                metadata TEXT,
+                FOREIGN KEY (project_id) REFERENCES project(id) ON DELETE CASCADE);
+            CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES session(id) ON DELETE CASCADE);
+            CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL,
+                session_id TEXT NOT NULL, time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL, data TEXT NOT NULL,
+                FOREIGN KEY (message_id) REFERENCES message(id) ON DELETE CASCADE);
+            INSERT INTO project VALUES ('global','/',0,0,'[]');
+            "#,
+        )
+        .unwrap();
+        db
+    }
+
+    /// A session OpenCode itself created: no agentbridge marker, one user turn.
+    fn insert_native_opencode_session(db: &Path, id: &str, directory: &str, text: &str) {
+        let conn = Connection::open(db).unwrap();
+        let ts: i64 = 1_790_927_764_000;
+        conn.execute(
+            "INSERT INTO session (id, project_id, slug, directory, title, version, \
+             time_created, time_updated) VALUES (?1,'global','s',?2,?3,'1.18.30',?4,?4)",
+            params![id, directory, format!("New session - 2026-10-02T07:56:04.904Z"), ts],
+        )
+        .unwrap();
+        append_opencode_user_turn(&conn, id, &format!("msg_{id}"), ts, text);
+    }
+
+    fn append_opencode_user_turn(conn: &Connection, session: &str, msg_id: &str, ts: i64, text: &str) {
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data) \
+             VALUES (?1, ?2, ?3, ?3, ?4)",
+            params![msg_id, session, ts, serde_json::json!({"role":"user"}).to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) \
+             VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
+            params![
+                format!("prt_{msg_id}"),
+                msg_id,
+                session,
+                ts,
+                serde_json::json!({"type":"text","text":text}).to_string()
+            ],
+        )
+        .unwrap();
+    }
+
+    /// A registry with a Claude reader and a real OpenCode connector, both in
+    /// the sandbox, so OpenCode is a discovery source and a write target.
+    fn opencode_registry(claude_root: PathBuf) -> crate::connector::Registry {
+        crate::connector::Registry::new(vec![
+            Box::new(crate::connectors::claude_code::TestClaudeCode::new(claude_root)),
+            Box::new(crate::connectors::opencode::OpenCodeConnector::new()),
+        ])
+    }
+
+    /// Found live 2026-10-02 (real opencode 1.18.30 database, sandboxed): the
+    /// OpenCode branch always *appended* its manifest rows, so every sync added
+    /// another row per session. One turn typed in OpenCode was then reported
+    /// as 5 turns and a conflict of OpenCode against itself
+    /// ("opencode+opencode+opencode+opencode+opencode"). Same bug the
+    /// antigravity branch had.
+    #[test]
+    fn test_resync_updates_opencode_manifest_rows_instead_of_appending() {
+        let _sb = Sandbox::new();
+        let live = live_root("claude-code").unwrap();
+        write_native_claude_session(&live, "/tmp/merge-project");
+        let db = make_opencode_db();
+        let registry = opencode_registry(live);
+
+        sync_into(&registry, Path::new("/tmp/merge-project"), false);
+        let after_first = read_manifest().len();
+        assert!(
+            read_manifest().iter().any(|r| r.target_provider == "opencode"),
+            "opencode must be a sync target"
+        );
+        sync_into(&registry, Path::new("/tmp/merge-project"), false);
+        sync_into(&registry, Path::new("/tmp/merge-project"), false);
+        let rows = read_manifest();
+        assert_eq!(rows.len(), after_first, "re-syncing must refresh manifest rows, not add more");
+
+        // One real turn typed in OpenCode into one synced row.
+        let row = rows.iter().find(|r| r.target_provider == "opencode").unwrap();
+        let oc_id = row.cache.to_string_lossy().to_string();
+        let conn = Connection::open(&db).unwrap();
+        append_opencode_user_turn(&conn, &oc_id, "msg_zz_new", 1_799_000_000_000, "TYPED IN OPENCODE");
+        drop(conn);
+
+        let report = pull_back(false);
+        let got: usize = report.pulled.iter().map(|(_, n)| n).sum();
+        assert_eq!(got, 1, "one typed turn is one recovered turn: {:?}", report.pulled);
+        assert!(
+            report.conflicts.is_empty(),
+            "one tool's work is never a conflict with itself: {:?}",
+            report.conflicts
+        );
+    }
+
+    /// A manifest already carrying the repeats (written by a build before the
+    /// fix above) must not make the very next `pull` report a self-conflict.
+    #[test]
+    fn test_pull_ignores_repeated_manifest_rows_from_older_builds() {
+        let _sb = Sandbox::new();
+        let live = live_root("claude-code").unwrap();
+        write_native_claude_session(&live, "/tmp/merge-project");
+        let db = make_opencode_db();
+        let registry = opencode_registry(live);
+        sync_into(&registry, Path::new("/tmp/merge-project"), false);
+
+        // Re-create the old damage: every row three more times.
+        let rows = read_manifest();
+        let body: String = (0..4)
+            .flat_map(|_| rows.iter())
+            .map(|r| serde_json::to_string(r).unwrap() + "\n")
+            .collect();
+        fs::write(manifest_path(), body).unwrap();
+        assert_eq!(read_manifest_raw().len(), rows.len() * 4);
+
+        let row = rows.iter().find(|r| r.target_provider == "opencode").unwrap();
+        let conn = Connection::open(&db).unwrap();
+        append_opencode_user_turn(
+            &conn,
+            &row.cache.to_string_lossy(),
+            "msg_zz_new",
+            1_799_000_000_000,
+            "TYPED IN OPENCODE",
+        );
+        drop(conn);
+
+        let report = pull_back(false);
+        let got: usize = report.pulled.iter().map(|(_, n)| n).sum();
+        assert_eq!(got, 1, "one typed turn is one recovered turn: {:?}", report.pulled);
+        assert!(report.conflicts.is_empty(), "no self-conflict: {:?}", report.conflicts);
+        assert_eq!(read_manifest_raw().len(), rows.len(), "and the repeats are gone from disk");
+    }
+
+    /// Found live 2026-10-02: every OpenCode manifest row has the database
+    /// itself as its `dest`, and loop prevention skipped any source whose path
+    /// is a known `dest`. So after the first sync that wrote one row into
+    /// OpenCode, *every* session OpenCode owns was treated as agentbridge's
+    /// own output, and a new OpenCode session never reached another tool.
+    #[test]
+    fn test_native_opencode_sessions_still_sync_after_agentbridge_wrote_into_opencode() {
+        let _sb = Sandbox::new();
+        let live = live_root("claude-code").unwrap();
+        write_native_claude_session(&live, "/tmp/merge-project");
+        let db = make_opencode_db();
+        let registry = opencode_registry(live);
+
+        // First sync writes the Claude session into OpenCode.
+        sync_into(&registry, Path::new("/tmp/merge-project"), false);
+        let written = crate::opencode_write::count_written(&db);
+        assert!(written > 0);
+
+        // The user then starts a session in OpenCode.
+        insert_native_opencode_session(&db, "ses_native0001tailAAAA", "/tmp/other", "started in opencode");
+        sync_into(&registry, Path::new("/tmp/merge-project"), false);
+
+        assert!(
+            read_manifest()
+                .iter()
+                .any(|r| r.session_id == "ses_native0001tailAAAA" && r.target_provider == "claude-code"),
+            "a session created in OpenCode must be materialized into Claude Code"
+        );
+
+        // And the rows agentbridge wrote must still never become sources.
+        sync_into(&registry, Path::new("/tmp/merge-project"), false);
+        let rows = read_manifest();
+        let ours = crate::opencode_write::written_ids(&db);
+        assert!(!ours.is_empty());
+        assert!(
+            rows.iter().all(|r| !ours.contains(&r.session_id)),
+            "agentbridge's own OpenCode rows must not be re-materialized"
+        );
+        let before = rows.len();
+        sync_into(&registry, Path::new("/tmp/merge-project"), false);
+        assert_eq!(read_manifest().len(), before, "and the manifest stays the same size");
+    }
+
+    /// Found on the operator's real machine 2026-10-02: the shell hook starts
+    /// one `sync` per new shell, several at once, and a tool's own startup
+    /// shells count. Each run read the manifest before another had written
+    /// it, saw that run's copies as ordinary sessions, and copied the copies.
+    /// One Claude session ended up in agy four times, twice labeled as if
+    /// Codex had made it, and the real manifest reached 123k rows.
+    ///
+    /// The manifest cannot be the only thing that says "this is a copy". Here
+    /// it is deleted outright; nothing may be copied again.
+    #[test]
+    fn test_copies_are_never_sources_even_when_the_manifest_is_lost() {
+        let _sb = Sandbox::new();
+        let live = live_root("claude-code").unwrap();
+        write_native_claude_session(&live, "/tmp/merge-project");
+        let db = make_opencode_db();
+        insert_native_opencode_session(&db, "ses_native0001tailAAAA", "/tmp/other", "started in opencode");
+        let codex = live_root("codex-cli").unwrap();
+        fs::create_dir_all(codex.join("sessions")).unwrap();
+        let registry = crate::connector::Registry::new(vec![
+            Box::new(crate::connectors::claude_code::TestClaudeCode::new(live.clone())),
+            Box::new(crate::connectors::codex_cli::CodexCliConnector::new()),
+            Box::new(crate::connectors::opencode::OpenCodeConnector::new()),
+        ]);
+        let count_files = |root: &Path| {
+            walkdir::WalkDir::new(root)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
+                .count()
+        };
+
+        let first = sync_into(&registry, Path::new("/tmp/merge-project"), false);
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+        let rows = read_manifest().len();
+        let (claude_files, codex_files, oc_rows) = (
+            count_files(&live),
+            count_files(&codex.join("sessions")),
+            crate::opencode_write::count_written(&db),
+        );
+        assert!(codex_files > 0 && oc_rows > 0, "both stores were written into");
+
+        fs::remove_file(manifest_path()).unwrap();
+        let second = sync_into(&registry, Path::new("/tmp/merge-project"), false);
+        assert!(second.errors.is_empty(), "{:?}", second.errors);
+
+        assert_eq!(count_files(&live), claude_files, "no copy of a copy in Claude Code");
+        assert_eq!(count_files(&codex.join("sessions")), codex_files, "none in Codex");
+        assert_eq!(crate::opencode_write::count_written(&db), oc_rows, "none in OpenCode");
+        assert_eq!(read_manifest().len(), rows, "the same copies are tracked again, no more");
+        for r in read_manifest() {
+            let label = crate::label::parse(r.title.as_deref().unwrap_or_default())
+                .unwrap_or_else(|| panic!("every copy is labeled: {:?}", r.title));
+            assert_eq!(
+                label.provider, r.source_provider,
+                "a copy names the tool the session really came from: {:?}",
+                r.title
+            );
+            assert!(
+                ["claude-code", "opencode"].contains(&label.provider),
+                "only the two tools that own a session here may be an origin: {:?}",
+                r.title
+            );
+        }
+    }
+
+    /// Found on the operator's real machine 2026-10-02: a Claude session's own
+    /// file (39 records, written by Claude Code) was replaced by a 13 line
+    /// converted copy titled `codex-cli · …`. A Codex copy of that session
+    /// keeps the session's id, so when a racing run took the copy for a Codex
+    /// session and wrote it "into Claude Code", the destination was the
+    /// original file itself. A tool's own session is never written over,
+    /// whatever led there.
+    #[test]
+    fn test_a_tools_own_session_file_is_never_written_over() {
+        let _sb = Sandbox::new();
+        let live = live_root("claude-code").unwrap();
+        write_native_claude_session(&live, "/tmp/merge-project");
+        let native = live
+            .join(crate::convert::ClaudeCodeConverter::encode_project_dir("/tmp/merge-project"))
+            .join(format!("{}.jsonl", NATIVE_UUID));
+        let before = fs::read(&native).unwrap();
+
+        // A Codex rollout for the same id and folder that no manifest knows
+        // about and that carries no origin record: what an older build's copy
+        // looks like to a run that raced it.
+        let codex = live_root("codex-cli").unwrap();
+        let day = codex.join("sessions/2026/07/01");
+        fs::create_dir_all(&day).unwrap();
+        fs::write(
+            day.join(format!("rollout-2026-07-01T12-00-00-{}.jsonl", NATIVE_UUID)),
+            format!(
+                "{{\"timestamp\":\"2026-07-01T12:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"session_id\":\"{id}\",\"timestamp\":\"2026-07-01T12:00:00Z\",\"cwd\":\"/tmp/merge-project\",\"source\":\"cli\"}}}}\n\
+                 {{\"timestamp\":\"2026-07-01T12:00:05Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"user_message\",\"message\":\"first question\"}}}}\n",
+                id = NATIVE_UUID
+            ),
+        )
+        .unwrap();
+        let registry = crate::connector::Registry::new(vec![
+            Box::new(crate::connectors::claude_code::TestClaudeCode::new(live.clone())),
+            Box::new(crate::connectors::codex_cli::CodexCliConnector::new()),
+        ]);
+
+        sync_into(&registry, Path::new("/tmp/merge-project"), false);
+
+        assert_eq!(
+            fs::read(&native).unwrap(),
+            before,
+            "the session file Claude Code owns must be byte for byte untouched"
+        );
+    }
+
+    /// `unsync --project` takes away what one folder's sync wrote and nothing
+    /// else: the other folder's copies, the manifest rows for them, and every
+    /// session a tool owns all stay.
+    #[test]
+    fn test_unsync_for_one_project_leaves_the_rest() {
+        let _sb = Sandbox::new();
+        let live = live_root("claude-code").unwrap();
+        write_native_claude_session(&live, "/tmp/merge-project");
+        let db = make_opencode_db();
+        insert_native_opencode_session(&db, "ses_native0001tailAAAA", "/tmp/other", "started in opencode");
+        let registry = opencode_registry(live.clone());
+
+        sync_into(&registry, Path::new("/tmp/project-a"), false);
+        sync_into(&registry, Path::new("/tmp/project-b"), false);
+        let before = read_manifest();
+        let in_a = before.iter().filter(|r| r.project == Path::new("/tmp/project-a")).count();
+        assert!(in_a > 0 && in_a < before.len(), "both folders have copies: {in_a} of {}", before.len());
+
+        let report = unsync_matching(
+            false,
+            &UnsyncFilter { project: Some(PathBuf::from("/tmp/project-a")), sessions: vec![] },
+        );
+        assert_eq!(report.removed.len(), in_a, "exactly that folder's copies");
+
+        let after = read_manifest();
+        assert_eq!(after.len(), before.len() - in_a, "the other rows are kept");
+        assert!(after.iter().all(|r| r.project != Path::new("/tmp/project-a")));
+        for r in &after {
+            if r.target_provider == "claude-code" {
+                assert!(r.dest.exists(), "another folder's copy must survive: {}", r.dest.display());
+            }
+        }
+        let conn = Connection::open(&db).unwrap();
+        let native: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session WHERE id = 'ses_native0001tailAAAA'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(native, 1, "OpenCode's own session is untouched");
+
+        // By session: every copy of one session, wherever it was written.
+        let report = unsync_matching(
+            false,
+            &UnsyncFilter { project: None, sessions: vec![NATIVE_UUID.to_string()] },
+        );
+        assert!(!report.removed.is_empty());
+        assert!(read_manifest().iter().all(|r| r.session_id != NATIVE_UUID));
+    }
+
+    /// A sync limited to what changed leaves older sessions alone. This is
+    /// what lets an automatic sync run without re-publishing a machine's whole
+    /// history every time.
+    #[test]
+    fn test_sync_since_only_touches_sessions_that_changed() {
+        let _sb = Sandbox::new();
+        let live = live_root("claude-code").unwrap();
+        write_native_claude_session(&live, "/tmp/merge-project");
+        let db = make_opencode_db();
+        let registry = opencode_registry(live);
+        let project = Path::new("/tmp/elsewhere");
+
+        // Nothing changed after this moment, so nothing is written.
+        let later = chrono::Utc::now() + chrono::Duration::hours(1);
+        let report = sync_into_since(&registry, project, false, Some(later));
+        assert!(report.created.is_empty(), "an old session is left alone: {:?}", report.created);
+        assert_eq!(crate::opencode_write::count_written(&db), 0);
+
+        // The session file was written a moment ago, so a window that starts
+        // before that takes it.
+        let earlier = chrono::Utc::now() - chrono::Duration::hours(1);
+        let report = sync_into_since(&registry, project, false, Some(earlier));
+        assert!(!report.created.is_empty(), "a session changed since then is published");
+    }
+
+    #[test]
+    fn test_sync_state_round_trips() {
+        let _sb = Sandbox::new();
+        assert!(last_sync_state().is_none(), "no state before the first run");
+        let at = chrono::Utc::now();
+        record_sync_state(at, "abc123").unwrap();
+        let (read_at, fp) = last_sync_state().expect("state is read back");
+        assert_eq!(fp, "abc123");
+        assert_eq!(read_at.timestamp(), at.timestamp());
+    }
+
+    /// Copies written under the old id shape are renamed by the next sync, and
+    /// the manifest keeps pointing at them, so `pull` still finds their turns.
+    #[test]
+    fn test_sync_renames_old_shaped_opencode_rows_and_the_manifest_follows() {
+        let _sb = Sandbox::new();
+        let live = live_root("claude-code").unwrap();
+        write_native_claude_session(&live, "/tmp/merge-project");
+        let db = make_opencode_db();
+        let registry = opencode_registry(live);
+        sync_into(&registry, Path::new("/tmp/merge-project"), false);
+
+        // Rewind one row, and its manifest entry, to the old shape.
+        let mut rows = read_manifest();
+        let i = rows.iter().position(|r| r.target_provider == "opencode").unwrap();
+        let good = rows[i].cache.to_string_lossy().to_string();
+        let old = "ses_ab0123456789abcdef0123456789abcdef";
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        for sql in [
+            "UPDATE session SET id = ?2 WHERE id = ?1",
+            "UPDATE message SET session_id = ?2 WHERE session_id = ?1",
+            "UPDATE part SET session_id = ?2 WHERE session_id = ?1",
+        ] {
+            conn.execute(sql, params![good, old]).unwrap();
+        }
+        drop(conn);
+        rows[i].cache = PathBuf::from(old);
+        let body: String = rows.iter().map(|r| serde_json::to_string(r).unwrap() + "\n").collect();
+        fs::write(manifest_path(), body).unwrap();
+        let before = rows.len();
+
+        sync_into(&registry, Path::new("/tmp/merge-project"), false);
+
+        let after = read_manifest();
+        assert_eq!(after.len(), before, "renamed, not added again");
+        assert!(after.iter().all(|r| r.cache.as_os_str() != old), "no manifest row is left on the old id");
+        assert!(after.iter().any(|r| r.cache.as_os_str() == good.as_str()));
+        let ids = crate::opencode_write::written_ids(&db);
+        assert!(ids.contains(&good) && !ids.contains(&old.to_string()), "{ids:?}");
+        assert!(pull_back(false).errors.is_empty());
+    }
+
+    /// agentbridge keeps no copy of any session. After a sync the only
+    /// converted file is the one in the target tool's store, the folder older
+    /// builds filled is gone, and a later sync still refreshes that file.
+    #[test]
+    fn test_sync_keeps_no_copy_in_agentbridges_own_folder() {
+        let _sb = Sandbox::new();
+        let registry = crate::connectors::all_for_testing(&fixture_root());
+        // What an older build left behind.
+        let legacy = data_dir().join("cache/claude-code/old");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("leftover.jsonl"), "x").unwrap();
+
+        let report = sync_into(&registry, Path::new("/tmp/some-project"), false);
+        let link = first_claude_link(&report);
+
+        assert!(!data_dir().join("cache").exists(), "the old cache folder is removed");
+        assert!(!data_dir().join("staging").exists(), "nothing is left staged");
+        assert_eq!(fs::metadata(&link.dest).unwrap().nlink(), 1, "the tool's file is the only one");
+
+        // A turn recovered from another tool still reaches that file.
+        append_claude_turn(&link.dest, &link.session_id, "ADDED ELSEWHERE");
+        pull_back(false);
+        sync_into(&registry, Path::new("/tmp/some-project"), false);
+        assert!(fs::read_to_string(&link.dest).unwrap().contains("ADDED ELSEWHERE"));
+        assert!(!data_dir().join("staging").exists());
+
+        // And unsync still knows the file as its own after the refresh.
+        let removed = unsync(false);
+        assert!(removed.removed.contains(&link.dest) && removed.kept_foreign.is_empty());
+    }
+
+    /// Two syncs at once is the race above. The second one must stand down.
+    #[test]
+    fn test_a_second_sync_stands_down_while_one_is_running() {
+        let _sb = Sandbox::new();
+        let live = live_root("claude-code").unwrap();
+        write_native_claude_session(&live, "/tmp/merge-project");
+        make_opencode_db();
+        let registry = opencode_registry(live);
+
+        let held = acquire_run_lock().expect("first run takes the lock");
+        let report = sync_into(&registry, Path::new("/tmp/merge-project"), false);
+        assert!(report.created.is_empty(), "nothing is written while another run holds the lock");
+        assert!(
+            report.errors.iter().any(|e| e.contains("another agentbridge")),
+            "and it says why: {:?}",
+            report.errors
+        );
+        assert!(read_manifest().is_empty());
+        let pulled = pull_back(false);
+        assert!(pulled.errors.iter().any(|e| e.contains("another agentbridge")));
+
+        drop(held);
+        let report = sync_into(&registry, Path::new("/tmp/merge-project"), false);
+        assert!(!report.created.is_empty(), "the lock is released when the run ends");
+    }
+
+    /// A run that died leaves its lock behind; it must not block sync forever.
+    #[test]
+    fn test_a_stale_lock_is_taken_over() {
+        let _sb = Sandbox::new();
+        fs::create_dir_all(data_dir()).unwrap();
+        let lock = data_dir().join("sync.lock");
+        fs::write(&lock, "999999").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        fs::File::options().write(true).open(&lock).unwrap().set_modified(old).unwrap();
+        assert!(acquire_run_lock().is_some(), "an hour old lock is stale");
     }
 
     /// Write-back out of antigravity: turns appended to the materialized
@@ -2033,7 +3045,7 @@ mod tests {
             "dry run must not write a manifest"
         );
         assert!(
-            !cache_root("claude-code").exists(),
+            !staging_root("claude-code").exists(),
             "dry run must not materialize artifacts"
         );
     }
@@ -2151,6 +3163,38 @@ mod tests {
             overlay.iter().any(|m| m.text.as_deref() == Some("CONTINUED IN ANOTHER TOOL")),
             "overlay must hold the new turn"
         );
+    }
+
+    /// Found live with real Codex 0.160: resuming a synced session there made
+    /// Codex write its own bookkeeping as turns (`<environment_context>…`,
+    /// `<skills_instructions>…`). Pull recovered them, and every other tool
+    /// then showed them as things you had said. Only real turns travel.
+    #[test]
+    fn test_pull_back_leaves_a_tools_bookkeeping_turns_behind() {
+        let _sb = Sandbox::new();
+        let registry = crate::connectors::all_for_testing(&fixture_root());
+        let synced = sync_into(&registry, Path::new("/tmp/some-project"), false);
+        let link = first_claude_link(&synced);
+
+        append_claude_turn(
+            &link.dest,
+            &link.session_id,
+            "<environment_context>\n  <cwd>/tmp/some-project</cwd>\n</environment_context>",
+        );
+        append_claude_turn(&link.dest, &link.session_id, "   ");
+        append_claude_turn(&link.dest, &link.session_id, "A REAL QUESTION");
+
+        let report = pull_back(false);
+        let got: usize = report.pulled.iter().map(|(_, n)| n).sum();
+        assert_eq!(got, 1, "only the real turn is recovered: {:?}", report.pulled);
+        let overlay = overlay_messages(&link.session_id);
+        assert!(overlay.iter().any(|m| m.text.as_deref() == Some("A REAL QUESTION")));
+        assert!(
+            !overlay.iter().any(|m| m.text.as_deref().is_some_and(|t| t.contains("environment_context"))),
+            "bookkeeping must not reach the overlay"
+        );
+        // Both were counted as seen, so the next pull has nothing left to do.
+        assert!(pull_back(false).pulled.is_empty(), "and it is not offered again");
     }
 
     /// Pulling twice must not duplicate the same turn.
@@ -2682,7 +3726,7 @@ mod tests {
 
         let report = unsync(false);
         assert!(
-            !cache_root("claude-code").exists(),
+            !staging_root("claude-code").exists(),
             "unsync must drop the derived cache too"
         );
         assert_eq!(
