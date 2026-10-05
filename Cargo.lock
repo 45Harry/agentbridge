@@ -18,6 +18,7 @@ dependencies = [
  "thiserror",
  "uuid",
  "walkdir",
+ "winapi-util",
 ]
 
 [[package]]
