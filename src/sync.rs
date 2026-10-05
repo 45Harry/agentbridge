@@ -15,7 +15,6 @@ use crate::convert::{ClaudeCodeConverter, CodexCliConverter, SessionConverter};
 use crate::index::{discover, Index};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 /// One file agentbridge created, and enough identity to remove it safely.
@@ -668,9 +667,9 @@ fn link_or_copy(src: &Path, dest: &Path) -> std::io::Result<u64> {
 
     // Already the same inode: the hardlink is in place, nothing to do. Falling
     // through to copy here would truncate the file we are copying *from*.
-    if let (Ok(a), Ok(b)) = (fs::metadata(src), fs::metadata(dest))
-        && a.ino() == b.ino() {
-            return Ok(a.ino());
+    if let (Ok(a), Ok(b)) = (file_id(src), file_id(dest))
+        && a == b {
+            return Ok(a);
         }
 
     match fs::hard_link(src, dest) {
@@ -692,7 +691,22 @@ fn link_or_copy(src: &Path, dest: &Path) -> std::io::Result<u64> {
             fs::copy(src, dest)?;
         }
     }
-    Ok(fs::metadata(dest)?.ino())
+    file_id(dest)
+}
+
+/// The identity of the file at `path`: two names share it exactly when they
+/// are hardlinks to one file. The inode on Unix, the NTFS file index on
+/// Windows.
+#[cfg(unix)]
+fn file_id(path: &Path) -> std::io::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(fs::metadata(path)?.ino())
+}
+
+#[cfg(windows)]
+fn file_id(path: &Path) -> std::io::Result<u64> {
+    let handle = winapi_util::Handle::from_path_any(path)?;
+    Ok(winapi_util::file::information(&handle)?.file_index())
 }
 
 /// The inode of a file agentbridge wrote directly (rather than hardlinked).
@@ -700,7 +714,7 @@ fn link_or_copy(src: &Path, dest: &Path) -> std::io::Result<u64> {
 /// replaced with a file of its own. `0` when unreadable, which `unsync` treats
 /// as "no match" and therefore leaves alone.
 fn inode_of(path: &Path) -> u64 {
-    fs::metadata(path).map(|m| m.ino()).unwrap_or(0)
+    file_id(path).unwrap_or(0)
 }
 
 /// The manifest as `status`, `pull` and `unsync` should see it: one row per
@@ -1691,12 +1705,12 @@ pub fn unsync_matching(dry_run: bool, filter: &UnsyncFilter) -> UnsyncReport {
                     && crate::antigravity_write::store()
                         .is_some_and(|home| crate::antigravity_write::remove_one(&home, &id).is_ok())
             }
-            _ => match fs::metadata(&r.dest) {
+            _ => match file_id(&r.dest) {
                 Err(_) => {
                     report.missing += 1;
                     continue;
                 }
-                Ok(meta) if meta.ino() != r.inode => {
+                Ok(id) if id != r.inode => {
                     report.kept_foreign.push(r.dest.clone());
                     keep.push(r);
                     continue;
@@ -1796,11 +1810,11 @@ pub fn unsync(dry_run: bool) -> UnsyncReport {
             report.removed.push(r.dest.clone());
             continue;
         }
-        let Ok(meta) = fs::metadata(&r.dest) else {
+        let Ok(id) = file_id(&r.dest) else {
             report.missing += 1;
             continue;
         };
-        if meta.ino() != r.inode {
+        if id != r.inode {
             report.kept_foreign.push(r.dest.clone());
             continue;
         }
@@ -1908,8 +1922,27 @@ mod tests {
         let inode = link_or_copy(&src, &dest).unwrap();
 
         // Same inode => one physical copy, two names (DESIGN.md Rule 3).
-        assert_eq!(inode, fs::metadata(&src).unwrap().ino());
+        assert_eq!(inode, file_id(&src).unwrap());
         assert_eq!(fs::read_to_string(&dest).unwrap(), "hello");
+    }
+
+    /// Regression: `file_id` must tell hardlinks apart from separate files on
+    /// every platform. It was Unix only, which broke the Windows build.
+    #[test]
+    fn test_file_id_matches_hardlinks_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.jsonl");
+        let b = tmp.path().join("b.jsonl");
+        let link = tmp.path().join("a-link.jsonl");
+        fs::write(&a, "same").unwrap();
+        fs::write(&b, "same").unwrap();
+        fs::hard_link(&a, &link).unwrap();
+
+        let id = file_id(&a).unwrap();
+        assert_ne!(id, 0);
+        assert_eq!(id, file_id(&link).unwrap());
+        assert_ne!(id, file_id(&b).unwrap());
+        assert!(file_id(&tmp.path().join("missing")).is_err());
     }
 
     /// Regression: linking a file onto itself must not destroy it. `fs::copy`
@@ -2670,7 +2703,11 @@ mod tests {
 
         assert!(!data_dir().join("cache").exists(), "the old cache folder is removed");
         assert!(!data_dir().join("staging").exists(), "nothing is left staged");
-        assert_eq!(fs::metadata(&link.dest).unwrap().nlink(), 1, "the tool's file is the only one");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(fs::metadata(&link.dest).unwrap().nlink(), 1, "the tool's file is the only one");
+        }
 
         // A turn recovered from another tool still reaches that file.
         append_claude_turn(&link.dest, &link.session_id, "ADDED ELSEWHERE");
