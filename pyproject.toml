@@ -1,0 +1,29 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "agentbridge-rs"
+description = "Local-first CLI + MCP server that bridges session context across AI coding agents."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.8"
+dynamic = ["version"]
+keywords = ["ai", "agents", "claude-code", "codex", "opencode", "antigravity", "cli"]
+classifiers = [
+    "Environment :: Console",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Rust",
+    "Topic :: Software Development",
+]
+
+[project.urls]
+Homepage = "https://github.com/45Harry/agentbridge"
+Repository = "https://github.com/45Harry/agentbridge"
+
+[tool.maturin]
+bindings = "bin"
+strip = true
