@@ -200,7 +200,16 @@ fn append_overlay(session_id: &str, messages: &[crate::model::Message]) -> std::
 fn load_materialized(target: &str, path: &Path, id: &str) -> Option<crate::model::Session> {
     match target {
         "claude-code" => crate::connectors::claude_code::load_file(path, id).ok(),
-        "codex-cli" => crate::connectors::codex_cli::load_file(path, id).ok(),
+        "codex-cli" => {
+            let mut s = crate::connectors::codex_cli::load_file(path, id).ok()?;
+            // A rollout carries no title; a name given inside Codex lives in
+            // Codex's name list, keyed by the id the copy has there.
+            if let Some(home) = crate::connectors::codex_cli::config_home() {
+                let thread = crate::convert::ClaudeCodeConverter::session_uuid(id);
+                s.title = crate::codex_write::renamed_in_codex(&home, &thread);
+            }
+            Some(s)
+        }
         "opencode" => crate::connectors::opencode::load_from_db(path, id).ok(),
         // Antigravity's `dest` is the conversation body agentbridge wrote; the
         // title lives in the separate summaries index, so it is layered on
@@ -1568,6 +1577,15 @@ fn ensure_codex_row(
     rollout_path: &Path,
     dirs: &[String],
 ) -> Option<String> {
+    // The name Codex shows. Done before the index guard on purpose: this is
+    // an append to a file Codex itself appends to, so it is safe while Codex
+    // is open, and waiting would leave the session to be named by Codex.
+    if let (Some(home), Some(label)) =
+        (crate::connectors::codex_cli::config_home(), session.title.as_deref())
+    {
+        let thread = crate::convert::ClaudeCodeConverter::session_uuid(&session.id);
+        crate::codex_write::ensure_thread_name(&home, &thread, label);
+    }
     let db = crate::codex_write::state_db()?;
     if let Err(e) = crate::codex_write::ensure_safe_to_write() {
         report.errors.push(e.to_string());

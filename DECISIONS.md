@@ -745,3 +745,53 @@ overlay, state), and free disk from 19 GB to 45 GB once the holding folder was
 deleted on their say. Tests 183 → 184.
 
 DESIGN.md §4 Rule 2 and Rule 3 describe the old scheme and are now out of date.
+
+## 2026-10-05 (evening) — A Codex copy must carry the records Codex's screen replays
+
+Reported by the operator: a synced session opened in Codex showed its id and
+an empty conversation. Yet `codex exec resume` on the same copy answered three
+questions correctly from the history.
+
+Codex keeps two views in one rollout. `response_item` records are what the
+model reads. `event_msg` records (`user_message`, `agent_message`) are what
+the screen replays. agentbridge wrote every turn as a `response_item` and only
+the first user turn as an `event_msg`. Asked through its app server
+(`thread/read` with turns), real Codex 0.160.0 reported this session's copy,
+935 messages long, as 1 turn with 1 item.
+
+Decision: every turn that says something also gets its `event_msg`, written
+just before the model's copy of the same turn. Tool calls, tool results and
+empty texts get none, since they would show as blank lines. The reader already
+counts only `response_item`s, so nothing is read back twice.
+
+After the change the same app server call on the real store returned 35 turns,
+35 user messages and 43 answers for this session, including a turn the
+operator had typed in Codex, which had come back through write back.
+
+`thread/read` over `codex app-server` is the check to use for "what does
+Codex's screen show"; `codex exec resume` only proves what the model can read.
+
+## 2026-10-05 (night) — The name Codex shows comes from Codex's own name list
+
+The operator asked why one session read "Respond to greeting" in Codex and
+`claude-code · pull the latest branch… · 2026-10-02 07:44 · a84732df`
+everywhere else.
+
+Codex keeps the name it shows in `~/.codex/session_index.jsonl`: one JSON line
+per naming, the last line for an id being current. agentbridge had only ever
+written `threads.title`. With no name of its own, the session was named by
+Codex itself the first time something was typed in it.
+
+Decision: agentbridge writes its label into that list for every copy it puts
+in Codex, and writes it again whenever the current name is something else.
+A name counts as a rename made in Codex, and is pulled to the other tools,
+only when agentbridge's label was in the list before it. A name Codex invented
+before any label existed is replaced, not spread. The write is an append to a
+file Codex appends to as well, so it is not held back while Codex is open.
+
+Verified on the real store: after one sync the real Codex app server
+(`thread/read`) returned the label as this session's name, the same string
+OpenCode and agy hold. Tests 184 → 187.
+
+Not verified: whether Codex's interactive screen still invents a name when one
+is already present. Its app server did not, in a control run with no name.

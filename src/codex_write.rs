@@ -423,6 +423,69 @@ pub struct ThreadRowReport {
 
 /// Remove every row agentbridge inserted — matched by the marker, so
 /// Codex's own sessions are never touched. Returns the number removed.
+/// Codex's own list of session names: one JSON line per naming, the last line
+/// for an id being its current name. This, not `threads.title`, is the name
+/// Codex shows for a session once it has one.
+fn name_index(home: &Path) -> PathBuf {
+    home.join("session_index.jsonl")
+}
+
+/// Every name Codex's list has held for `thread_id`, oldest first.
+fn thread_names(home: &Path, thread_id: &str) -> Vec<String> {
+    let Ok(body) = std::fs::read_to_string(name_index(home)) else {
+        return Vec::new();
+    };
+    body.lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v.get("id").and_then(|i| i.as_str()) == Some(thread_id))
+        .filter_map(|v| v.get("thread_name").and_then(|n| n.as_str()).map(str::to_string))
+        .collect()
+}
+
+/// Make `label` the name Codex shows for `thread_id`. Returns true when a
+/// line was written.
+///
+/// Found live 2026-10-05: with no name of its own, a synced session was named
+/// by Codex itself the first time something was typed in it ("Respond to
+/// greeting"), so the same conversation carried one name in Codex and another
+/// in every other tool. Writing the label here first gives Codex nothing to
+/// invent, and writing it again puts back a name Codex invented earlier.
+///
+/// Appended, never rewritten: Codex appends to this file too.
+pub fn ensure_thread_name(home: &Path, thread_id: &str, label: &str) -> bool {
+    if thread_names(home, thread_id).last().map(String::as_str) == Some(label) {
+        return false;
+    }
+    let line = serde_json::json!({
+        "id": thread_id,
+        "thread_name": label,
+        "updated_at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+    });
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(name_index(home))
+        .and_then(|mut f| writeln!(f, "{line}"))
+        .is_ok()
+}
+
+/// A name someone gave the session inside Codex after agentbridge had
+/// labeled it, or `None` when there is none.
+///
+/// A name is a rename only if agentbridge's label was there first: a name
+/// Codex invented before any label was written is not something a person
+/// chose, and is replaced by `ensure_thread_name` instead of being spread to
+/// the other tools.
+pub fn renamed_in_codex(home: &Path, thread_id: &str) -> Option<String> {
+    let names = thread_names(home, thread_id);
+    let latest = names.last()?;
+    let labeled_before = names[..names.len() - 1]
+        .iter()
+        .any(|n| crate::label::parse(n).is_some());
+    (labeled_before && crate::label::parse(latest).is_none()).then(|| latest.clone())
+}
+
 /// Remove the `threads` rows agentbridge wrote for one rollout file.
 pub fn remove_rows_for_path(db: &Path, rollout: &Path) -> Result<usize, WriteError> {
     let conn = Connection::open(db).map_err(|e| WriteError::Sql(e.to_string()))?;
@@ -778,6 +841,43 @@ mod tests {
 
     /// Regression (operator report 2026-08-18): an untitled session synced
     /// in from another tool used to show a long, mid-word-cut prompt
+    /// Codex's own name list is where a session's shown name lives.
+    #[test]
+    fn test_label_is_written_into_codexs_name_list_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let label = "claude-code · Fix login · 2026-07-31 10:00 · aaaaaaaa";
+        assert!(ensure_thread_name(tmp.path(), "t1", label));
+        assert!(!ensure_thread_name(tmp.path(), "t1", label), "a second sync writes nothing");
+        assert_eq!(thread_names(tmp.path(), "t1"), vec![label.to_string()]);
+        assert!(renamed_in_codex(tmp.path(), "t1").is_none());
+        assert!(thread_names(tmp.path(), "other").is_empty());
+    }
+
+    /// The exact case found live: Codex named the session itself before any
+    /// label existed. That is not a rename, and the label takes its place.
+    #[test]
+    fn test_a_name_codex_invented_is_replaced_not_spread() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            name_index(tmp.path()),
+            "{\"id\":\"t1\",\"thread_name\":\"Respond to greeting\",\"updated_at\":\"2026-10-05T04:33:13.445066Z\"}\n",
+        )
+        .unwrap();
+        assert!(renamed_in_codex(tmp.path(), "t1").is_none(), "nobody chose that name");
+        let label = "claude-code · Fix login · 2026-07-31 10:00 · aaaaaaaa";
+        assert!(ensure_thread_name(tmp.path(), "t1", label));
+        assert_eq!(thread_names(tmp.path(), "t1").last().unwrap(), label);
+    }
+
+    /// A name given in Codex after the label was there is a real rename.
+    #[test]
+    fn test_a_name_given_after_the_label_is_a_rename() {
+        let tmp = tempfile::tempdir().unwrap();
+        ensure_thread_name(tmp.path(), "t1", "claude-code · Fix login · 2026-07-31 10:00 · aaaaaaaa");
+        ensure_thread_name(tmp.path(), "t1", "Login work");
+        assert_eq!(renamed_in_codex(tmp.path(), "t1").as_deref(), Some("Login work"));
+    }
+
     /// fragment as its picker name in `codex /resume`. The fallback title
     /// must read as a name: short, word-boundary-safe, ellipsized, with no
     /// line breaks.
