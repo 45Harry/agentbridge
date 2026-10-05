@@ -349,6 +349,29 @@ undocumented, drifting vendor formats exactly). It strengthens the case for
 prioritizing M4 (distilled brief injection, format-agnostic) over polishing
 the M5 copy-shim.
 
+### 6.1 The agentbridge marker (added 2026-10-05; **Claude Code verified, Codex not**)
+
+Files agentbridge writes into Claude Code and Codex carry one extra JSON key,
+`agentbridge`, so they stay recognisable if the manifest is lost (`src/marker.rs`):
+
+- **Claude Code:** on the leading `mode` record —
+  `{"type":"mode","mode":"normal","sessionId":"…","agentbridge":{…}}`.
+- **Codex CLI:** inside the `session_meta` payload —
+  `{"type":"session_meta","payload":{"id":"…","cwd":"…","agentbridge":{…}}}`.
+
+The value is `{"v":1,"origin_provider":"…","origin_id":"…","messages":N}`.
+Neither tool needs the key and both already carry fields they ignore.
+**Claude Code: verified 2026-10-05 against `claude 2.1.289`** (the native binary
+shipped inside the VS Code extension): a converted session carrying the marker
+resumes exactly like the same file with the marker removed (`No deferred tool
+marker found`, the "session loaded" signal), while a junk file and the old invented
+schema are both rejected with `No conversation found`, so the check discriminates.
+**Codex: not verified** (no `codex` on the machine); use `codex delete <id> --force`
+→ `Deleted session` (HANDOFF §4). A tool's
+*own* session is never marked (merge-back and same-tool `resume` use unmarked
+converters). OpenCode, Codex `threads` and Antigravity rows are tagged by their
+own marker columns and need nothing here.
+
 ## 7. Antigravity session store (`agy`) — read **and** write
 
 **Last verified:** against the operator's real databases on 2026-08-19, macOS
@@ -487,3 +510,25 @@ Run against an isolated copy (`HOME`, `ANTIGRAVITY_HOME`,
 5. Three further `sync` passes left the count at 26 — no feedback loop.
 6. `unsync` returned the store to exactly 12 bodies / 102 rows; all 12 original
    bodies byte-identical (`cmp`), recovered work preserved in the overlay.
+
+### 7.6 Tool-call steps (type 132), verified 2026-10-05
+
+Step type **132** is a tool call, read from a real conversation (76 such steps over
+7 tools: `view_file`, `replace_file_content`, `grep_search`, `run_command`,
+`list_dir`, `write_to_file`, `find_by_name`):
+
+| Field | Meaning |
+| --- | --- |
+| `.5.4.1` | call id (`call_2079748`) |
+| `.5.4.2` | tool name |
+| `.5.4.3` | arguments, a JSON document in a string (parsed in all 76) |
+| `.140.2.1` | result text (present for 75 of 76; absent on one `write_to_file`) |
+
+Only status 3 steps are read (71 of the 76); the meaning of status 2 (one
+`run_command`) and 7 (three `run_command`, one `write_to_file`) is not established,
+so they are skipped. Argument names are Antigravity's own (`AbsolutePath`,
+`TargetFile`, `DirectoryPath`, `CommandLine`, `Query`). Each step becomes an
+assistant turn (tool name and input) followed by a tool turn (result). An earlier
+store reported type 21 as tool calls; it was not present in this conversation and is
+still unmapped. Verified on one conversation from one machine: a different agy
+version may use other step types.

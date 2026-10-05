@@ -19,6 +19,14 @@ Corollary the operator was explicit about: **do not store the same data twice.**
 agentbridge indexes and links the session data already scattered across the
 machine; it does not become a second copy of it.
 
+> **2026-10-05 amendment to Rule 1.** The persistent index (`src/store.rs`) does
+> hold a *derived* copy of message text, because full-text search and briefs need
+> it. It stays within the rule's intent: the text is redacted before storage and
+> truncated per message, tool output is kept only as a short excerpt, the file is
+> a cache that can be deleted and rebuilt at no cost, and no session body is
+> *relied on* from it (the sessions themselves are still read from the tools'
+> own files for sync). See DECISIONS.md 2026-10-05 (Phase 4).
+
 ## 2. The obstacle, measured
 
 Every tool scopes its session picker to the current working directory. This is
@@ -237,7 +245,10 @@ been superseded by delivery. What now runs on the operator's machine:
   Write path + successful-response text mapping deferred until the CLI's
   model quota resets (`CONNECTORS.md` §6).
 
-Not built yet: redaction, a durable marker in generated files, Kilo Code,
+Shipped 2026-10-05: redaction (invariant 6), a durable marker in generated
+files, a run lock and atomic state writes — see DECISIONS.md.
+
+Not built yet: Kilo Code,
 and topic threading (§10).
 
 ## 10. Open question — how far does "same thread" go?

@@ -11,11 +11,11 @@ conversation. Read this, then `DESIGN.md` (architecture and why), then
 ```bash
 git clone git@github.com:45Harry/agentbridge.git
 cd agentbridge
-cargo build && cargo test      # 145 tests pass (+2 ignored: live-verification suites)
+cargo build && cargo test      # 300 tests pass (+5 ignored: live-verification suites)
 cargo run -- init              # read-only: what's on this machine
 ```
 
-Requires Rust edition 2024. Binary version is 0.3.4.
+Requires Rust 1.89+ (edition 2024). Binary version is 0.4.0.
 
 ## 1. What this is
 
@@ -81,9 +81,13 @@ today — read those three decisions together rather than the first one alone.
   verified. Remaining gaps: the encrypted `.pb` bodies in the desktop/backup
   stores cannot be read at all (no key), and merge-back into a *native* agy
   body is deliberately refused — recovered turns stay in the overlay.
-- `start`/`inject` (cross-tool brief injection) exist; the brief builder is
-  unit-tested, live-agent launch verification is light.
-- Redaction (`SPEC.md` §3) not implemented.
+- `start`/`inject`/`clean` **work as of 2026-10-05** (§2j): they write a fenced
+  block into `CLAUDE.md` / `AGENTS.md` and `clean` restores the file exactly.
+  Tested on agentbridge's side only; whether each *agent* reads the file is
+  unverified (no agent binaries on the dev machine). The brief itself is still
+  a simple digest, not a distilled one.
+- Redaction (`SPEC.md` §3) **shipped 2026-10-05** — see §2i and `SECURITY.md`.
+  Known misses are documented there (short passwords, unlabelled strings).
 
 ## 2a. Cross-tool folder visibility — measured live 2026-08-03
 
@@ -652,6 +656,226 @@ recovered **bare** into the overlay (not labeled) and republished with the label
 rebuilt around it; three sync+pull cycles produced a stable 52-row manifest and
 zero renames. Tests 128 -> 143.
 
+## 2i. Phase 1 safety layer — 2026-10-05
+
+Redaction, a run lock, atomic state writes, and a durable marker. Full
+reasoning (including rejected options) in DECISIONS.md 2026-10-05; the user-facing
+model is `SECURITY.md`. What a cold reader needs:
+
+- **`src/redact.rs`.** `Redactor::load()` (defaults + `~/.agentbridge/redact.rules`)
+  is called at the top of `sync_into`, `pull_back_with`, `cmd_resume`, and for
+  briefs. `redactor.session(&mut s)` runs right after `source.load()` in
+  `sync_into`, *before* `fold_overlay`, so overlay dedup compares redacted text
+  with redacted text. A bad rules file returns an error and writes nothing
+  (`sync` exits 2). `--no-redact` is a global flag, refused for `auto watch`.
+- **Do not redact native files.** `merge_back_native` and same-tool `resume`
+  rewrite a tool's own file. They use `ClaudeCodeConverter::unmarked()` /
+  `CodexCliConverter::unmarked()` and skip the redactor on the loaded session.
+  Redacting or marking there silently damages a real session.
+- **`src/lock.rs`.** `lock::acquire_default()` at command level (`main.rs`
+  `lock_or_exit`, watch round, dashboard actions). Not inside the library
+  functions: it is not re-entrant. Dry runs and read-only commands never lock.
+- **`sync::write_atomic`** for the manifest, overlay and title overlay.
+- **`src/marker.rs`.** Extra `agentbridge` JSON key on the Claude `mode` record
+  and Codex `session_meta` payload. `sync_into` treats marked files as
+  never-a-source; `status` lists orphans; `unsync --orphans` removes unmodified
+  ones.
+- **Re-scrubbing.** Copies are rewritten in place on every sync, so running
+  `sync` after upgrading removes secrets from copies written by older versions.
+  Verified live: `--no-redact` copies the key, a following normal `sync` removes
+  it from the cache and the hardlinked live copies.
+
+**Verified live (2026-10-05, sandbox, real binary, all six store env vars
+redirected, the repo's secret fixtures):** every planted secret appears only in
+the two seeded originals; every copy carries `[REDACTED:…]`; eight simultaneous
+`sync` processes left a valid 8-row manifest with no duplicates and no temp
+files; a lock held by another process made `sync` wait 2.6s then succeed while
+`--dry-run` returned in 0.1s; a deleted manifest left no copies-of-copies and
+`status` listed the 8 orphans; an invalid rules file wrote nothing and exited 2;
+a user rule applied. Test count 145 -> 186 (208 after §2j).
+
+**The overlap was a real bug, not a theoretical one.** Eight simultaneous
+`sync` processes (what a burst of new terminals with the shell hook does) on the
+pre-lock code left a manifest of 78, 100 and 148 lines across three rounds, with
+36-50 destinations listed more than once; the correct count for that fixture set
+is 40. With the lock: 40 lines and 0 duplicates in all three rounds.
+
+**Not verified:** (1) the marker against a real `claude`/`codex` — neither is
+installed on this development machine; use §4's zero-cost signals. (2) Redaction
+throughput on a real multi-GB store (measured: ~380 MB/s clean, ~16 MB/s dense
+secrets, release build, synthetic text).
+
+**Found, not fixed:** `non-utf8` and `hyphens-and-spaces` fixtures are scanned
+but fail `load()` by id, so sessions like them are not synced (pre-existing).
+
+## 2j. Phases 0 and 2 — 2026-10-05
+
+**A data-loss bug, found by a test written to check a hunch.** Sync always also
+targets `$HOME`. A Claude Code session *native* to `$HOME` already lives at the
+exact path its `$HOME` copy would take, so syncing from any other folder
+replaced the user's real transcript with a lossy conversion of itself (and
+`unsync` would later have deleted it). Pre-existing, in every release before this
+one. Fixed with a general rule: **never write onto a file agentbridge did not
+create** (tracked in the manifest or carrying the marker). Regression test
+`test_sync_never_overwrites_a_native_session_living_in_home`. Anyone who ran an
+earlier version and had sessions started in `$HOME` should check them: such a
+file is now marked as agentbridge's, so `unsync --orphans` would treat it as
+removable.
+
+**`start` / `inject` / `clean`** (`src/inject.rs`). The `Connector` trait changed
+(a core change, but the right one): connectors now only declare
+`instruction_file(project)` and `launch_program()`; one shared `write_fenced`
+does the work. Block is `<!-- agentbridge:begin v=1 pad=N created=B -->` …
+`<!-- agentbridge:end -->`; `pad` and `created` are recorded in the marker so
+`clean` restores byte-for-byte with no side record. Verified: `clean` is
+byte-identical for empty / no-trailing-newline / unicode files; deletes a file it
+created; refreshes in place; follows symlinks (people link `AGENTS.md` to
+`CLAUDE.md`); preserves file mode; refuses unbalanced fences and non-UTF-8 files;
+neutralises marker text inside the brief. Live-run in a sandbox with a stand-in
+`claude` on `PATH`: arguments after `--` pass through, cwd is the project, the
+agent's exit code is returned, a missing binary leaves the context in place with a
+clear message. The brief is built from the project's recent sessions in the
+*other* tools only (not all 11k), skips agentbridge's own copies, is redacted, and
+is capped at 8 KB. Files: Claude Code `CLAUDE.md`; Codex, OpenCode, Antigravity
+`AGENTS.md`. **None of those four is verified against the real agent**;
+Antigravity's is a guess. `find_session` also no longer gives up the whole search
+when one session fails to load.
+
+**`scan()` reads the tail** (`connectors::tail_records`). It used to set
+`last_event_at` to the session's *start* time, contradicting SPEC §5, so `ls`
+order and "most recent" were wrong, and a rename made after the first record was
+invisible. Cost measured on a synthetic 6,000-session, 1.1 GB store: 6.2 s vs
+5.9 s. (The baseline scan being ~1 ms per file is its own pre-existing cost, worth
+a look before the watch loop is trusted on a store that size.)
+
+**`sync --all-known`**: syncs every project directory sessions have used that
+still exists. Refuses without `--yes` (or `--dry-run`), because it re-reads the
+history once per directory and gives OpenCode a copy per project.
+
+**Phase 0:** `.github/workflows/ci.yml` (build, `clippy -D warnings`, tests plus a
+check that nothing is written outside the test sandbox, smoke test, and a Rust
+1.89 build), `scripts/sandbox.sh` (all six env vars), `scripts/smoke.sh` (13
+end-to-end checks of the built binary). README no longer claims Windows or
+overstates `start`. **The CI file has never run** (no GitHub access from the dev
+machine); its two shell steps were exercised locally, and MSRV 1.89 is assumed
+from the APIs used, not built.
+
+**Deferred, on purpose:** mapping Antigravity tool-call steps (needs real protobuf
+data to reverse; Phase 5), a Windows port (README now says unsupported),
+`resume` undo log (`unsync` covers it).
+
+## 2k. Phase 3 — test depth, and what it found — 2026-10-05
+
+Writing the spec's missing tests (round-trip, scan/load consistency, read-only,
+locks) turned up four real defects. None was visible to the existing suite, which
+only ever read the repo's own synthetic fixtures.
+
+1. **The Claude and Codex readers dropped tool calls from real sessions.** The
+   writers emit the real format (tool calls as `tool_use` content blocks, results as
+   `tool_result` blocks, Codex `function_call` / `function_call_output`), but the
+   readers only understood the fixtures' synthetic shape. A real tool call read
+   back as an empty turn with no name or input; a tool result as an empty *user*
+   message; Codex reasoning and calls as empty assistant turns. Every real session
+   synced across tools carried this. Measured on a real machine (23 Claude
+   sessions): 0 tool calls decoded before, ~8,100 after. Readers now map the real
+   blocks, pair results to calls (by `tool_use_id` / `call_id`), and skip
+   thinking-only records (about one assistant record in six on that machine; the
+   model's private reasoning, not a turn).
+2. **Fixing (1) created a new hazard, handled in the same change.** Once calls are
+   real, converters must pair every result to its call or the real tool rejects the
+   transcript on resume. They kept one "pending id", which breaks on parallel tool
+   calls (common). `convert::pair_tool_turns` now pairs by tool name, else in order,
+   and drops true orphans (an interrupted call, a result cut off by compaction).
+   Verified on real data: every transcript converted from 23 real sessions pairs up
+   under both converters; 2 of 8,135 calls were orphans. **Still unverified against
+   the real `claude` / `codex` resuming such a transcript.**
+3. **Codex `load()` could not load some sessions `scan()` listed** (rollout filename
+   and in-file id disagreed). `load` now falls back to the in-file id, so anything
+   listed can be loaded. Test: every scanned fixture loads.
+4. **A locked foreign database stalled reads for 5 s each** (rusqlite's default
+   busy timeout, and `load` opens a connection per session). Now 250 ms
+   (`connectors::open_read_only`), so a held lock becomes an ordinary per-session
+   error. Lock tests: 10 s -> 0.5 s.
+
+New tests: seeded randomised round trips for both converters (60 sessions each,
+adversarial text), hand-authored real-shape records for both readers (independent
+of our writers), a fuzz of tool-call shapes asserting pairing, a read-only test that
+snapshots every byte of all four stores around every read-only operation (and again
+with the tree chmod'd read-only; mutation-checked), concurrency tests (appending
+writer with torn lines; WAL writer mid-transaction; exclusive lock), a generated
+100 MB session (scan 0.1 ms, full load 135 ms, release build).
+
+Ignored tests worth running on a real machine: `cargo test --release --lib --
+--ignored test_real_sessions test_perf`. The real-data ones assert properties of the
+content (tool calls decode, <5% empty turns, every converted transcript pairs), not
+"not empty", and print counts only.
+
+**Caveats.** Upgrading changes message counts for real sessions (tool calls now
+count; thinking records no longer do). `pull` is unaffected (it compares a copy to
+what was written, both read by the same reader) and the next `sync` refreshes
+copies with real tool history. The pairing drops orphans rather than inventing
+results. Not done from the spec's unit list: path canonicalization (symlinks,
+worktrees, case-insensitive filesystems) — the `Project` model that would carry it
+is not wired in yet (Phase 4).
+
+## 2l. Phase 4 — index, brief, MCP, optional model — 2026-10-05
+
+The original SPEC §6 M3/M6 on top of the sync tool. Reasoning and rejected options
+are in DECISIONS.md; what a cold reader needs:
+
+- **`src/store.rs`** — `~/.agentbridge/index.db` (SQLite, WAL, FTS5/Porter).
+  `Store::open` migrates; `refresh(store, registry, redactor, only_provider, progress)`
+  is the incremental fill from the tools' stores. Text is redacted and truncated at
+  insert (`index_session`). It is a *cache* (DESIGN Rule 1 amended).
+- **`src/brief.rs`** — `build` (extract) → `render` (budget by re-measuring) →
+  `brief_for_project` (cache). `count_tokens` is a fixed conservative proxy.
+  Weights live in `build`; `Item::new` neutralises `[`/`]` in extracted text.
+- **`src/mcp.rs`** — `Server::handle` is a pure `Value -> Option<Value>`;
+  `serve` is the stdio loop. `agentbridge mcp` runs a background refresher thread
+  with its own SQLite connection.
+- **`src/llm.rs`** — `LlmProvider` trait, `CommandProvider` (prompt on stdin, no
+  shell, 256 KB output cap, timeout), `validate` (shape, citations, budget),
+  `summarise` (always falls back to the plain brief).
+- **Commands:** `index [--provider] [--rebuild]`, `search`, `brief [--since]
+  [--budget] [--no-refresh] [--llm-cmd]`, `fact`, `mcp`; `start` / `inject` use
+  the brief; `auto watch` refreshes the index.
+
+**Verified:** index of 24 real Claude sessions (19,867 messages) built in 6.8 s,
+8.2 MB; incremental run 0.0 s; search instant; real-data brief reviewed by eye
+(and six quality bugs fixed from it, see DECISIONS); the real binary answers a
+handshake, `get_brief` and `search_history` over a pipe against real data; 300
+tests; smoke script covers index/search/brief/fact/MCP/`--llm-cmd` fallback.
+
+**Not verified:** (0) see §2m for what a real Claude Code did and did not confirm;
+(1) the MCP server against any real agent's MCP client (only a
+hand-written one); (2) `--llm-cmd` against a real model (only a recording mock, a
+`cat` echo and failure/timeout commands); (3) the brief's usefulness beyond one
+machine's sessions: it is heuristic, so expect misses and the odd false positive;
+(4) first-build time on a very large store (11k sessions): extrapolating the
+measured ~0.3 ms/message suggests minutes, untested; (5) the `start` brief reaching
+each agent (still the Phase 2 caveat).
+
+**Known gaps:** no optional export to an external memory MCP server; `index` has no
+`--since`; brief sections are English-only (cue words); search has no phrase or
+prefix syntax by design; path canonicalization (symlinks/worktrees as one project)
+is still not done: `sessions_for_project` matches the recorded path.
+
+## 2m. Real-binary verification and Antigravity tool calls — 2026-10-05
+
+- **A real Claude Code is on the dev machine**: the VS Code extension's bundled
+  binary (`~/.vscode/extensions/anthropic.claude-code-*/resources/native-binary/claude`).
+  Use it in a sandbox with `HOME` + `CLAUDE_CONFIG_DIR` redirected (it has no
+  credentials there, so it cannot call the API). Verified against 2.1.289: a
+  converted copy with the marker resumes like one without it; junk and the old
+  invented schema are rejected (`No conversation found`).
+- **Still unverifiable without a login**: the API accepting our tool-call pairing,
+  and the model reading the injected `CLAUDE.md`. Still unverified entirely: Codex,
+  OpenCode and Antigravity as *consumers* of our copies.
+- **Antigravity tool calls** (step type 132) are now decoded; layout and the
+  verification in CONNECTORS §7.6. 71 calls / 71 results on the real conversation.
+- `scripts/` has no helper for the real-claude check yet; the recipe above is the
+  whole of it (sandbox env, `claude --resume <uuid>` from the project directory).
+
 ## 3. Architecture in one page
 
 Full detail in `DESIGN.md`; the three rules that matter:
@@ -677,6 +901,13 @@ src/
                 resume, inject, start, info
   lib.rs        module root
   index.rs      discovery — metadata only, bodies stay in source files
+  redact.rs     secret redaction applied to every derived copy (fail closed)
+  store.rs      persistent SQLite index (FTS5), facts, brief cache
+  brief.rs      extractive cited brief within a measured token budget
+  mcp.rs        MCP server over stdio (search_history, get_brief, get_session, record_fact)
+  llm.rs        optional model pass via a user-supplied command; validated output
+  lock.rs       one-writer-at-a-time advisory lock in the data dir
+  marker.rs     durable "agentbridge wrote this" key inside generated files
   sync.rs       cache, hardlink fan-out, manifest, pull_back, status, unsync
   convert.rs    native-format writers (Claude Code, Codex) + brief builder
   label.rs      the cross-tool session label written into every target's
@@ -843,17 +1074,14 @@ invariant 2, `ClaudeCodeConverter::convert_multi`, and the Codex
    displayed title rather than `preview`/`first_user_message`. Needs a real
    authenticated `codex` session (state_5.sqlite only fully initializes on
    one) — do this on the operator's own machine, not a fresh sandbox.
-2. **`agentbridge list`'s title lag.** Documented in §2b as a narrower,
-   known gap: `scan()` stops at the first `cwd`-bearing record, so a
-   mid-conversation rename won't show in `list` until `load()` runs (sync/pull
-   are unaffected). Worth deciding whether that's acceptable long-term or
-   `list` needs its own fix.
-3. Now that `ClaudeCodeConverter` has a real `convert_multi`, check whether
-   Claude Code needs the same per-directory "already natively visible, don't
-   duplicate" guard Codex has (the `is_codex`-specific block in
-   `sync_into`) — not proven necessary yet (Claude Code sessions don't
-   multi-file the way Codex rollouts can), but worth a second look now that
-   more directories actually get copies.
+2. ~~**`agentbridge list`'s title lag.**~~ **Fixed 2026-10-05** (§2j): `scan()`
+   now also reads the last 32 KiB, so a recent rename and the true last-event
+   time show in `list`. A rename more than 32 KiB from the end of a very long
+   session is still only seen by `load()`.
+3. ~~Claude Code per-directory guard.~~ **It was needed, and worse than
+   suspected** (§2j): a Claude session native to `$HOME` was overwritten by a
+   converted copy of itself. Fixed with a general never-overwrite-foreign-file
+   guard.
 
 0. **Re-verify the 2026-08-03 OpenCode fix live.** The
    per-project id + manifest key changes pass 78 unit tests and nothing else;
@@ -879,7 +1107,9 @@ invariant 2, `ClaudeCodeConverter::convert_multi`, and the Codex
    ab-crosstest` is the throwaway folder used for the 08-03 run; it and the
    probe rows come out with `agentbridge unsync` (never `rm -rf`).
 
-1. **Decide the folder-coverage story** — the open product question behind
+1. ~~**Decide the folder-coverage story**~~ — **decided 2026-10-05**: keep the
+   shell hook as the default, add opt-in `sync --all-known [--yes]` (§2j). The
+   original discussion, kept for the reasoning:  the open product question behind
    §2a. Today a session reaches a folder only when sync was pointed at it
    (`sync --project X`, or the shell hook running `agentbridge sync` in each
    new shell), plus `$HOME` — which for OpenCode means every non-worktree
@@ -889,8 +1119,8 @@ invariant 2, `ClaudeCodeConverter::convert_multi`, and the Codex
    part row, and the database is already 278 MB for 148 sessions), or keep the
    shell hook as the answer and document it. Not decided.
 
-2. **Durable marker in generated files** so orphans can never be mistaken for
-   real sessions (the §4 footgun).
+2. ~~**Durable marker in generated files**~~ — **done 2026-10-05** (§2i), but
+   **not yet verified against real `claude`/`codex` binaries** — do that first.
 3. ~~**Antigravity write path + model-text mapping**~~ — **done 2026-08-19**
    (§2g). Model text is `payload.20.1` on step type 15; the write connector is
    `src/antigravity_write.rs`. Remaining antigravity work, if wanted:
@@ -900,11 +1130,12 @@ invariant 2, `ClaudeCodeConverter::convert_multi`, and the Codex
    *cipher*, not the schema), and mapping tool-call steps (type 21, 258
    occurrences) into `Message::tool_name`/`tool_input`, which currently decode
    as no turn at all.
-4. **Redaction** (`src/redact.rs`, doesn't exist) — `SPEC.md` §3 requires it
-   before anything is written or sent. Fail closed.
+4. ~~**Redaction**~~ — **done 2026-10-05** (§2i). `src/redact.rs`, fail closed.
 5. **Kilo Code / other connectors** — as requested, on their own
    `CONNECTORS.md` sections with verified formats first.
-6. **Live verification of `start`/`inject`** against a real agent launch.
+6. **Live verification of `start`/`inject`** against the *real* agents: confirm
+   each actually reads the file (Antigravity's is the least certain). The launch
+   path itself was verified with a stand-in program (§2j).
 7. Topic threading — grouping sessions across tools by subject rather than
    project path (`DESIGN.md` §10).
 
@@ -912,7 +1143,7 @@ invariant 2, `ClaudeCodeConverter::convert_multi`, and the Codex
 
 - Public: `https://github.com/45Harry/agentbridge`. Work lands on `develop`;
   `master` is the release branch (merged via PR).
-- Keep tests green (145 + 2 ignored); add a regression test for every bug, and
+- Keep tests green (300 + 5 ignored); add a regression test for every bug, and
   verify format changes against the real binary before believing them.
 - Never commit session data. `~/.agentbridge` is never the source of fixtures.
 - Ignored tests are the real-data checks: run them explicitly after any

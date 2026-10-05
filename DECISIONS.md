@@ -455,3 +455,289 @@ label carried the session's real date (2026-08-18/19), never the sync date; the
 same label appeared in both the agy index and the Claude Code copy; a rename
 made inside agy was recovered bare (not labeled) into the overlay and
 republished with the label rebuilt around it. Tests 128 → 143.
+
+---
+
+## 2026-10-05 — Phase 1 safety layer: redaction, run lock, durable marker
+
+Closes the three gaps HANDOFF had carried since 2026-08 ("Redaction not
+implemented", "durable marker still to do", and an unexamined question of what
+happens when the shell hook, `auto watch` and a manual run overlap). Nothing
+here changes what gets synced; it changes what is safe to sync.
+
+**Redaction (`src/redact.rs`, `SECURITY.md`).** Every *derived* copy is
+redacted; originals never are. One call in `sync_into`, right after a session
+is loaded and before the overlay fold, covers all four writers, so no target
+can be forgotten. Overlay writes and reads, `resume` into another tool, and
+briefs are covered separately.
+
+- *Rejected: redact the originals.* That edits users' own history, and
+  invariant 2 (a tool's own sessions are never modified) exists for good reason.
+- *Deliberately not redacted:* `resume` into a session's own tool and opt-in
+  merge-back both rewrite a tool's *native* file. Redacting there would replace
+  text the user wrote. Only overlay turns folded into a native file are
+  redacted. Covered by `test_merge_back_keeps_native_text_and_does_not_mark_the_native_file`.
+- *Fail closed.* A rules file that cannot be read or parsed aborts the write
+  (exit status 2); it never falls back to defaults. Invalid user rules are
+  errors, not skipped lines.
+- *Opt-out.* `--no-redact`, interactive commands only, with a warning. `auto
+  watch` refuses it, since it runs unattended. The default is redaction on:
+  copies are not byte-faithful to the original, which is the price of not
+  spreading secrets, and the flag exists for anyone who disagrees.
+- *Idempotent by construction.* Replacements start with `[REDACTED` and rules
+  skip anything already tagged. Write-back dedupes turns by text, so a second
+  pass that changed the text would read as new work forever. The overlay dedup
+  also redacts before comparing: a turn typed into a copy is still raw there
+  until the next sync, and raw vs redacted must not look like two turns.
+- *Dependency: `regex`.* Linear-time matching removes a stalled-sync attack via
+  a crafted transcript. Measured in a release build: ~380 MB/s on clean text,
+  ~16 MB/s when every line carries several secrets.
+- *Known false-negative:* short (under 6 character) passwords in free text, and
+  unlabelled high-entropy strings. Documented in `SECURITY.md`; rules can be
+  added in `redact.rules`.
+
+**Run lock (`src/lock.rs`).** An OS advisory lock on `agentbridge.lock` in the
+data dir, taken by `sync`, `pull`, `resume`, `unsync` and each watch round;
+never by read-only commands or `--dry-run`. Held at the *command* level, not
+inside `sync_into`/`pull_back`, because those are called from one another's
+callers and the lock is not re-entrant. A waiting command gives up after 120s
+with exit 75; the watch loop and dashboard skip the round instead of queueing.
+`File::try_lock` needs Rust 1.89, now declared as `rust-version`. The lock is
+released by the OS when a process dies, so there is no stale-lock cleanup.
+Measured before/after: eight simultaneous `sync` runs on the old code left
+78-148 manifest lines with 36-50 duplicated destinations (correct: 40); with the
+lock, 40 lines and no duplicates in every round.
+All manifest and overlay writes now go through `write_atomic` (temp file, fsync,
+rename); `fs::write` truncates first, so a crash mid-write used to leave a
+truncated manifest, and previous failures there were swallowed (`let _ =`).
+
+**Durable marker (`src/marker.rs`).** Claude Code and Codex copies carry an
+extra `agentbridge` key (on the `mode` record / `session_meta` payload) naming
+the origin session and the turn count written. Discovery treats a marked file as
+never-a-source even if the manifest is lost, `status` lists marked files the
+manifest does not track, and `unsync --orphans` removes the ones whose turn count
+still matches (a file with turns added since is kept, since with the manifest
+gone there is no baseline to recover them against).
+
+- *Rejected: "generated session ids are UUID v5".* Tempting, because it needs no
+  format change, but false: a Codex session copied into Claude Code keeps its own
+  UUID, and only non-UUID source ids go through v5.
+- *Rejected: the title label.* It is user-editable, and absent unless titled.
+- *Native files must never be marked.* Merge-back and same-tool `resume` rewrite
+  a real session through the converters, so those use `unmarked()` converters;
+  otherwise the user's own session would stop being a source. Regression-tested.
+- ⚠ **Not verified against a real `claude` or `codex` binary** (neither is
+  installed on the development machine this was written on). An unknown extra
+  JSON key is the least intrusive place for a marker, but HANDOFF §4's lesson
+  applies: before trusting it on a real machine, run `claude --resume <id>` and
+  `codex delete <id>` against a marked copy. If a tool ever strips the key on
+  rewrite, the manifest remains the primary record; the marker is the fallback.
+
+**Test-suite changes.** `Sandbox` now also redirects `XDG_DATA_HOME` (a developer
+exporting it would otherwise have sandboxed tests touch their real
+`opencode.db`, the same class of gap as `CODEX_HOME`). The env lock is now
+crate-wide (`sync::test_env_lock`) so tests outside `sync.rs` can hold it.
+145 -> 186 passing. Each fix was mutation-checked: disabling it makes its test
+fail. That check found the first draft of the lost-manifest test passing with
+the marker logic switched off (the Codex store was not detected in the sandbox,
+so it only ever exercised one tool); it now asserts provenance and fails without
+the fix.
+
+**Found, not fixed (pre-existing):** with the fixture registry, two fixtures
+(`non-utf8` and `hyphens-and-spaces`) are listed by the Claude connector's scan
+but `load()` cannot find them by id, so a real session with a non-UTF-8 byte or
+in such a path would be reported as an error and not synced. Tracked for the
+test-depth phase.
+
+---
+
+## 2026-10-05 — Phases 0 and 2: never overwrite foreign files, injection, folder coverage
+
+**Never write onto a file agentbridge did not create.** A test written to check a
+suspicion found that syncing from any directory replaced a Claude Code session
+native to `$HOME` with a lossy converted copy of itself, because sync always also
+targets `$HOME`. Fixed as a general guard in `sync_into`, not a Claude-specific
+patch: a destination that exists and is neither in the manifest nor marker-bearing
+is skipped (counted as `skipped_native`). Considered and rejected: special-casing
+`$HOME` — the same collision exists for any directory a session is native to.
+
+**Injection goes through the tool's own instruction file** (`CLAUDE.md`,
+`AGENTS.md`), fenced, rather than an environment variable or CLI flag: it is the
+one mechanism that all four agents share and that survives the agent being started
+from an IDE. The `Connector` trait changed from `inject(brief, dry_run)` to
+`instruction_file(project)` + `launch_program()` + a default `inject`, because
+resolving the file needs the project directory (the old Claude stub always failed
+for exactly that reason) and the write itself is identical for every agent. The
+padding and "created by us" facts live *in the begin marker*, so `clean` needs no
+side record and still restores byte-for-byte if `~/.agentbridge` is gone.
+Alternatives rejected: a separate undo log (breaks when the data dir is lost); a
+backup copy of the original file (stale the moment the user edits it).
+- Unverified: whether Claude Code, Codex, OpenCode and Antigravity each read
+  those files. Antigravity (`AGENTS.md`) is the least certain.
+- The brief covers only the *other* tools' sessions in the project, since the
+  agent already has its own, and skips agentbridge's copies (label or marker) so a
+  conversation is not summarised twice. Capped at 8 KB: it is paid for on every
+  launch.
+
+**Folder coverage: keep the hook, add opt-in `sync --all-known`.** Fanning out by
+default is cheap for Claude Code (hardlinks) and expensive for OpenCode (a copy of
+every message per project; the real database is already hundreds of MB), and each
+directory re-reads the whole history. So it is explicit, previewable with
+`--dry-run`, and refuses to run without `--yes`.
+
+**`scan()` reads a bounded tail** (32 KiB) of Claude and Codex files, to report the
+true last event time (SPEC §5) and recent renames. Bounded so the scan stays cheap:
++0.3 s on 6,000 sessions / 1.1 GB. Accepted limit: a rename more than 32 KiB from
+the end of a very long session is only seen by `load()`.
+
+**Windows: not supported, and the README now says so.** Sync depends on Unix
+hardlinks, inode identity and `pgrep`. A port is real work (a `cfg` split for
+inodes, a process check, link fallbacks) with nobody to verify it on; claiming it
+was the worse option.
+
+**CI** (`.github/workflows/ci.yml`) runs on Linux and macOS: build, `clippy -D
+warnings`, tests with a check that no file appears in the real `$HOME`, a smoke
+test of the built binary, and a Rust 1.89 build. Not yet executed on GitHub.
+`cargo fmt --check` is deliberately absent: the existing code was never rustfmt'd,
+and reformatting it would bury the history in noise.
+
+---
+
+## 2026-10-05 — Phase 3: readers must decode what writers emit; pair tool calls
+
+Round-trip testing (write a session in a tool's native format, read it back)
+showed the readers had been tested only against the repo's own synthetic fixtures.
+Against the real record shapes they lost every tool call, read tool results as
+blank user messages, and read model reasoning as blank assistant turns. See
+HANDOFF §2k for the measurements. Decisions:
+
+- **Fix the readers, not the tests.** The writers emit the real format and
+  real tools accepted it; the readers were the outlier.
+- **Thinking-only assistant records are not turns.** They are the model's private
+  reasoning. Surfacing them would also leak chain-of-thought into every brief and
+  cross-tool copy (the same reason Antigravity's `.20.3` is not surfaced). An
+  *explicitly empty* `text` block still counts, so a genuinely blank reply
+  survives a round trip.
+- **Pair tool results to calls in the converters, by tool name then order, and
+  drop orphans.** Rejected: carrying the real call id on `Message` (touches ~35
+  struct literals and the overlay format for a case name-matching handles);
+  inventing a result for a dangling call (fabricates content in a transcript).
+  Losing half of a broken pair is the smaller harm than a transcript the tool
+  cannot open.
+- **Short busy timeout (250 ms) on reads of other tools' databases.** The spec's
+  "a lock held by a running agent never blocks the scan" was only true up to
+  rusqlite's 5 s default, per session. Writers keep the default; they already
+  refuse to run while the tool is open.
+- **Perf and real-data tests are `#[ignore]`d, not deleted.** The 100 MB test
+  writes 100 MB and runs in CI in a separate release-mode step; the real-data tests
+  need the operator's sessions and are run by hand.
+- **No `proptest`.** Not available offline and not worth a new dependency: a seeded
+  `fastrand` generator (already in the lockfile via `tempfile`) gives deterministic,
+  reproducible randomised tests, with the seed in the failure message.
+
+---
+
+## 2026-10-05 — Phase 4: a persistent index, a cited brief, an MCP server
+
+Delivers the original product vision (SPEC §6 M3 and M6) on top of the sync tool.
+
+**A persistent SQLite index, amending DESIGN Rule 1.** `src/store.rs` keeps a
+derived, redacted, truncated copy of message text so search and briefs read the
+index instead of every transcript. Rejected: no stored text at all (search would
+re-read everything each time); storing full bodies (a second copy of 100 MB
+sessions, and secrets). The index is a cache: deleting it costs only a rebuild.
+- Schema is versioned (`PRAGMA user_version`) with forward-only migrations applied
+  transactionally at open; an index from a *newer* agentbridge is refused rather
+  than guessed at.
+- FTS5 with the Porter tokenizer, kept in sync by triggers (as decided in 2026-07-30),
+  so "migration" finds "migrate". Queries are quoted term by term, so user or agent
+  text can never be an FTS syntax error.
+- Incremental: files are fingerprinted by size and mtime; database-backed sessions
+  by their own last-event time (the shared database file's mtime says nothing about
+  one session). A tool whose scan fails keeps its rows: a failed scan proves
+  nothing about what is gone.
+- Left out of the index: agentbridge's own copies (label or marker), and Claude
+  Code sub-agent transcripts (`agent-*`). The latter are a tool working for a
+  conversation; on a real machine they were 15 of 24 files and their giant task
+  prompts dominated "open threads".
+
+**The brief is extractive, deterministic and cited** (`src/brief.rs`). Decisions,
+problems and conventions are found by wording cues; files, commands, tests and
+branches are tallied from tool calls. Every item carries `[tool:session#turn]`
+(an aggregate cites its latest occurrence; recorded facts cite `[fact:N]`), and
+square brackets inside extracted text become parentheses so a message cannot mint
+a citation. Rejected: asking a model first (the spec requires it to work with zero
+LLM calls).
+- **The budget is measured, not estimated**, with a stated limit: `count_tokens`
+  is an exact, deterministic, deliberately conservative proxy (a token per four
+  alphanumeric characters, one per symbol), not any model's tokenizer. No
+  tokenizer crate is vendored here and a wrong "accurate" count would be worse
+  than an honest proxy. Items are dropped lowest score first and the final text is
+  re-measured.
+- **Cache key** hashes the algorithm version, request, every included session's
+  id, last event and size, and every fact; a stale hit is impossible, a spurious
+  miss is harmless.
+- **Found by running it on real sessions, not by the tests I wrote first:** IDE
+  and system markup (`<ide_opened_file>`, `<system-reminder>`) was being read as
+  what the user said; shell assignments and inline scripts were counted as
+  commands; one command run once was counted twice (two overlapping splits);
+  `**bold**` markers and `i.e.` produced fragment sentences; compaction notices
+  became "the last ask"; "no regression" matched the problem cues. Each is fixed
+  with a regression test. The heuristics will still be wrong sometimes, which is
+  what the citations are for.
+
+**MCP over stdio, four tools** (`src/mcp.rs`): `search_history`, `get_brief`,
+`get_session`, `record_fact`. A small tool list is a design constraint (the list
+is paid for on every connection; a test caps it). Newline-delimited JSON-RPC, no
+runtime dependency (the spec's `tokio` is not needed for a synchronous stdio
+loop); stdout carries only protocol. Results are redacted again, bounded to 16 KB,
+and begin with a notice that they are quoted data, because transcripts can contain
+text written to steer an agent. A background thread refreshes the index so no tool
+call waits on a scan. Not implemented: the optional export to an external memory
+server (the spec marks it optional).
+
+**The model pass is a command, not a library** (`src/llm.rs`). `--llm-cmd "claude -p"`
+runs a user-named program with the prompt on stdin: no HTTP client, no API key
+handling, no network code in agentbridge, and the model is swappable by
+construction. Rejected: linking a provider SDK (a dependency and a trust decision
+for every user). The command runs without a shell. The answer is accepted only if
+it keeps the brief's shape, every bullet ends with a citation present in the
+source, nothing uncited appears, and it fits the budget; otherwise the plain brief
+is used and the reason shown. A recording mock asserts the provider never receives
+a secret.
+
+**Also changed:** `start` now injects the project brief (all tools, within a
+token budget) instead of a first-line digest, and `inject <ids>` briefs the chosen
+sessions; the old `build_cross_tool_brief` is deleted. `auto watch` refreshes the
+index as part of its loop.
+
+---
+
+## 2026-10-05 — Phase 5 (part): verified against a real Claude Code; Antigravity tool calls
+
+**A real `claude` was available all along**: the VS Code extension bundles the native
+binary (`~/.vscode/extensions/anthropic.claude-code-*/resources/native-binary/claude`,
+2.1.289 here). Run only in a sandbox (`HOME` and `CLAUDE_CONFIG_DIR` redirected, no
+credentials, telemetry and auto-update off), using HANDOFF §4's zero-cost
+`--resume` signals. Findings:
+- Our converted Claude copy, **with** the `agentbridge` marker, resumes the same as
+  the copy with the marker stripped; junk and the old invented schema are rejected.
+  That closes the Phase 1 marker risk for Claude Code (not for Codex).
+- The converted transcript, built from a Codex session with *parallel, out-of-order*
+  tool calls, loads.
+- **Not verifiable without a login:** that the API accepts our tool-call pairing, and
+  that the model reads the injected `CLAUDE.md` block (the binary stops at "Not
+  logged in"). Both stay marked unverified.
+
+**Antigravity step type 132 is a tool call** (layout in CONNECTORS §7.6), mapped to an
+assistant turn plus a tool turn. Verified on the one real conversation present
+(71 completed calls, 71 results, every result named). Only status 3 is read; statuses
+2 and 7 are skipped because their meaning is not established. The store's argument
+extractor and the brief's tool-name sets learned Antigravity's names. Decided *not* to
+guess type 21 (reported earlier, absent here).
+
+**Not done, on purpose:** the Codex picker check (no `codex` here); a Kilo Code
+connector (not installed; a connector from an assumed format is exactly what this
+project's history says not to ship); topic threading (an open design question, DESIGN
+§10, that needs your decision before any code); rule-file syncing (the spec says defer
+to existing tools).
