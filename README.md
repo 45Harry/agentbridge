@@ -29,6 +29,18 @@ you launched it from. Most of your history is on disk but invisible.
 
 ## Install
 
+From PyPI (prebuilt binary, no Rust needed):
+
+```bash
+pipx install agentbridge-rs     # or: uv tool install agentbridge-rs
+agentbridge --version
+```
+
+The PyPI package is named `agentbridge-rs`; the command it installs is
+`agentbridge`. Upgrade with `pipx upgrade agentbridge-rs`.
+
+With Cargo:
+
 ```bash
 # if you don't have Rust yet: https://rustup.rs
 cargo install --git https://github.com/45Harry/agentbridge
@@ -36,7 +48,8 @@ agentbridge --version
 ```
 
 Works on Linux, macOS and Windows. Building from a local checkout:
-`cargo install --path .` (then re-run to update it again later).
+`cargo install --path .` (then re-run to update it again later), or build a
+wheel with `maturin build --release` (lands in `target/wheels/`).
 
 ## Get started
 
