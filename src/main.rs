@@ -1,4 +1,3 @@
-use agentbridge::connector::Connector;
 use agentbridge::connectors;
 use agentbridge::convert::{ClaudeCodeConverter, CodexCliConverter, SessionConverter};
 use agentbridge::model::Session;
@@ -12,6 +11,11 @@ mod tui;
 #[derive(Parser)]
 #[command(name = "agentbridge", version, about = "Cross-tool session & memory bridge for AI coding agents")]
 struct Cli {
+    /// Write copies without redacting secrets (API keys, tokens, passwords).
+    /// Interactive commands only: refused for `auto watch`.
+    #[arg(long, global = true)]
+    no_redact: bool,
+
     /// Open the interactive dashboard when omitted
     #[command(subcommand)]
     command: Option<Commands>,
@@ -31,25 +35,119 @@ enum Commands {
         provider: Option<String>,
     },
 
-    /// Index sessions from all providers
+    /// Build or refresh the search index (incremental; safe to run any time)
     #[command(name = "index")]
     Index {
-        /// Provider to index (default: all detected)
+        /// Only this provider (default: all detected)
         #[arg(long)]
         provider: Option<String>,
+
+        /// Throw the index away and rebuild it from scratch
+        #[arg(long)]
+        rebuild: bool,
     },
 
-    /// Start an agent with cross-tool context injected
+    /// Search every tool's session history
+    #[command(name = "search")]
+    Search {
+        /// Words to look for (all must appear in the same message)
+        #[arg(required = true)]
+        query: Vec<String>,
+
+        /// Only sessions under this directory
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Only this provider
+        #[arg(long)]
+        provider: Option<String>,
+
+        /// Only messages newer than this: 90m, 12h, 7d, 2w or YYYY-MM-DD
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Most results to show
+        #[arg(long, default_value = "10")]
+        limit: usize,
+    },
+
+    /// Print a compact, cited summary of a project's history across all tools
+    #[command(name = "brief")]
+    Brief {
+        /// Project directory (defaults to cwd)
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Only sessions newer than this: 90m, 12h, 7d, 2w or YYYY-MM-DD
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Token budget for the brief (measured on the final text)
+        #[arg(long, default_value = "2000")]
+        budget: usize,
+
+        /// Use the index as it is instead of refreshing it first
+        #[arg(long)]
+        no_refresh: bool,
+
+        /// Condense the brief with a model you choose: a command that reads a
+        /// prompt on stdin and writes the answer on stdout (e.g. "claude -p").
+        /// Opt-in. agentbridge makes no network call itself; the redacted brief
+        /// is handed to this command. A summary that is not faithfully cited is
+        /// discarded in favour of the plain brief.
+        #[arg(long)]
+        llm_cmd: Option<String>,
+    },
+
+    /// Run the MCP server on stdio, so an agent can search and summarise your
+    /// other tools' sessions (tools: search_history, get_brief, get_session,
+    /// record_fact)
+    #[command(name = "mcp")]
+    Mcp,
+
+    /// Record a durable fact about a project; it appears in its brief
+    #[command(name = "fact")]
+    Fact {
+        /// The fact, in one or two sentences
+        #[arg(required = true)]
+        text: Vec<String>,
+
+        /// Project directory (defaults to cwd)
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Tag (repeatable)
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+    },
+
+    /// Start an agent with context from your other tools' sessions injected
     #[command(name = "start")]
     Start {
-        /// Target provider (claude-code, codex-cli, opencode)
+        /// Agent to start (claude-code, codex-cli, opencode, antigravity)
         provider: String,
 
-        /// Passthrough args to the agent
+        /// Arguments passed through to the agent
         #[arg(last = true)]
         passthrough: Vec<String>,
 
-        /// Dry run (show what would be injected without writing)
+        /// Project directory (defaults to cwd)
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Token budget for the injected brief
+        #[arg(long, default_value = "1500")]
+        budget: usize,
+
+        /// Use the index as it is instead of refreshing it first
+        #[arg(long)]
+        no_refresh: bool,
+
+        /// Inject the context but do not launch the agent
+        #[arg(long)]
+        no_launch: bool,
+
+        /// Show what would be injected without writing or launching
         #[arg(long)]
         dry_run: bool,
     },
@@ -73,6 +171,16 @@ enum Commands {
         /// Show what would happen without writing anything
         #[arg(long)]
         dry_run: bool,
+
+        /// Sync every project directory your sessions have ever used, not just
+        /// one. Slow on a big history, and OpenCode gets a copy of each session
+        /// per project it knows (database growth); needs --dry-run or --yes.
+        #[arg(long, conflicts_with = "project")]
+        all_known: bool,
+
+        /// Confirm `--all-known` (it is not asked interactively)
+        #[arg(long)]
+        yes: bool,
     },
 
     /// Recover turns other tools appended to synced sessions
@@ -106,6 +214,12 @@ enum Commands {
         /// Show what would be removed without removing it
         #[arg(long)]
         dry_run: bool,
+
+        /// Instead, remove generated files the manifest no longer tracks
+        /// (found by the marker inside them). Files with turns added since
+        /// agentbridge wrote them are kept.
+        #[arg(long)]
+        orphans: bool,
     },
 
     /// Resume a session across tools
@@ -134,7 +248,7 @@ enum Commands {
         copy: bool,
     },
 
-    /// Inject session context into an agent's startup
+    /// Inject chosen sessions' context into an agent's startup file
     #[command(name = "inject")]
     Inject {
         /// Target provider
@@ -144,7 +258,27 @@ enum Commands {
         #[arg(required = true)]
         session_ids: Vec<String>,
 
+        /// Project directory (defaults to cwd)
+        #[arg(long)]
+        project: Option<String>,
+
         /// Dry run
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Remove the context agentbridge injected, restoring the files exactly
+    #[command(name = "clean")]
+    Clean {
+        /// Project directory (defaults to cwd)
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Also clean every project agentbridge has ever injected into
+        #[arg(long)]
+        all: bool,
+
+        /// Show what would be removed without changing anything
         #[arg(long)]
         dry_run: bool,
     },
@@ -184,6 +318,20 @@ fn main() {
     let cli = Cli::parse();
     let registry = connectors::all();
 
+    if cli.no_redact {
+        // The shell hook and the watch daemon run unattended; nobody is there
+        // to have meant this, so they can never skip redaction.
+        if matches!(
+            cli.command,
+            Some(Commands::Auto { action: AutoAction::Watch { .. } })
+        ) {
+            eprintln!("--no-redact is not allowed with `auto watch` (it runs unattended)");
+            std::process::exit(2);
+        }
+        agentbridge::redact::disable_for_this_process();
+        eprintln!("warning: --no-redact: secrets in these sessions will be copied as-is");
+    }
+
     match cli.command {
         None => {
             // Bare `agentbridge` = the dashboard, but only where a TUI can
@@ -202,15 +350,26 @@ fn main() {
             }
         }
         Some(Commands::List { project, provider }) => cmd_list(&registry, project, provider),
-        Some(Commands::Index { provider }) => cmd_index(&registry, provider),
-        Some(Commands::Start { provider, passthrough, dry_run }) => {
-            cmd_start(&registry, &provider, &passthrough, dry_run)
+        Some(Commands::Index { provider, rebuild }) => cmd_index(&registry, provider.as_deref(), rebuild),
+        Some(Commands::Search { query, project, provider, since, limit }) => {
+            cmd_search(&query.join(" "), project.as_deref(), provider, since.as_deref(), limit)
+        }
+        Some(Commands::Brief { project, since, budget, no_refresh, llm_cmd }) => {
+            cmd_brief(&registry, project.as_deref(), since.as_deref(), budget, no_refresh, llm_cmd.as_deref())
+        }
+        Some(Commands::Fact { text, project, tags }) => cmd_fact(&text.join(" "), project.as_deref(), tags),
+        Some(Commands::Mcp) => cmd_mcp(),
+        Some(Commands::Start { provider, passthrough, project, budget, no_refresh, no_launch, dry_run }) => {
+            cmd_start(&registry, &provider, &passthrough, project.as_deref(), budget, no_refresh, no_launch, dry_run)
         }
         Some(Commands::Resume { session_id, target, project, dry_run, merge, copy }) => {
             cmd_resume(&registry, &session_id, &target, project.as_deref(), dry_run, merge, copy)
         }
-        Some(Commands::Inject { provider, session_ids, dry_run }) => {
-            cmd_inject(&registry, &provider, &session_ids, dry_run)
+        Some(Commands::Inject { provider, session_ids, project, dry_run }) => {
+            cmd_inject(&registry, &provider, &session_ids, project.as_deref(), dry_run)
+        }
+        Some(Commands::Clean { project, all, dry_run }) => {
+            cmd_clean(&registry, project.as_deref(), all, dry_run)
         }
         Some(Commands::Init) => cmd_init(&registry),
         Some(Commands::Tui) => {
@@ -225,11 +384,13 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Some(Commands::Sync { project, dry_run }) => cmd_sync(&registry, project.as_deref(), dry_run),
+        Some(Commands::Sync { project, dry_run, all_known, yes }) => {
+            cmd_sync(&registry, project.as_deref(), dry_run, all_known, yes)
+        }
         Some(Commands::Pull { dry_run, auto_merge }) => cmd_pull(dry_run, auto_merge),
         Some(Commands::Auto { action }) => cmd_auto(&registry, action),
-        Some(Commands::Status) => cmd_status(),
-        Some(Commands::Unsync { dry_run }) => cmd_unsync(dry_run),
+        Some(Commands::Status) => cmd_status(&registry),
+        Some(Commands::Unsync { dry_run, orphans }) => cmd_unsync(&registry, dry_run, orphans),
         Some(Commands::Info) => cmd_info(&registry),
     }
 }
@@ -306,115 +467,401 @@ fn cmd_list(registry: &agentbridge::connector::Registry, project: Option<String>
     }
 }
 
-fn cmd_index(registry: &agentbridge::connector::Registry, provider: Option<String>) {
-    let connectors: Vec<&dyn Connector> = match provider {
-        Some(ref p) => {
-            registry.by_id(p).map(|c| vec![c]).unwrap_or_default()
+fn open_index_or_exit() -> agentbridge::store::Store {
+    match agentbridge::store::Store::open_default() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("agentbridge: {e}");
+            std::process::exit(1);
         }
-        None => registry.detected().collect(),
-    };
-
-    let mut total = 0;
-    for c in &connectors {
-        println!("Indexing {}...", c.display_name());
-        let scan = match c.scan() {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("  Error scanning {}: {}", c.id(), e);
-                continue;
-            }
-        };
-        let mut count = 0;
-        for result in scan {
-            let raw = match result {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("  Error on session: {}", e);
-                    continue;
-                }
-            };
-            if raw.body_available {
-                match c.load(&raw.id) {
-                    Ok(session) => {
-                        count += 1;
-                        println!("  ✓ {} ({} msgs)", raw.id, session.messages.len());
-                    }
-                    Err(e) => {
-                        eprintln!("  ✗ {} load failed: {}", raw.id, e);
-                    }
-                }
-            } else {
-                println!("  - {} (metadata only)", raw.id);
-            }
-        }
-        println!("  → {} sessions from {}\n", count, c.display_name());
-        total += count;
     }
-    println!("Indexed {} sessions total.", total);
 }
 
+fn redactor_or_exit() -> agentbridge::redact::Redactor {
+    match agentbridge::redact::Redactor::load() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("redaction: {e} — nothing was indexed");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Bring the index up to date, telling the operator when it is the slow first
+/// build. Progress goes to stderr so stdout stays clean for the brief or search.
+fn refresh_index(
+    registry: &agentbridge::connector::Registry,
+    store: &mut agentbridge::store::Store,
+    provider: Option<&str>,
+) -> agentbridge::store::RefreshStats {
+    let redactor = redactor_or_exit();
+    let first = store.counts().map(|(s, _)| s == 0).unwrap_or(false);
+    if first {
+        eprintln!("Building the index (one time; later runs only read what changed)…");
+    }
+    let interactive = std::io::stderr().is_terminal();
+    let stats = agentbridge::store::refresh(store, registry, &redactor, provider, |st| {
+        if interactive && first {
+            eprint!("\r  {} indexed, {} unchanged…", st.indexed, st.unchanged);
+        }
+    });
+    if interactive && first {
+        eprintln!();
+    }
+    match stats {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("agentbridge: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_index(registry: &agentbridge::connector::Registry, provider: Option<&str>, rebuild: bool) {
+    if let Some(p) = provider
+        && registry.by_id(p).is_none()
+    {
+        eprintln!("Unknown provider: {p}");
+        std::process::exit(2);
+    }
+    if rebuild {
+        let db = agentbridge::store::default_path();
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{}", db.display(), suffix));
+        }
+    }
+    let mut store = open_index_or_exit();
+    let stats = refresh_index(registry, &mut store, provider);
+    let (sessions, messages) = store.counts().unwrap_or((0, 0));
+    println!(
+        "Index: {} session(s), {} message(s)  [{} indexed now, {} unchanged, {} removed, {} agentbridge copies skipped]",
+        sessions, messages, stats.indexed, stats.unchanged, stats.removed, stats.skipped_copies
+    );
+    for e in stats.errors.iter().take(10) {
+        eprintln!("  ! {e}");
+    }
+    if stats.errors.len() > 10 {
+        eprintln!("  … and {} more", stats.errors.len() - 10);
+    }
+}
+
+fn parse_since_or_exit(since: Option<&str>) -> Option<i64> {
+    since.map(|t| {
+        agentbridge::brief::parse_since(t, chrono::Utc::now().timestamp()).unwrap_or_else(|e| {
+            eprintln!("--since: {e}");
+            std::process::exit(2);
+        })
+    })
+}
+
+fn cmd_search(query: &str, project: Option<&str>, provider: Option<String>, since: Option<&str>, limit: usize) {
+    let store = open_index_or_exit();
+    if store.counts().map(|(s, _)| s == 0).unwrap_or(true) {
+        eprintln!("The index is empty. Run `agentbridge index` first.");
+        std::process::exit(1);
+    }
+    let filter = agentbridge::store::SearchFilter {
+        project: project.map(|p| {
+            std::fs::canonicalize(p).map(|d| d.to_string_lossy().to_string()).unwrap_or_else(|_| p.to_string())
+        }),
+        provider,
+        since: parse_since_or_exit(since),
+        limit,
+    };
+    let hits = store.search(query, &filter).unwrap_or_else(|e| {
+        eprintln!("agentbridge: {e}");
+        std::process::exit(1);
+    });
+    if hits.is_empty() {
+        println!("No matches.");
+        return;
+    }
+    for h in &hits {
+        let when = h
+            .ts
+            .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .unwrap_or_default();
+        let short: String = h.sid.chars().take(8).collect();
+        println!(
+            "[{}:{}#{}] {} · {} · {}",
+            h.provider,
+            short,
+            h.ordinal,
+            h.role,
+            when,
+            h.project.as_deref().unwrap_or("(no project)")
+        );
+        println!("    {}", h.snippet.replace('\n', " "));
+    }
+}
+
+fn cmd_brief(
+    registry: &agentbridge::connector::Registry,
+    project: Option<&str>,
+    since: Option<&str>,
+    budget: usize,
+    no_refresh: bool,
+    llm_cmd: Option<&str>,
+) {
+    let project = resolve_project(project);
+    let mut store = open_index_or_exit();
+    if !no_refresh {
+        refresh_index(registry, &mut store, None);
+    }
+    let redactor = redactor_or_exit();
+    let since = parse_since_or_exit(since);
+    match agentbridge::brief::brief_for_project(
+        &mut store,
+        &project.to_string_lossy(),
+        since,
+        budget,
+        &redactor,
+    ) {
+        Ok(r) => {
+            let mut text = r.text.clone();
+            if let Some(cmd) = llm_cmd.filter(|_| r.items > 0) {
+                let provider = agentbridge::llm::CommandProvider::new(cmd, std::time::Duration::from_secs(120))
+                    .unwrap_or_else(|e| {
+                        eprintln!("--llm-cmd: {e}");
+                        std::process::exit(2);
+                    });
+                eprintln!(
+                    "Sending the redacted brief ({} tokens) to `{}`. agentbridge opens no \
+                     connection itself; what that command does with the text is up to you.",
+                    r.tokens,
+                    provider.program()
+                );
+                let summary = agentbridge::llm::summarise(&provider, &redactor, &r.text, budget);
+                match &summary.fallback_reason {
+                    None => eprintln!("(condensed by the model; every line checked against the brief's citations)"),
+                    Some(why) => eprintln!("(model output not used: {why}; showing the plain brief)"),
+                }
+                text = summary.text;
+            }
+            print!("{text}");
+            eprintln!(
+                "({} session(s), {} line(s), {} of {} tokens{})",
+                r.sessions,
+                r.items,
+                agentbridge::brief::count_tokens(&text),
+                budget,
+                if r.cached { ", cached" } else { "" }
+            );
+        }
+        Err(e) => {
+            eprintln!("agentbridge: {e}");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// stdout is the protocol channel here: nothing but JSON-RPC may be written to
+/// it. Everything for a human goes to stderr.
+fn cmd_mcp() {
+    let store = open_index_or_exit();
+    let redactor = redactor_or_exit();
+
+    // Keep the index fresh without making any tool call wait for a scan: a
+    // background thread with its own connection (SQLite WAL lets it write while
+    // the server reads), once now and then every five minutes.
+    std::thread::spawn(|| {
+        loop {
+            let registry = agentbridge::connectors::all();
+            if let (Ok(mut store), Ok(redactor)) = (
+                agentbridge::store::Store::open_default(),
+                agentbridge::redact::Redactor::load(),
+            ) {
+                match agentbridge::store::refresh(&mut store, &registry, &redactor, None, |_| {}) {
+                    Ok(s) => eprintln!(
+                        "agentbridge mcp: index refreshed ({} indexed, {} unchanged)",
+                        s.indexed, s.unchanged
+                    ),
+                    Err(e) => eprintln!("agentbridge mcp: index refresh failed: {e}"),
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(300));
+        }
+    });
+
+    let project = std::env::current_dir().unwrap_or_default();
+    let mut server = agentbridge::mcp::Server::new(store, redactor, project);
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout().lock();
+    if let Err(e) = server.serve(stdin.lock(), &mut stdout) {
+        eprintln!("agentbridge mcp: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn cmd_fact(text: &str, project: Option<&str>, tags: Vec<String>) {
+    let project = resolve_project(project);
+    let mut store = open_index_or_exit();
+    let redactor = redactor_or_exit();
+    match store.add_fact(Some(&project.to_string_lossy()), text, &tags, &redactor) {
+        Ok(id) => println!("Recorded fact {id} for {}", project.display()),
+        Err(e) => {
+            eprintln!("agentbridge: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Resolve `--project` (or cwd) to an absolute, symlink-free directory.
+fn resolve_project(project: Option<&str>) -> PathBuf {
+    match project {
+        Some(p) => match std::fs::canonicalize(p) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("--project '{}' could not be resolved: {}", p, e);
+                std::process::exit(2);
+            }
+        },
+        None => std::env::current_dir().unwrap_or_default(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn cmd_start(
     registry: &agentbridge::connector::Registry,
     provider: &str,
-    _passthrough: &[String],
+    passthrough: &[String],
+    project: Option<&str>,
+    budget: usize,
+    no_refresh: bool,
+    no_launch: bool,
     dry_run: bool,
 ) {
-    let connector = match registry.by_id(provider) {
-        Some(c) => c,
-        None => {
-            eprintln!("Unknown provider: {}. Use: {}", provider,
-                registry.all().iter().map(|c| c.id()).collect::<Vec<_>>().join(", "));
-            return;
-        }
+    let Some(connector) = registry.by_id(provider) else {
+        eprintln!(
+            "Unknown provider: {}. Use: {}",
+            provider,
+            registry.all().iter().map(|c| c.id()).collect::<Vec<_>>().join(", ")
+        );
+        std::process::exit(2);
     };
+    let project = resolve_project(project);
 
-    let mut all_sessions: Vec<Session> = Vec::new();
-    for c in registry.detected() {
-        let scan = match c.scan() {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        for result in scan {
-            let raw = match result {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-            if raw.body_available
-                && let Ok(session) = c.load(&raw.id) {
-                    all_sessions.push(session);
-                }
-        }
+    let mut store = open_index_or_exit();
+    if !no_refresh {
+        refresh_index(registry, &mut store, None);
     }
+    let redactor = redactor_or_exit();
+    let result = agentbridge::brief::brief_for_project(
+        &mut store,
+        &project.to_string_lossy(),
+        None,
+        budget,
+        &redactor,
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("agentbridge: {e}");
+        std::process::exit(2);
+    });
 
-    all_sessions.sort_by_key(|s| std::cmp::Reverse(s.started_at));
-
-    let brief = agentbridge::convert::build_cross_tool_brief(&all_sessions);
-
-    if dry_run {
-        println!("[dry-run] Would inject brief into {}:", provider);
-        println!("{}", brief);
-        println!();
-        match connector.inject(&brief, true) {
-            Ok(target) => {
-                println!("Would write to: {}", target.path.display());
+    if result.items == 0 {
+        println!(
+            "Nothing indexed for {} yet; nothing to inject for {}.",
+            project.display(),
+            connector.display_name()
+        );
+    } else {
+        let brief = agentbridge::inject::cap_brief(&result.text, agentbridge::inject::MAX_BRIEF_BYTES);
+        if dry_run {
+            println!(
+                "[dry-run] Would inject a {}-token brief from {} session(s):",
+                result.tokens, result.sessions
+            );
+            println!("{}", brief);
+        }
+        match connector.inject(&brief, &project, dry_run) {
+            Ok(t) if dry_run => println!("Would write to: {}", t.path.display()),
+            Ok(t) => {
+                println!(
+                    "Injected a {}-token brief from {} session(s) into {}",
+                    result.tokens,
+                    result.sessions,
+                    t.path.display()
+                );
+                println!("Remove it again with: agentbridge clean");
             }
             Err(e) => {
-                println!("Inject target resolution: {} (expected during dry-run)", e);
+                eprintln!("Could not inject into {}: {}", connector.display_name(), e);
+                std::process::exit(1);
             }
         }
-        return;
     }
 
-    match connector.inject(&brief, false) {
-        Ok(target) => {
-            println!("Injected brief into {} at {}", provider, target.path.display());
-            if let Some((start, end)) = target.fenced_range {
-                println!("  Fenced block: bytes [{}, {})", start, end);
+    if dry_run || no_launch {
+        return;
+    }
+    let Some(program) = connector.launch_program() else {
+        eprintln!("{} cannot be launched from agentbridge.", connector.display_name());
+        std::process::exit(1);
+    };
+    match std::process::Command::new(program)
+        .args(passthrough)
+        .current_dir(&project)
+        .status()
+    {
+        Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+        Err(e) => {
+            eprintln!(
+                "Could not launch `{}`: {} (the context above is already in place; \
+                 start it yourself, then `agentbridge clean` when done)",
+                program, e
+            );
+            std::process::exit(127);
+        }
+    }
+}
+
+fn cmd_clean(
+    registry: &agentbridge::connector::Registry,
+    project: Option<&str>,
+    all: bool,
+    dry_run: bool,
+) {
+    use agentbridge::inject::{clean_file, CleanOutcome};
+    let project = resolve_project(project);
+    let mut files = agentbridge::inject::instruction_files(registry, &project);
+    if all {
+        files.extend(agentbridge::inject::remembered());
+    }
+    files.sort();
+    files.dedup();
+
+    let mut done = Vec::new();
+    let mut failed = false;
+    let mut touched = 0;
+    for f in &files {
+        match clean_file(f, dry_run) {
+            Ok(CleanOutcome::NotPresent) => done.push(f.clone()),
+            Ok(outcome) => {
+                touched += 1;
+                let verb = match (outcome, dry_run) {
+                    (CleanOutcome::RemovedFile, true) => "would delete (agentbridge created it)",
+                    (CleanOutcome::RemovedFile, false) => "deleted (agentbridge created it)",
+                    (_, true) => "would clean",
+                    (_, false) => "cleaned",
+                };
+                println!("{} {}", verb, f.display());
+                done.push(f.clone());
+            }
+            Err(e) => {
+                failed = true;
+                eprintln!("  ! {}: {}", f.display(), e);
             }
         }
-        Err(e) => {
-            eprintln!("Failed to inject into {}: {}", provider, e);
-        }
+    }
+    if !dry_run {
+        agentbridge::inject::forget(&done);
+    }
+    if touched == 0 && !failed {
+        println!("Nothing to clean{}.", if all { "" } else { " in this project" });
+    }
+    if failed {
+        std::process::exit(1);
     }
 }
 
@@ -448,6 +895,26 @@ fn cmd_resume(
             Err(e) => {
                 eprintln!("--project '{}' could not be resolved: {}", p, e);
                 return;
+            }
+        }
+    }
+
+    let _lock = (!dry_run).then(lock_or_exit);
+
+    // Cross-tool copies are redacted like everything else `sync` writes. A
+    // resume into the session's own tool rewrites its native file, and
+    // redacting that would replace text the user actually wrote.
+    if session.provider != target {
+        match agentbridge::redact::Redactor::load() {
+            Ok(redactor) => {
+                let n = redactor.session(&mut session);
+                if n > 0 {
+                    println!("  redacted {} secret(s) in the copy (original untouched)", n);
+                }
+            }
+            Err(e) => {
+                eprintln!("redaction: {} — nothing was written", e);
+                std::process::exit(2);
             }
         }
     }
@@ -567,11 +1034,21 @@ fn cmd_resume(
 
     let result: Result<PathBuf, String> = match target {
         "claude-code" => {
-            let converter = ClaudeCodeConverter::new();
+            // Resuming into the session's own tool rewrites its native file,
+            // which must stay unmarked; a cross-tool copy is ours and marked.
+            let converter = if session.provider == target {
+                ClaudeCodeConverter::unmarked()
+            } else {
+                ClaudeCodeConverter::new()
+            };
             converter.convert(&session, target_dir)
         }
         "codex-cli" => {
-            let converter = CodexCliConverter::new();
+            let converter = if session.provider == target {
+                CodexCliConverter::unmarked()
+            } else {
+                CodexCliConverter::new()
+            };
             let mut dirs = vec![session.project_path().unwrap_or_default()];
             if let Ok(home) = std::env::var("HOME") {
                 let home = home.trim_end_matches('/').to_string();
@@ -723,48 +1200,53 @@ fn cmd_inject(
     registry: &agentbridge::connector::Registry,
     provider: &str,
     session_ids: &[String],
+    project: Option<&str>,
     dry_run: bool,
 ) {
-    let sessions: Vec<Session> = session_ids
-        .iter()
-        .filter_map(|id| find_session(registry, id))
-        .collect();
-
-    if sessions.is_empty() {
-        eprintln!("No sessions found for the given IDs.");
-        return;
-    }
-
-    let brief = agentbridge::convert::build_cross_tool_brief(&sessions);
-
-    let connector = match registry.by_id(provider) {
-        Some(c) => c,
-        None => {
-            eprintln!("Unknown provider: {}", provider);
-            return;
-        }
+    let Some(connector) = registry.by_id(provider) else {
+        eprintln!("Unknown provider: {}", provider);
+        std::process::exit(2);
     };
+    let project = resolve_project(project);
+    let mut store = open_index_or_exit();
+    refresh_index(registry, &mut store, None);
+
+    let mut rows = Vec::new();
+    for id in session_ids {
+        match store.find_session(id) {
+            Ok(Some(row)) => rows.push(row),
+            Ok(None) => eprintln!("  ! no indexed session matches `{id}`"),
+            Err(e) => {
+                eprintln!("agentbridge: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if rows.is_empty() {
+        eprintln!("No sessions found for the given IDs.");
+        std::process::exit(1);
+    }
+    let redactor = redactor_or_exit();
+    let result = agentbridge::brief::brief_for_sessions(&store, rows, 1500, &redactor)
+        .unwrap_or_else(|e| {
+            eprintln!("agentbridge: {e}");
+            std::process::exit(2);
+        });
+    let brief = agentbridge::inject::cap_brief(&result.text, agentbridge::inject::MAX_BRIEF_BYTES);
 
     if dry_run {
-        println!("[dry-run] Would inject brief into {}:", provider);
+        println!("[dry-run] Would inject a {}-token brief into {}:", result.tokens, provider);
         println!("{}", brief);
-        match connector.inject(&brief, true) {
-            Ok(target) => {
-                println!("Would write to: {}", target.path.display());
-            }
-            Err(e) => {
-                println!("Inject target resolution: {}", e);
-            }
-        }
-        return;
     }
-
-    match connector.inject(&brief, false) {
+    match connector.inject(&brief, &project, dry_run) {
+        Ok(target) if dry_run => println!("Would write to: {}", target.path.display()),
         Ok(target) => {
-            println!("✓ Injected brief into {} at {}", provider, target.path.display());
+            println!("Injected brief into {} at {}", provider, target.path.display());
+            println!("Remove it again with: agentbridge clean");
         }
         Err(e) => {
             eprintln!("Failed to inject: {}", e);
+            std::process::exit(1);
         }
     }
 }
@@ -774,13 +1256,16 @@ fn find_session(registry: &agentbridge::connector::Registry, session_id: &str) -
         if !c.detect() {
             continue;
         }
-        let scan = c.scan().ok()?;
-        for result in scan {
-            let raw = result.ok()?;
+        // A connector whose scan fails, or one corrupt session in the middle of
+        // a scan, must not hide every session after it.
+        let Ok(scan) = c.scan() else { continue };
+        for raw in scan.filter_map(|r| r.ok()) {
             if (raw.id == session_id || raw.id.contains(session_id) || session_id.contains(&raw.id))
-                && raw.body_available {
-                    return c.load(&raw.id).ok();
-                }
+                && raw.body_available
+                && let Ok(session) = c.load(&raw.id)
+            {
+                return Some(session);
+            }
         }
     }
     None
@@ -819,7 +1304,32 @@ fn cmd_init(registry: &agentbridge::connector::Registry) {
     }
 }
 
-fn cmd_sync(registry: &agentbridge::connector::Registry, project: Option<&str>, dry_run: bool) {
+fn cmd_sync(
+    registry: &agentbridge::connector::Registry,
+    project: Option<&str>,
+    dry_run: bool,
+    all_known: bool,
+    yes: bool,
+) {
+    // Every directory a session was ever recorded in, that still exists.
+    let known: Vec<PathBuf> = if all_known {
+        agentbridge::index::discover(registry)
+            .project_dirs()
+            .into_iter()
+            .filter(|d| d.is_dir())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if all_known && !dry_run && !yes {
+        eprintln!(
+            "--all-known would sync {} directories. Each one re-reads your whole session history, \
+             and OpenCode gets a copy of every session per project directory it knows, which grows \
+             its database. Preview with --dry-run, or confirm with --yes.",
+            known.len()
+        );
+        std::process::exit(2);
+    }
     let dir = match project {
         Some(p) => match std::fs::canonicalize(p) {
             Ok(d) => d,
@@ -830,6 +1340,10 @@ fn cmd_sync(registry: &agentbridge::connector::Registry, project: Option<&str>, 
         },
         None => std::env::current_dir().unwrap_or_default(),
     };
+
+    // One writer at a time: the hook, `auto watch` and manual runs all edit
+    // the manifest. A dry run only reads, so it never waits.
+    let _lock = (!dry_run).then(lock_or_exit);
 
     // Recover anything other tools appended before re-materializing, so the
     // refreshed copies carry it.
@@ -843,8 +1357,17 @@ fn cmd_sync(registry: &agentbridge::connector::Registry, project: Option<&str>, 
         );
     }
 
-    println!("Surfacing all machine sessions in {}", dir.display());
-    let report = agentbridge::sync::sync_into(registry, &dir, dry_run);
+    let report = if all_known {
+        println!("Surfacing all machine sessions in {} known directories", known.len());
+        let mut total = agentbridge::sync::SyncReport::default();
+        for d in &known {
+            total.absorb(agentbridge::sync::sync_into(registry, d, dry_run));
+        }
+        total
+    } else {
+        println!("Surfacing all machine sessions in {}", dir.display());
+        agentbridge::sync::sync_into(registry, &dir, dry_run)
+    };
 
     if dry_run {
         println!("[dry-run] would materialize {} session(s); nothing written", report.created.len());
@@ -854,6 +1377,12 @@ fn cmd_sync(registry: &agentbridge::connector::Registry, project: Option<&str>, 
         if report.codex_indexed > 0 {
             println!("  indexed   {} session(s) into codex /resume", report.codex_indexed);
         }
+    }
+    if report.sessions_redacted > 0 {
+        println!(
+            "  redacted  secrets in {} session(s) (copies only; originals untouched)",
+            report.sessions_redacted
+        );
     }
     if report.skipped_native > 0 {
         println!("  skipped   {} (already native here)", report.skipped_native);
@@ -867,6 +1396,11 @@ fn cmd_sync(registry: &agentbridge::connector::Registry, project: Option<&str>, 
     for e in report.errors.iter().take(10) {
         eprintln!("  ! {}", e);
     }
+    // Fail closed, loudly: a redaction problem means nothing was written, and
+    // a script has to be able to tell.
+    if report.errors.iter().chain(pulled.errors.iter()).any(|e| e.starts_with("redaction:")) {
+        std::process::exit(2);
+    }
     if !dry_run && !report.created.is_empty() {
         println!();
         println!("Open any tool here — its own session picker now lists them.");
@@ -874,8 +1408,13 @@ fn cmd_sync(registry: &agentbridge::connector::Registry, project: Option<&str>, 
     }
 }
 
-fn cmd_unsync(dry_run: bool) {
-    let report = agentbridge::sync::unsync(dry_run);
+fn cmd_unsync(registry: &agentbridge::connector::Registry, dry_run: bool, orphans: bool) {
+    let _lock = (!dry_run).then(lock_or_exit);
+    let report = if orphans {
+        agentbridge::sync::unsync_orphans(registry, dry_run)
+    } else {
+        agentbridge::sync::unsync(dry_run)
+    };
     if dry_run {
         println!("[dry-run] would remove {} file(s)", report.removed.len());
     } else {
@@ -898,6 +1437,7 @@ fn cmd_pull(dry_run: bool, auto_merge: bool) {
     // is the explicit opt-out for scripts that want today's behavior. The
     // full-screen picker (src/tui.rs) is only ever constructed here.
     let interactive = !dry_run && !auto_merge && std::io::stdin().is_terminal();
+    let _lock = (!dry_run).then(lock_or_exit);
 
     let report = if interactive {
         agentbridge::sync::pull_back_with(dry_run, &mut crate::tui::RatatuiConflictResolver)
@@ -953,10 +1493,11 @@ fn cmd_pull(dry_run: bool, auto_merge: bool) {
     }
 }
 
-fn cmd_status() {
+fn cmd_status(registry: &agentbridge::connector::Registry) {
     let rows = agentbridge::sync::status();
     if rows.is_empty() {
         println!("Nothing synced. Run `agentbridge sync`.");
+        print_orphans(registry);
         return;
     }
     println!("{:<38} {:<12} {:>8} {:>8} {:>7}", "SESSION", "TARGET", "WROTE", "ON DISK", "NEW");
@@ -980,7 +1521,46 @@ fn cmd_status() {
     }
     println!();
     println!("{} file(s) tracked, {} with new turns to pull", rows.len(), drifted);
+    print_orphans(registry);
 }
+
+/// Generated files the manifest has lost track of, found by their marker.
+fn print_orphans(registry: &agentbridge::connector::Registry) {
+    let orphans = agentbridge::sync::orphans(registry);
+    if orphans.is_empty() {
+        return;
+    }
+    println!();
+    println!("{} generated file(s) are not in the manifest:", orphans.len());
+    for o in orphans.iter().take(20) {
+        let state = match o.on_disk {
+            Some(n) if n == o.expected => "unmodified".to_string(),
+            Some(n) => format!("{} turn(s) added since", n.saturating_sub(o.expected)),
+            None => "unreadable".to_string(),
+        };
+        println!(
+            "  {} (from {} {}) — {}",
+            o.path.display(),
+            o.origin_provider,
+            o.origin_id,
+            state
+        );
+    }
+    println!("Remove the unmodified ones with: agentbridge unsync --orphans");
+}
+
+/// Take the run lock or exit; waiting is bounded, never indefinite.
+fn lock_or_exit() -> agentbridge::lock::RunLock {
+    match agentbridge::lock::acquire_default() {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!("agentbridge: {e}");
+            // EX_TEMPFAIL: nothing was done, safe to retry.
+            std::process::exit(75);
+        }
+    }
+}
+
 
 fn cmd_auto(registry: &agentbridge::connector::Registry, action: AutoAction) {
     match action {

@@ -93,7 +93,20 @@ impl Dashboard {
         self.registry.detected().map(|c| c.id().to_string()).collect()
     }
 
+    /// Short wait: the dashboard is interactive, so if another run is busy say
+    /// so instead of freezing the screen for minutes.
+    fn try_lock(&mut self) -> Option<agentbridge::lock::RunLock> {
+        match agentbridge::lock::acquire(std::time::Duration::from_secs(5)) {
+            Ok(l) => Some(l),
+            Err(e) => {
+                self.status = e.to_string();
+                None
+            }
+        }
+    }
+
     fn do_sync(&mut self) {
+        let Some(_lock) = self.try_lock() else { return };
         let dir = std::env::current_dir().unwrap_or_default();
         let pulled = pull_back(false);
         let n: usize = pulled.pulled.iter().map(|(_, n)| n).sum();
@@ -128,6 +141,7 @@ impl Dashboard {
 
     fn do_pull(&mut self) {
         self.unsync_pending = false;
+        let Some(_lock) = self.try_lock() else { return };
         let report = pull_back(false);
         let n: usize = report.pulled.iter().map(|(_, n)| n).sum();
         let conflicts = report.conflicts.len();
@@ -159,6 +173,7 @@ impl Dashboard {
     }
 
     fn confirm_unsync(&mut self) {
+        let Some(_lock) = self.try_lock() else { return };
         let report = agentbridge::sync::unsync(false);
         self.status = format!(
             "unsync: removed {} file(s){}",

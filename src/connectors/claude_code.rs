@@ -1,4 +1,4 @@
-use crate::connector::{Connector, ConnectorError, ConnectorResult, InjectTarget, SessionStream};
+use crate::connector::{Connector, ConnectorError, ConnectorResult, SessionStream};
 use crate::model::{Message, RawSession, Role, Session, TokenTotals};
 use chrono::{DateTime, TimeZone, Utc};
 use serde_json::Value;
@@ -131,28 +131,12 @@ impl Connector for ClaudeCodeConnector {
         Some(vec!["claude".to_string(), "--resume".to_string(), session.id.clone()])
     }
 
-    fn inject(&self, brief: &str, dry_run: bool) -> ConnectorResult<InjectTarget> {
-        let target = find_inject_target()?;
-        if !dry_run {
-            let marker_begin = "<!-- agentbridge:brief -->\n";
-            let marker_end = "\n<!-- /agentbridge:brief -->";
-            let content = format!("{}{}{}", marker_begin, brief, marker_end);
-            let start = compute_fence_start(&target)?;
-            fs::write(&target, &content).map_err(|e| ConnectorError::Io {
-                path: target.clone(),
-                source: e,
-            })?;
-            let end = start + content.len();
-            Ok(InjectTarget {
-                path: target,
-                fenced_range: Some((start, end)),
-            })
-        } else {
-            Ok(InjectTarget {
-                path: target,
-                fenced_range: None,
-            })
-        }
+    fn instruction_file(&self, project: &Path) -> Option<PathBuf> {
+        Some(project.join("CLAUDE.md"))
+    }
+
+    fn launch_program(&self) -> Option<&'static str> {
+        Some("claude")
     }
 }
 
@@ -199,6 +183,32 @@ fn extract_cc_text_flexible(val: &Value) -> Option<String> {
         }
     // Try fixture format: content at top level
     val.get("content").and_then(|v| v.as_str()).map(|s| s.to_string())
+}
+
+/// The `message.content` blocks of a record, when it is a block array (the
+/// real format) rather than a plain string.
+fn content_blocks(val: &Value) -> Option<&Vec<Value>> {
+    val.get("message")?.get("content")?.as_array()
+}
+
+/// The text of a `tool_result` block. Claude Code writes either a string or an
+/// array of `{type:"text", text}` blocks; anything else is kept as it is.
+fn tool_result_value(block: &Value) -> Option<Value> {
+    let content = block.get("content")?;
+    match content {
+        Value::Array(parts) => {
+            let texts: Vec<&str> = parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                .collect();
+            if texts.is_empty() {
+                Some(content.clone())
+            } else {
+                Some(Value::String(texts.join("\n")))
+            }
+        }
+        other => Some(other.clone()),
+    }
 }
 
 fn scan_file(path: &Path) -> ConnectorResult<Option<RawSession>> {
@@ -277,12 +287,25 @@ fn scan_file(path: &Path) -> ConnectorResult<Option<RawSession>> {
         }
     }
 
+    // The head stopped at the first record with a `cwd`. The true last event
+    // and the latest rename are at the other end of the file.
+    let mut last_event_at = timestamp;
+    for rec in super::tail_records(path) {
+        let event_type = rec.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if let Some(ts) = extract_cc_timestamp(&rec) {
+            last_event_at = last_event_at.max(Some(ts));
+        }
+        if let Some(t) = extract_cc_custom_title(event_type, &rec) {
+            title = Some(t);
+        }
+    }
+
     Ok(Some(RawSession {
         id,
         provider: "claude-code".to_string(),
         project_path: cwd,
         started_at: timestamp,
-        last_event_at: timestamp,
+        last_event_at,
         title,
         source: None,
         source_path: path.to_path_buf(),
@@ -350,6 +373,8 @@ fn load_from_path(path: &Path, id: &str) -> ConnectorResult<Session> {
     })?;
 
     let reader = BufReader::new(file);
+    // tool_use id -> tool name, so a later tool_result can say which tool it answers.
+    let mut tool_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut messages = Vec::new();
     let mut started_at: Option<DateTime<Utc>> = None;
     let mut last_event_at: Option<DateTime<Utc>> = None;
@@ -421,36 +446,119 @@ fn load_from_path(path: &Path, id: &str) -> ConnectorResult<Session> {
 
         match event_type {
             "user" | "user_message" => {
+                // Real Claude Code writes a tool's output as a *user* record
+                // whose content is `tool_result` blocks, paired with the call
+                // by `tool_use_id`. Reading that as a user turn made every
+                // tool result an empty human message.
+                let results: Vec<&Value> = content_blocks(&val)
+                    .map(|b| {
+                        b.iter()
+                            .filter(|x| x.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let parent = val.get("parentUuid").and_then(|v| v.as_str()).map(|_| 0);
+                for block in &results {
+                    let tool_name = block
+                        .get("tool_use_id")
+                        .and_then(|v| v.as_str())
+                        .and_then(|id| tool_names.get(id).cloned());
+                    messages.push(Message {
+                        session_id: id.to_string(),
+                        ordinal,
+                        role: Role::Tool,
+                        timestamp,
+                        text: None,
+                        tool_name,
+                        tool_input: None,
+                        tool_result: tool_result_value(block),
+                        parent_ordinal: parent,
+                    });
+                    ordinal += 1;
+                }
+                // Any real human text in the same record (or a record that is
+                // plain text) is still a user turn.
                 let text = extract_cc_text_flexible(&val);
-                let msg = Message {
-                    session_id: id.to_string(),
-                    ordinal,
-                    role: Role::User,
-                    timestamp,
-                    text,
-                    tool_name: None,
-                    tool_input: None,
-                    tool_result: None,
-                    parent_ordinal: val.get("parentUuid").and_then(|v| v.as_str()).map(|_| 0),
-                };
-                messages.push(msg);
-                ordinal += 1;
+                if results.is_empty() || text.as_deref().is_some_and(|t| !t.is_empty()) {
+                    messages.push(Message {
+                        session_id: id.to_string(),
+                        ordinal,
+                        role: Role::User,
+                        timestamp,
+                        text,
+                        tool_name: None,
+                        tool_input: None,
+                        tool_result: None,
+                        parent_ordinal: parent,
+                    });
+                    ordinal += 1;
+                }
             }
             "assistant" | "assistant_message" => {
+                // Real Claude Code writes the model's private reasoning as its
+                // own assistant record holding only a `thinking` block. That is
+                // not something anyone said, and reading it as a turn filled
+                // transcripts with blank assistant messages (about one record
+                // in six on a real machine). A record is a turn only if it
+                // carries text or a tool call; an explicitly empty `text`
+                // block still counts, so a genuinely blank reply survives.
+                if content_blocks(&val).is_some_and(|blocks| {
+                    !blocks.is_empty()
+                        && blocks.iter().all(|b| {
+                            !matches!(
+                                b.get("type").and_then(|t| t.as_str()),
+                                Some("text" | "tool_use")
+                            )
+                        })
+                }) {
+                    continue;
+                }
+                // Tool calls are `tool_use` content blocks inside the assistant
+                // message. Each becomes its own turn carrying the tool name and
+                // input, after any text the same record holds.
+                let calls: Vec<&Value> = content_blocks(&val)
+                    .map(|b| {
+                        b.iter()
+                            .filter(|x| x.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let parent = val.get("parentUuid").and_then(|v| v.as_str()).map(|_| 0);
                 let text = extract_cc_text_flexible(&val);
-                let msg = Message {
-                    session_id: id.to_string(),
-                    ordinal,
-                    role: Role::Assistant,
-                    timestamp,
-                    text,
-                    tool_name: None,
-                    tool_input: None,
-                    tool_result: None,
-                    parent_ordinal: val.get("parentUuid").and_then(|v| v.as_str()).map(|_| 0),
-                };
-                messages.push(msg);
-                ordinal += 1;
+                if calls.is_empty() || text.as_deref().is_some_and(|t| !t.is_empty()) {
+                    messages.push(Message {
+                        session_id: id.to_string(),
+                        ordinal,
+                        role: Role::Assistant,
+                        timestamp,
+                        text,
+                        tool_name: None,
+                        tool_input: None,
+                        tool_result: None,
+                        parent_ordinal: parent,
+                    });
+                    ordinal += 1;
+                }
+                for call in calls {
+                    let name = call.get("name").and_then(|v| v.as_str()).map(str::to_string);
+                    if let (Some(call_id), Some(name)) =
+                        (call.get("id").and_then(|v| v.as_str()), &name)
+                    {
+                        tool_names.insert(call_id.to_string(), name.clone());
+                    }
+                    messages.push(Message {
+                        session_id: id.to_string(),
+                        ordinal,
+                        role: Role::Assistant,
+                        timestamp,
+                        text: None,
+                        tool_name: name,
+                        tool_input: call.get("input").cloned(),
+                        tool_result: None,
+                        parent_ordinal: parent,
+                    });
+                    ordinal += 1;
+                }
             }
             "tool_use" => {
                 let tool_name = val.get("tool_name").and_then(|v| v.as_str()).map(|s| s.to_string());
@@ -512,16 +620,7 @@ fn load_from_path(path: &Path, id: &str) -> ConnectorResult<Session> {
     })
 }
 
-fn find_inject_target() -> ConnectorResult<PathBuf> {
-    Err(ConnectorError::Other(anyhow::anyhow!(
-        "inject target resolution not yet implemented for Claude Code; \
-         requires determining the active project directory"
-    )))
-}
 
-fn compute_fence_start(_target: &Path) -> ConnectorResult<usize> {
-    Ok(0)
-}
 
 #[cfg(test)]
 pub struct TestClaudeCode {
@@ -594,7 +693,4 @@ impl Connector for TestClaudeCode {
         None
     }
 
-    fn inject(&self, _brief: &str, _dry_run: bool) -> ConnectorResult<InjectTarget> {
-        Err(ConnectorError::Other(anyhow::anyhow!("inject not available in test connector")))
-    }
 }

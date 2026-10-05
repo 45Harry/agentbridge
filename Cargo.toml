@@ -1,7 +1,9 @@
 [package]
 name = "agentbridge"
-version = "0.3.4"
+version = "0.4.0"
 edition = "2024"
+# `File::try_lock` (the run lock) needs 1.89.
+rust-version = "1.89"
 license = "MIT"
 description = "Local-first CLI + MCP server that bridges session context across AI coding agents."
 
@@ -17,6 +19,8 @@ clap = { version = "4", features = ["derive"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 ratatui = "0.29"
 crossterm = "0.28"
+regex = "1"
 
 [dev-dependencies]
 tempfile = "3"
+fastrand = "2"

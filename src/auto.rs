@@ -83,6 +83,20 @@ pub fn watch(
 
         // First pass always syncs; later passes only when something moved.
         if last.is_empty() || now != last {
+            // Another run (the shell hook, a manual `sync`) may hold the
+            // manifest. Skip this round rather than queue up behind it, and
+            // leave `last` unchanged so the next round retries.
+            let _lock = match crate::lock::acquire(Duration::from_secs(60)) {
+                Ok(l) => l,
+                Err(e) => {
+                    println!("[agentbridge] {} — skipping this round", e);
+                    if once {
+                        break;
+                    }
+                    std::thread::sleep(interval);
+                    continue;
+                }
+            };
             let r = crate::sync::pull_back(false);
             let pulled: usize = r.pulled.iter().map(|(_, n)| n).sum();
             let s = crate::sync::sync_into(registry, project, false);
@@ -93,6 +107,14 @@ pub fn watch(
                     s.created.len(),
                     pulled
                 );
+            }
+            // Keep the search index current as a side effect of the loop that
+            // already scans everything. Incremental, so it reads only what
+            // changed; a failure here never affects syncing.
+            if let (Ok(mut store), Ok(redactor)) =
+                (crate::store::Store::open_default(), crate::redact::Redactor::load())
+            {
+                let _ = crate::store::refresh(&mut store, registry, &redactor, None, |_| {});
             }
             if !r.conflicts.is_empty() {
                 // An unattended daemon can't prompt, so it merges (AutoMerge,

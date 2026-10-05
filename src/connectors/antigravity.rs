@@ -46,10 +46,10 @@
 //! Reads are strictly read-only: databases open with
 //! `SQLITE_OPEN_READ_ONLY` so a live Antigravity process is never blocked.
 
-use crate::connector::{Connector, ConnectorError, ConnectorResult, InjectTarget, SessionStream};
+use crate::connector::{Connector, ConnectorError, ConnectorResult, SessionStream};
 use crate::model::{Message, RawSession, Role, Session, TokenTotals};
 use chrono::{DateTime, TimeZone, Utc};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
 /// Every Antigravity surface that keeps sessions, in the order they are
@@ -125,10 +125,7 @@ impl AntigravityConnector {
     }
 
     fn open_body(&self, id: &str, path: &Path) -> ConnectorResult<Connection> {
-        Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-        )
+        super::open_read_only(path)
         .map_err(|e| ConnectorError::Parse {
             id: id.to_string(),
             path: path.to_path_buf(),
@@ -144,10 +141,7 @@ impl AntigravityConnector {
         if !db.is_file() {
             return None;
         }
-        let conn = Connection::open_with_flags(
-            &db,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-        )
+        let conn = super::open_read_only(&db)
         .ok()?;
         // `title` is the user's explicit rename and must win over `preview`,
         // which is only the first words of the opening message. Reading
@@ -216,10 +210,7 @@ struct BlobMeta {
 /// `trajectory_metadata_blob`; a caller that also has a summaries row layers
 /// the explicit title over the top.
 pub(crate) fn load_body(path: &Path, id: &str) -> ConnectorResult<Session> {
-    let conn = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-    )
+    let conn = super::open_read_only(path)
     .map_err(|e| ConnectorError::Parse {
         id: id.to_string(),
         path: path.to_path_buf(),
@@ -272,6 +263,36 @@ pub(crate) fn load_body(path: &Path, id: &str) -> ConnectorResult<Session> {
                 started_at = ts;
             }
             last_event_at = ts;
+        }
+        // A tool call is two turns: the model asking, then the tool answering.
+        if step_type == STEP_TOOL_CALL
+            && let Some(call) = tool_step(&payload)
+        {
+            messages.push(Message {
+                session_id: id.to_string(),
+                ordinal: messages.len() as u64,
+                role: Role::Assistant,
+                timestamp: ts,
+                text: None,
+                tool_name: Some(call.name.clone()),
+                tool_input: Some(call.input),
+                tool_result: None,
+                parent_ordinal: None,
+            });
+            if let Some(result) = call.result {
+                messages.push(Message {
+                    session_id: id.to_string(),
+                    ordinal: messages.len() as u64,
+                    role: Role::Tool,
+                    timestamp: ts,
+                    text: None,
+                    tool_name: Some(call.name),
+                    tool_input: None,
+                    tool_result: Some(serde_json::Value::String(result)),
+                    parent_ordinal: None,
+                });
+            }
+            continue;
         }
         // A step type that only carries bookkeeping is skipped; a turn with no
         // recoverable text is still kept, since dropping it would silently
@@ -466,10 +487,12 @@ impl Connector for AntigravityConnector {
         })
     }
 
-    fn inject(&self, _brief: &str, _dry_run: bool) -> ConnectorResult<InjectTarget> {
-        Err(ConnectorError::Other(anyhow::anyhow!(
-            "inject not yet implemented for Antigravity"
-        )))
+    fn instruction_file(&self, project: &Path) -> Option<PathBuf> {
+        Some(project.join("AGENTS.md"))
+    }
+
+    fn launch_program(&self) -> Option<&'static str> {
+        Some("agy")
     }
 }
 
@@ -670,7 +693,15 @@ fn step_time(payload: &[u8]) -> Option<DateTime<Utc>> {
 ///   15  model turn — the common case, text at `.20.1`
 ///   17  model turn that failed, message at `.24.3.1`
 ///   23  model summary, text at `.30.4`
-///   5/7/8/9/21/90/98/99/101/132/138  context, tool calls, telemetry
+///   132 tool call: id `.5.4.1`, tool name `.5.4.2`, arguments (a JSON
+///       document in a string) `.5.4.3`, result text `.140.2.1`. Verified on a
+///       real conversation: 76 steps over 7 tools (`view_file`,
+///       `replace_file_content`, `grep_search`, `run_command`, `list_dir`,
+///       `write_to_file`, `find_by_name`), every argument string valid JSON.
+///       Only completed steps (status 3) are read; what status 2 and 7 mean
+///       is not established.
+///   5/7/8/9/21/90/98/99/101/138  context, telemetry (21 was reported as tool
+///       calls in an earlier store; not seen in the verified conversation)
 fn step_message(step_type: i64, payload: &[u8]) -> Option<(Role, Option<String>)> {
     match step_type {
         14 => Some((Role::User, user_text(payload))),
@@ -684,6 +715,29 @@ fn step_message(step_type: i64, payload: &[u8]) -> Option<(Role, Option<String>)
         }
         _ => None,
     }
+}
+
+const STEP_TOOL_CALL: i64 = 132;
+
+struct ToolStep {
+    name: String,
+    input: serde_json::Value,
+    result: Option<String>,
+}
+
+/// A tool-call step (type 132), or `None` if it has no tool name.
+fn tool_step(payload: &[u8]) -> Option<ToolStep> {
+    let call = proto_descend(payload, &[5, 4])?;
+    let name = non_empty(proto_string_field(call, 2))?;
+    // Arguments are a JSON document in a string. Keep it as JSON when it
+    // parses, so downstream code can read `AbsolutePath` or `CommandLine`.
+    let input = match non_empty(proto_string_field(call, 3)) {
+        Some(raw) => serde_json::from_str(&raw).unwrap_or(serde_json::Value::String(raw)),
+        None => serde_json::json!({}),
+    };
+    let result = proto_descend(payload, &[140, 2])
+        .and_then(|r| non_empty(proto_string_field(r, 1)));
+    Some(ToolStep { name, input, result })
 }
 
 /// User text for step type 14: `payload.19.2`, falling back to the inner
@@ -1179,6 +1233,33 @@ mod tests {
             assistant_turns > 0,
             "real sessions must decode model responses, not just user input"
         );
+
+        // Tool-call steps (type 132). Whether any exist depends on the machine,
+        // so assert on the content of whatever is there: a tool step must come
+        // out as a named call followed by its result, never as a blank turn.
+        let (mut calls, mut results, mut unnamed) = (0usize, 0usize, 0usize);
+        for r in &results_listing(&connector) {
+            let s = connector.load(&r.id).unwrap();
+            for m in &s.messages {
+                if m.role == Role::Assistant && m.tool_name.is_some() {
+                    calls += 1;
+                    assert!(m.tool_input.is_some(), "a call keeps its arguments");
+                }
+                if m.role == Role::Tool {
+                    results += 1;
+                    if m.tool_name.is_none() {
+                        unnamed += 1;
+                    }
+                }
+            }
+        }
+        eprintln!("antigravity: {calls} tool calls, {results} tool results, {unnamed} unnamed results");
+        assert_eq!(unnamed, 0, "every tool result names its tool");
+        assert!(results <= calls, "a result never appears without its call");
+    }
+
+    fn results_listing(c: &AntigravityConnector) -> Vec<crate::model::RawSession> {
+        c.scan().unwrap().filter_map(|r| r.ok()).collect()
     }
 
     #[test]
@@ -1207,5 +1288,90 @@ mod tests {
             session.messages[1].timestamp,
             Utc.timestamp_opt(1_785_377_885, 0).single()
         );
+    }
+
+    // ---- tool-call steps (type 132), laid out as found in a real conversation ----
+
+    /// Mirrors a real step: `.5.4.{1,2,3}` call id, name and JSON arguments;
+    /// `.140.2.1` the result text; `.5.1` the timestamp.
+    fn tool_payload(secs: u64, name: &str, args: &str, result: Option<&str>) -> Vec<u8> {
+        let mut created = Vec::new();
+        created.extend(tag_buf(1, 0));
+        created.extend(varint_buf(secs));
+        let mut call = Vec::new();
+        call.extend(str_field(1, "call_2079748"));
+        call.extend(str_field(2, name));
+        call.extend(str_field(3, args));
+        let mut f5 = msg_field(1, &created);
+        f5.extend(msg_field(4, &call));
+        let mut p = Vec::new();
+        p.extend(tag_buf(1, 0));
+        p.extend(varint_buf(132));
+        p.extend(msg_field(5, &f5));
+        if let Some(r) = result {
+            let f140_2 = str_field(1, r);
+            p.extend(msg_field(140, &msg_field(2, &f140_2)));
+        }
+        p
+    }
+
+    #[test]
+    fn test_a_tool_step_decodes_to_a_call_and_its_result() {
+        let p = tool_payload(
+            1_785_377_890,
+            "view_file",
+            r#"{"AbsolutePath":"/home/u/proj/src/main.rs","StartLine":1}"#,
+            Some("fn main() {}"),
+        );
+        let t = tool_step(&p).expect("a tool step");
+        assert_eq!(t.name, "view_file");
+        assert_eq!(t.input["AbsolutePath"], "/home/u/proj/src/main.rs");
+        assert_eq!(t.input["StartLine"], 1, "arguments stay structured JSON");
+        assert_eq!(t.result.as_deref(), Some("fn main() {}"));
+        assert_eq!(step_time(&p), Utc.timestamp_opt(1_785_377_890, 0).single());
+    }
+
+    #[test]
+    fn test_a_tool_step_without_a_name_or_result_is_handled() {
+        // No result yet (a call still running): the call alone is kept.
+        let t = tool_step(&tool_payload(1, "run_command", r#"{"CommandLine":"ls"}"#, None)).unwrap();
+        assert_eq!(t.result, None);
+        // Arguments that are not JSON are kept as text rather than dropped.
+        let t = tool_step(&tool_payload(1, "x", "not json", Some("r"))).unwrap();
+        assert_eq!(t.input, serde_json::Value::String("not json".into()));
+        // No tool name: not a tool call.
+        assert!(tool_step(&tool_payload(1, "", "{}", Some("r"))).is_none());
+        assert!(tool_step(&user_payload(1)).is_none(), "a user step is not a tool step");
+    }
+
+    #[test]
+    fn test_a_conversation_with_tool_calls_loads_them_as_paired_turns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join(".gemini/antigravity-cli");
+        std::fs::create_dir_all(root.join("conversations")).unwrap();
+        let id = "4aa51afb-4660-47ee-884c-56498f4b0333";
+        make_db_with(
+            &root.join("conversations"),
+            id,
+            &[
+                (14, user_payload(1_785_377_882)),
+                (132, tool_payload(1_785_377_885, "view_file", r#"{"AbsolutePath":"/p/a.rs"}"#, Some("contents of a.rs"))),
+                (132, tool_payload(1_785_377_886, "run_command", r#"{"CommandLine":"cargo test"}"#, Some("ok"))),
+            ],
+            None,
+        );
+        let s = AntigravityConnector::with_root(root).load(id).unwrap();
+        let view: Vec<_> = s.messages.iter().map(|m| (m.role, m.tool_name.clone())).collect();
+        assert_eq!(view, vec![
+            (Role::User, None),
+            (Role::Assistant, Some("view_file".into())),
+            (Role::Tool, Some("view_file".into())),
+            (Role::Assistant, Some("run_command".into())),
+            (Role::Tool, Some("run_command".into())),
+        ]);
+        assert_eq!(s.messages[1].tool_input.as_ref().unwrap()["AbsolutePath"], "/p/a.rs");
+        assert_eq!(s.messages[2].tool_result, Some(serde_json::json!("contents of a.rs")));
+        let ords: Vec<u64> = s.messages.iter().map(|m| m.ordinal).collect();
+        assert_eq!(ords, vec![0, 1, 2, 3, 4], "ordinals stay contiguous");
     }
 }

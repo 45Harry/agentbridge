@@ -13,6 +13,7 @@
 use crate::connector::Registry;
 use crate::convert::{ClaudeCodeConverter, CodexCliConverter, SessionConverter};
 use crate::index::{discover, Index};
+use crate::redact::Redactor;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::os::unix::fs::MetadataExt;
@@ -165,16 +166,30 @@ pub fn overlay_title(session_id: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-fn set_overlay_title(session_id: &str, title: &str) -> std::io::Result<()> {
-    fs::create_dir_all(overlay_dir())?;
-    fs::write(overlay_title_path(session_id), title)
+fn set_overlay_title(session_id: &str, title: &str, redactor: &Redactor) -> std::io::Result<()> {
+    // A rename typed inside a copy can carry a secret too, and this file is
+    // folded into every other tool's copy.
+    let (title, _) = redactor.text(title);
+    write_atomic(&overlay_title_path(session_id), title.as_bytes())
 }
 
-fn append_overlay(session_id: &str, messages: &[crate::model::Message]) -> std::io::Result<usize> {
+fn append_overlay(
+    session_id: &str,
+    messages: &[crate::model::Message],
+    redactor: &Redactor,
+) -> std::io::Result<usize> {
     if messages.is_empty() {
         return Ok(0);
     }
     fs::create_dir_all(overlay_dir())?;
+
+    // Redact before the dedup below: a turn typed into a copy is still raw in
+    // that copy until the next sync rewrites it, so a second pull would
+    // otherwise see "raw" vs the stored "redacted" text as two different turns.
+    let mut messages = messages.to_vec();
+    for m in &mut messages {
+        redactor.message(m);
+    }
 
     // Never append a turn already recorded — pulls can overlap when the same
     // session is materialized into several tools.
@@ -183,7 +198,7 @@ fn append_overlay(session_id: &str, messages: &[crate::model::Message]) -> std::
 
     let mut body = fs::read_to_string(overlay_path(session_id)).unwrap_or_default();
     let mut added = 0;
-    for m in messages {
+    for m in &messages {
         if existing.contains(&message_key(m)) {
             continue;
         }
@@ -192,7 +207,7 @@ fn append_overlay(session_id: &str, messages: &[crate::model::Message]) -> std::
         added += 1;
     }
     if added > 0 {
-        fs::write(overlay_path(session_id), body)?;
+        write_atomic(&overlay_path(session_id), body.as_bytes())?;
     }
     Ok(added)
 }
@@ -297,6 +312,15 @@ struct Pending {
 /// always.
 pub fn pull_back_with(dry_run: bool, resolver: &mut dyn ConflictResolver) -> PullReport {
     let mut report = PullReport::default();
+    // Fail closed: a broken rules file means "recover nothing", never "recover
+    // unredacted". The overlay is folded into every other tool's copy.
+    let redactor = match Redactor::load() {
+        Ok(r) => r,
+        Err(e) => {
+            report.errors.push(format!("redaction: {} — nothing was recovered", e));
+            return report;
+        }
+    };
     let mut manifest = read_manifest();
     let mut changed = false;
 
@@ -381,7 +405,7 @@ pub fn pull_back_with(dry_run: bool, resolver: &mut dyn ConflictResolver) -> Pul
                 if keep {
                     if dry_run {
                         report.renamed.push((session_id.clone(), new_title.clone()));
-                    } else if let Err(e) = set_overlay_title(&session_id, new_title) {
+                    } else if let Err(e) = set_overlay_title(&session_id, new_title, &redactor) {
                         report.errors.push(format!("overlay title {}: {}", session_id, e));
                     } else {
                         report.renamed.push((session_id.clone(), new_title.clone()));
@@ -402,7 +426,7 @@ pub fn pull_back_with(dry_run: bool, resolver: &mut dyn ConflictResolver) -> Pul
                 if dry_run {
                     report.pulled.push((session_id.clone(), pending.new_messages.len()));
                 } else {
-                    match append_overlay(&session_id, &pending.new_messages) {
+                    match append_overlay(&session_id, &pending.new_messages, &redactor) {
                         Ok(0) => {}
                         Ok(n) => report.pulled.push((session_id.clone(), n)),
                         Err(e) => {
@@ -424,7 +448,9 @@ pub fn pull_back_with(dry_run: bool, resolver: &mut dyn ConflictResolver) -> Pul
             .iter()
             .map(|r| serde_json::to_string(r).unwrap_or_default() + "\n")
             .collect();
-        let _ = fs::write(manifest_path(), body);
+        if let Err(e) = write_atomic(&manifest_path(), body.as_bytes()) {
+            report.errors.push(format!("manifest update failed: {}", e));
+        }
     }
 
     report
@@ -445,7 +471,26 @@ pub struct SyncReport {
     /// Codex `threads` rows inserted so the materialized rollouts show up in
     /// `codex /resume` (CONNECTORS.md §2).
     pub codex_indexed: usize,
+    /// Sessions in which at least one secret was replaced before writing
+    /// (counted once per session, not once per target tool).
+    pub sessions_redacted: usize,
     pub errors: Vec<String>,
+}
+
+impl SyncReport {
+    /// Fold another run's report into this one (used when one command syncs
+    /// several directories).
+    pub fn absorb(&mut self, other: SyncReport) {
+        self.created.extend(other.created);
+        self.unchanged += other.unchanged;
+        self.skipped_native += other.skipped_native;
+        self.merged_native += other.merged_native;
+        self.codex_indexed += other.codex_indexed;
+        // The same session is redacted again for every directory, so summing
+        // would count it many times over.
+        self.sessions_redacted = self.sessions_redacted.max(other.sessions_redacted);
+        self.errors.extend(other.errors);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -458,6 +503,44 @@ pub struct UnsyncReport {
 
 fn home() -> PathBuf {
     std::env::var("HOME").map(PathBuf::from).unwrap_or_default()
+}
+
+/// Replace `path` with `bytes` so a crash or a concurrent reader sees either
+/// the old file or the new one, never a half-written one.
+///
+/// `fs::write` truncates first, so dying mid-write left an empty or partial
+/// `manifest.jsonl` — and the manifest is the only record of what agentbridge
+/// created, which `unsync` and `pull` both depend on.
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(dir)?;
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let tmp = dir.join(format!(".{}.tmp-{}", name, std::process::id()));
+    let result = (|| {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        // Replacing a file must not change who can read it (a user's own
+        // `CLAUDE.md` may be 0600).
+        if let Ok(meta) = fs::metadata(path) {
+            let _ = fs::set_permissions(&tmp, meta.permissions());
+        }
+        fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// HOME / AGENTBRIDGE_DATA_DIR and friends are process-global, so any test that
+/// points them at a temp tree must hold this for its whole run, or concurrent
+/// tests clobber each other's environment.
+#[cfg(test)]
+pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// agentbridge's own data dir. Overridable for tests and for operators who
@@ -641,7 +724,7 @@ fn append_manifest(records: &[LinkRecord]) -> std::io::Result<()> {
         existing.push_str(&serde_json::to_string(r).unwrap_or_default());
         existing.push('\n');
     }
-    fs::write(&path, existing)
+    write_atomic(&path, existing.as_bytes())
 }
 
 /// Make every session on the machine visible in `project` for every detected
@@ -651,8 +734,13 @@ fn append_manifest(records: &[LinkRecord]) -> std::io::Result<()> {
 /// Fold turns other tools appended into a session (write-back). Dedup by turn
 /// identity: a source session may already contain them if the user also
 /// continued it in its own tool.
-fn fold_overlay(session: &mut crate::model::Session, session_id: &str) {
-    let overlay = overlay_messages(session_id);
+fn fold_overlay(session: &mut crate::model::Session, session_id: &str, redactor: &Redactor) {
+    // Overlays written before redaction existed may still hold a secret, and
+    // this is the point where they would be spread into every copy.
+    let mut overlay = overlay_messages(session_id);
+    for m in &mut overlay {
+        redactor.message(m);
+    }
     if !overlay.is_empty() {
         let have: std::collections::HashSet<String> =
             session.messages.iter().map(message_key).collect();
@@ -674,7 +762,7 @@ fn fold_overlay(session: &mut crate::model::Session, session_id: &str) {
     // itself is never touched (invariant 2), so this overlay is the only
     // record of the rename until/unless the session opts into merge-back.
     if let Some(t) = overlay_title(session_id) {
-        session.title = Some(t);
+        session.title = Some(redactor.text(&t).0);
     }
 }
 
@@ -688,6 +776,7 @@ fn fold_overlay(session: &mut crate::model::Session, session_id: &str) {
 fn merge_back_native(
     registry: &Registry,
     entry: &crate::index::IndexEntry,
+    redactor: &Redactor,
 ) -> Result<(), String> {
     let Some(source) = registry.by_id(&entry.provider) else {
         return Err(format!("merge-back: no connector for {}", entry.provider));
@@ -696,14 +785,18 @@ fn merge_back_native(
         Ok(s) => s,
         Err(e) => return Err(format!("merge-back load {}: {}", entry.id, e)),
     };
-    fold_overlay(&mut session, &entry.id);
+    // The session is deliberately *not* redacted here: this rewrites the
+    // tool's own native file, and redacting it would silently replace text the
+    // user actually wrote. Only the overlay turns folded in (which came from
+    // copies, and are redacted) pass through the redactor.
+    fold_overlay(&mut session, &entry.id, redactor);
 
     match entry.provider.as_str() {
         "claude-code" => {
             let Some(live) = live_root("claude-code") else {
                 return Err("merge-back: no claude-code live root".to_string());
             };
-            ClaudeCodeConverter::new()
+            ClaudeCodeConverter::unmarked()
                 .convert(&session, &live)
                 .map(|_| ())
         }
@@ -713,7 +806,7 @@ fn merge_back_native(
             };
             let cache = cache_root("codex-cli");
             let dir = session.project_path().unwrap_or_default();
-            let artifact = CodexCliConverter::new()
+            let artifact = CodexCliConverter::unmarked()
                 .convert_multi(&session, &cache, std::slice::from_ref(&dir))?
                 .into_iter()
                 .next()
@@ -732,8 +825,17 @@ fn merge_back_native(
 }
 
 pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncReport {
-    let index: Index = discover(registry);
     let mut report = SyncReport::default();
+    // Every copy agentbridge writes goes through this. Fail closed: an
+    // unreadable or invalid rules file means writing nothing at all.
+    let redactor = match Redactor::load() {
+        Ok(r) => r,
+        Err(e) => {
+            report.errors.push(format!("redaction: {} — nothing was written", e));
+            return report;
+        }
+    };
+    let index: Index = discover(registry);
 
     // OpenCode and Antigravity have no live_root (rows/per-conversation
     // databases, not linkable files) but are still valid targets.
@@ -765,8 +867,20 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
     // so the next discovery pass sees those files as ordinary sessions. Left
     // unguarded they get re-materialized on every run and the session count
     // multiplies. A file agentbridge created is never a source.
-    let generated: std::collections::HashSet<PathBuf> =
+    let mut generated: std::collections::HashSet<PathBuf> =
         manifest.iter().map(|r| r.dest.clone()).collect();
+    // The manifest is not the only record. A file carrying agentbridge's own
+    // marker (src/marker.rs) is ours even if the manifest was lost or restored
+    // from an older state; without this such files are re-ingested as real
+    // sessions and multiplied on every sync.
+    for e in &index.entries {
+        if is_file_provider(&e.provider)
+            && !generated.contains(&e.source_path)
+            && crate::marker::read(&e.source_path).is_some()
+        {
+            generated.insert(e.source_path.clone());
+        }
+    }
 
     // Two index entries can carry the same (provider, id) — e.g. a generated
     // file sits alongside its own source. They resolve to one destination, so
@@ -793,6 +907,9 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
         }
     }
 
+    let mut redacted_sessions: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
+
     for entry in entries {
         if generated.contains(&entry.source_path) {
             continue;
@@ -817,7 +934,7 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
                     // so recovered turns stay in the overlay instead.
                     && entry.provider != "antigravity"
                 {
-                    match merge_back_native(registry, entry) {
+                    match merge_back_native(registry, entry, &redactor) {
                         Ok(()) => report.merged_native += 1,
                         Err(e) => report.errors.push(e),
                     }
@@ -851,10 +968,18 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
             };
             session.project_id = project.to_string_lossy().to_string();
 
+            // Redact before anything else touches the session, so the overlay
+            // fold below compares redacted text with redacted text, and every
+            // writer (cache, rows, brief) only ever sees the clean version.
+            // The origin file is not modified; this is the derived copy.
+            if redactor.session(&mut session) > 0 {
+                redacted_sessions.insert((entry.provider.clone(), entry.id.clone()));
+            }
+
             // Fold in turns other tools appended (write-back). Dedup by turn
             // identity: a source session may already contain them if the user
             // also continued it in its own tool.
-            fold_overlay(&mut session, &entry.id);
+            fold_overlay(&mut session, &entry.id, &redactor);
 
             // Stamp the cross-tool label into the title every target picker
             // shows: origin tool, name, the session's own start time, and the
@@ -1081,6 +1206,20 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
                 let rel = artifact.strip_prefix(&cache).unwrap_or(artifact);
                 let dest = live.join(rel);
 
+                // Never write onto a file agentbridge did not create. Sync
+                // always targets `$HOME` as well as the project, so a session
+                // that is *native* to `$HOME` already sits at exactly the path
+                // its `$HOME` copy would take, and replacing it swaps the
+                // user's real transcript for a lossy conversion of itself.
+                // Ours means: tracked in the manifest, or carrying the marker.
+                if dest.exists()
+                    && !generated.contains(&dest)
+                    && !already.iter().any(|(_, d)| d == &dest)
+                {
+                    report.skipped_native += 1;
+                    continue;
+                }
+
                 if already.iter().any(|(id, d)| id == &entry.id && d == &dest) && dest.exists() {
                     // The artifact was just re-converted and the live copy shares
                     // its inode (hardlink), so the copy *is* refreshed even though
@@ -1142,7 +1281,7 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
                 .iter()
                 .map(|r| serde_json::to_string(r).unwrap_or_default() + "\n")
                 .collect();
-            if let Err(e) = fs::write(manifest_path(), body) {
+            if let Err(e) = write_atomic(&manifest_path(), body.as_bytes()) {
                 report.errors.push(format!("manifest update failed: {}", e));
             }
         }
@@ -1151,6 +1290,7 @@ pub fn sync_into(registry: &Registry, project: &Path, dry_run: bool) -> SyncRepo
         }
     }
 
+    report.sessions_redacted = redacted_sessions.len();
     report
 }
 
@@ -1235,6 +1375,87 @@ fn ensure_codex_row(
 
 /// Remove exactly the files agentbridge created. A destination whose inode
 /// no longer matches the manifest belongs to something else now and is kept.
+/// Providers whose generated copies are plain files that can carry the marker.
+fn is_file_provider(provider: &str) -> bool {
+    matches!(provider, "claude-code" | "codex-cli")
+}
+
+/// A file agentbridge wrote (it carries the marker) that the manifest no
+/// longer knows about.
+#[derive(Debug, Clone)]
+pub struct Orphan {
+    pub path: PathBuf,
+    /// Tool whose store holds the file.
+    pub provider: String,
+    pub origin_provider: String,
+    pub origin_id: String,
+    /// Turns agentbridge wrote.
+    pub expected: usize,
+    /// Turns in the file now; `None` if it could not be read.
+    pub on_disk: Option<usize>,
+}
+
+impl Orphan {
+    /// Safe to delete: nothing has been appended since agentbridge wrote it.
+    /// (Turns only — a rename made inside the tool is not detectable here.)
+    pub fn unmodified(&self) -> bool {
+        self.on_disk == Some(self.expected)
+    }
+}
+
+/// Marked files the manifest does not track. Read-only.
+pub fn orphans(registry: &Registry) -> Vec<Orphan> {
+    let tracked: std::collections::HashSet<PathBuf> =
+        read_manifest().into_iter().map(|r| r.dest).collect();
+    discover(registry)
+        .entries
+        .into_iter()
+        .filter(|e| is_file_provider(&e.provider) && !tracked.contains(&e.source_path))
+        .filter_map(|e| {
+            let marker = crate::marker::read(&e.source_path)?;
+            let on_disk = load_materialized(&e.provider, &e.source_path, &e.id)
+                .map(|s| s.messages.len());
+            Some(Orphan {
+                path: e.source_path,
+                provider: e.provider,
+                origin_provider: marker.origin_provider,
+                origin_id: marker.origin_id,
+                expected: marker.messages,
+                on_disk,
+            })
+        })
+        .collect()
+}
+
+/// Remove orphans nobody has added work to. An orphan with extra turns is kept
+/// (and listed in `kept_foreign`): with the manifest gone there is no baseline
+/// to recover those turns against, so deleting it would lose them.
+pub fn unsync_orphans(registry: &Registry, dry_run: bool) -> UnsyncReport {
+    let mut report = UnsyncReport::default();
+    for o in orphans(registry) {
+        if !o.unmodified() {
+            report.kept_foreign.push(o.path);
+            continue;
+        }
+        if dry_run {
+            report.removed.push(o.path);
+            continue;
+        }
+        match fs::remove_file(&o.path) {
+            Ok(()) => {
+                if let Some(parent) = o.path.parent()
+                    && fs::read_dir(parent).map(|mut d| d.next().is_none()).unwrap_or(false)
+                {
+                    let _ = fs::remove_dir(parent);
+                }
+                report.removed.push(o.path);
+            }
+            Err(_) => report.missing += 1,
+        }
+    }
+    report
+}
+
 pub fn unsync(dry_run: bool) -> UnsyncReport {
     let mut report = UnsyncReport::default();
     let records = read_manifest();
@@ -1340,7 +1561,7 @@ pub fn unsync(dry_run: bool) -> UnsyncReport {
             .iter()
             .map(|r| serde_json::to_string(r).unwrap_or_default() + "\n")
             .collect();
-        let _ = fs::write(manifest_path(), body);
+        let _ = write_atomic(&manifest_path(), body.as_bytes());
     }
 
     report
@@ -1357,10 +1578,6 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
     }
 
-    /// HOME / AGENTBRIDGE_DATA_DIR are process-global, so sandboxed tests
-    /// must not run concurrently or they clobber each other's env.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// Point HOME and the data dir at a temp tree so tests never touch the
     /// operator's real `~/.claude` or `~/.codex`.
     struct Sandbox {
@@ -1370,7 +1587,7 @@ mod tests {
 
     impl Sandbox {
         fn new() -> Self {
-            let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let guard = super::test_env_lock();
             let tmp = tempfile::tempdir().unwrap();
             unsafe {
                 std::env::set_var("HOME", tmp.path());
@@ -1387,6 +1604,10 @@ mod tests {
                 // would write conversations into the operator's real
                 // ~/.gemini store (HANDOFF §sandbox doctrine).
                 std::env::set_var("ANTIGRAVITY_HOME", tmp.path().join(".gemini/antigravity-cli"));
+                // OpenCode's database lives under XDG_DATA_HOME when set, so a
+                // developer who exports it would otherwise have sandboxed
+                // tests read and write their real opencode.db.
+                std::env::set_var("XDG_DATA_HOME", tmp.path().join(".local/share"));
             }
             Sandbox { _tmp: tmp, _guard: guard }
         }
@@ -1911,7 +2132,7 @@ mod tests {
             tool_result: None,
             parent_ordinal: None,
         };
-        append_overlay(NATIVE_UUID, &[overlay_msg]).unwrap();
+        append_overlay(NATIVE_UUID, &[overlay_msg], &Redactor::defaults()).unwrap();
         set_merge(NATIVE_UUID).unwrap();
 
         let report = sync_into(&registry, &project, false);
@@ -1961,7 +2182,7 @@ mod tests {
             tool_result: None,
             parent_ordinal: None,
         };
-        append_overlay(NATIVE_UUID, &[overlay_msg]).unwrap();
+        append_overlay(NATIVE_UUID, &[overlay_msg], &Redactor::defaults()).unwrap();
 
         let report = sync_into(&registry, &project, false);
 
@@ -2782,5 +3003,576 @@ mod tests {
             before + 1,
             "refresh must advance the manifest count"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 1: redaction, run lock, durable marker
+    // ------------------------------------------------------------------
+
+    /// Every secret planted in the claude and codex fixtures.
+    const PLANTED_SECRETS: &[&str] = &[
+        "sk-abc123def456ghi789jkl012",
+        "sk-proj-1111111111222222",
+        "wJalrXUtnFEMI/K7MDENG",
+        "ghp_AAAAAAAAAAAAAAAA",
+        "user:password@localhost",
+        "secret123@prod-db",
+        "sk-proj-real-looking-fake-key-for-testing",
+        "super-secret-jwt-key-12345",
+    ];
+
+    /// Every regular file under `root` (SQLite databases and their `-wal` /
+    /// `-shm` siblings included) whose bytes contain `needle`.
+    fn files_containing(root: &Path, needle: &str) -> Vec<PathBuf> {
+        walkdir::WalkDir::new(root)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .filter(|e| {
+                fs::read(e.path())
+                    .map(|b| b.windows(needle.len()).any(|w| w == needle.as_bytes()))
+                    .unwrap_or(false)
+            })
+            .map(|e| e.path().to_path_buf())
+            .collect()
+    }
+
+    fn sandbox_home() -> PathBuf {
+        PathBuf::from(std::env::var("HOME").unwrap())
+    }
+
+    fn make_opencode_db(home: &Path) -> PathBuf {
+        let db = home.join(".local/share/opencode/opencode.db");
+        fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            r#"
+            PRAGMA foreign_keys = ON;
+            CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT NOT NULL,
+                time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+                sandboxes TEXT NOT NULL);
+            CREATE TABLE session (
+                id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
+                parent_id TEXT, slug TEXT NOT NULL, directory TEXT NOT NULL,
+                title TEXT NOT NULL, version TEXT NOT NULL,
+                time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+                metadata TEXT,
+                FOREIGN KEY (project_id) REFERENCES project(id) ON DELETE CASCADE);
+            CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES session(id) ON DELETE CASCADE);
+            CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL,
+                session_id TEXT NOT NULL, time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL, data TEXT NOT NULL,
+                FOREIGN KEY (message_id) REFERENCES message(id) ON DELETE CASCADE);
+            INSERT INTO project VALUES ('global','/',0,0,'[]');
+            "#,
+        )
+        .unwrap();
+        db
+    }
+
+    /// Flips the process-wide redaction opt-out for one test and always puts it
+    /// back, so a failing assertion cannot leak the setting into other tests.
+    struct RedactionOff;
+    impl RedactionOff {
+        fn new() -> Self {
+            crate::redact::set_disabled_for_test(true);
+            Self
+        }
+    }
+    impl Drop for RedactionOff {
+        fn drop(&mut self) {
+            crate::redact::set_disabled_for_test(false);
+        }
+    }
+
+    /// The headline guarantee: a secret in any session never lands in any tool's
+    /// store. All four writers, scanned at the byte level, WAL files included.
+    #[test]
+    fn test_secrets_never_reach_any_target_store() {
+        let _sb = Sandbox::new();
+        let home = sandbox_home();
+        make_opencode_db(&home);
+        make_agy_store();
+        let fx = fixture_root();
+
+        // Precondition: the fixtures really contain every needle, or this test
+        // would pass vacuously.
+        for needle in PLANTED_SECRETS {
+            assert!(
+                !files_containing(&fx, needle).is_empty(),
+                "fixture no longer contains {needle}; update PLANTED_SECRETS"
+            );
+        }
+
+        let registry = crate::connector::Registry::new(vec![
+            Box::new(crate::connectors::claude_code::TestClaudeCode::new(fx.join("claude-code"))),
+            Box::new(crate::connectors::codex_cli::TestCodexCli::new(fx.join("codex-cli"))),
+            Box::new(crate::connectors::opencode::OpenCodeConnector::new()),
+            Box::new(crate::connectors::antigravity::AntigravityConnector::new()),
+        ]);
+        let report = sync_into(&registry, Path::new("/tmp/some-project"), false);
+
+        assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+        // Non-vacuous: every one of the four writers actually wrote something.
+        for target in ["claude-code", "codex-cli", "opencode", "antigravity"] {
+            assert!(
+                report.created.iter().any(|r| r.target_provider == target),
+                "{target} received no copy, so it was not tested"
+            );
+        }
+        assert!(report.sessions_redacted >= 2, "got {}", report.sessions_redacted);
+
+        for needle in PLANTED_SECRETS {
+            let leaks = files_containing(&home, needle);
+            assert!(leaks.is_empty(), "secret {needle:?} leaked into {leaks:?}");
+        }
+        assert!(
+            !files_containing(&home, "[REDACTED:").is_empty(),
+            "copies should carry redaction tags, proving the text went through the redactor"
+        );
+    }
+
+    /// `--no-redact` really copies as-is, and a later normal sync scrubs the
+    /// copies it wrote earlier (hardlinks follow the refreshed cache file).
+    #[test]
+    fn test_opt_out_copies_secrets_and_a_later_sync_scrubs_them() {
+        let _sb = Sandbox::new();
+        let home = sandbox_home();
+        let registry = crate::connectors::all_for_testing(&fixture_root());
+        let project = PathBuf::from("/tmp/some-project");
+
+        {
+            let _off = RedactionOff::new();
+            let report = sync_into(&registry, &project, false);
+            assert_eq!(report.sessions_redacted, 0);
+            assert!(
+                !files_containing(&home, "sk-abc123def456ghi789jkl012").is_empty(),
+                "with redaction off the secret should be copied verbatim"
+            );
+        }
+
+        let report = sync_into(&registry, &project, false);
+        assert!(report.sessions_redacted > 0);
+        for needle in PLANTED_SECRETS {
+            let leaks = files_containing(&home, needle);
+            assert!(leaks.is_empty(), "re-sync left {needle:?} in {leaks:?}");
+        }
+    }
+
+    /// A turn typed into a copy is recovered into the overlay redacted, and
+    /// recovering it again does not duplicate it (raw vs redacted text must not
+    /// read as two different turns).
+    #[test]
+    fn test_pull_back_redacts_recovered_turns_and_stays_idempotent() {
+        let _sb = Sandbox::new();
+        let registry = crate::connectors::all_for_testing(&fixture_root());
+        let project = PathBuf::from("/tmp/some-project");
+        let synced = sync_into(&registry, &project, false);
+        let link = first_claude_link(&synced);
+
+        let typed = "deploy with key sk-abc123def456ghi789jkl012 please";
+        append_claude_turn(&link.dest, &link.session_id, typed);
+
+        let first = pull_back(false);
+        assert_eq!(first.pulled.iter().map(|(_, n)| n).sum::<usize>(), 1);
+        let overlay = overlay_messages(&link.session_id);
+        let turn = overlay
+            .iter()
+            .find(|m| m.text.as_deref().is_some_and(|t| t.contains("deploy with key")))
+            .expect("turn recovered");
+        assert!(!turn.text.as_deref().unwrap().contains("sk-abc123"), "{:?}", turn.text);
+        assert!(
+            files_containing(&data_dir().join("overlay"), "sk-abc123def456ghi789jkl012").is_empty(),
+            "the overlay on disk must not hold the secret"
+        );
+
+        // The copy still holds the raw turn until the next sync rewrites it, so
+        // a second pull sees it again; it must dedupe against the redacted one.
+        let before = overlay_messages(&link.session_id).len();
+        pull_back(false);
+        assert_eq!(overlay_messages(&link.session_id).len(), before, "duplicated on re-pull");
+
+        // And the next sync scrubs the copy itself.
+        sync_into(&registry, &project, false);
+        let after = fs::read_to_string(&link.dest).unwrap();
+        assert!(!after.contains("sk-abc123def456ghi789jkl012"), "copy still raw after sync");
+        assert!(after.contains("deploy with key"), "the turn itself must survive");
+    }
+
+    /// Fail closed: a rules file that does not parse stops the write entirely,
+    /// rather than falling back to the defaults or writing unredacted.
+    #[test]
+    fn test_invalid_rules_file_stops_sync_and_pull_without_writing() {
+        let _sb = Sandbox::new();
+        fs::create_dir_all(data_dir()).unwrap();
+        fs::write(data_dir().join(crate::redact::USER_RULES_FILE), "broken = (unclosed\n").unwrap();
+        let registry = crate::connectors::all_for_testing(&fixture_root());
+
+        let report = sync_into(&registry, Path::new("/tmp/some-project"), false);
+        assert!(report.created.is_empty(), "nothing may be written");
+        assert!(
+            report.errors.iter().any(|e| e.starts_with("redaction:")),
+            "error should say why: {:?}",
+            report.errors
+        );
+        assert!(!cache_root("claude-code").exists(), "no cache written");
+        assert!(!manifest_path().exists(), "no manifest written");
+        assert!(live_root("claude-code").is_none_or(|p| !p.exists()), "no live files written");
+
+        let pulled = pull_back(false);
+        assert!(pulled.errors.iter().any(|e| e.starts_with("redaction:")), "{:?}", pulled.errors);
+    }
+
+    /// Redaction applies to derived copies only. Merge-back rewrites a tool's
+    /// *own* file, and that must keep the text the user wrote, secrets and all,
+    /// and must not be marked as agentbridge output.
+    #[test]
+    fn test_merge_back_keeps_native_text_and_does_not_mark_the_native_file() {
+        let _sb = Sandbox::new();
+        let live = live_root("claude-code").unwrap();
+        let project = PathBuf::from("/tmp/merge-project");
+        let dir = live.join(crate::convert::ClaudeCodeConverter::encode_project_dir(
+            project.to_str().unwrap(),
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let native = dir.join(format!("{}.jsonl", NATIVE_UUID));
+        fs::write(
+            &native,
+            format!(
+                "{{\"uuid\":\"{u}\",\"type\":\"conversation_start\",\"cwd\":\"/tmp/merge-project\",\"timestamp\":\"2026-07-01T12:00:00Z\",\"title\":\"Merge test\"}}\n\
+                 {{\"uuid\":\"b2c3d4e5-f6a7-8901-bcde-f12345678901\",\"parentUuid\":\"{u}\",\"type\":\"user_message\",\"cwd\":\"/tmp/merge-project\",\"timestamp\":\"2026-07-01T12:00:05Z\",\"content\":\"my key is sk-abc123def456ghi789jkl012\"}}\n",
+                u = NATIVE_UUID
+            ),
+        )
+        .unwrap();
+        let registry = native_registry(live.clone());
+
+        let overlay_msg = crate::model::Message {
+            session_id: NATIVE_UUID.into(),
+            ordinal: 0,
+            role: crate::model::Role::User,
+            timestamp: Some(chrono::DateTime::from_timestamp(1783000000, 0).unwrap()),
+            text: Some("answered in opencode".into()),
+            tool_name: None,
+            tool_input: None,
+            tool_result: None,
+            parent_ordinal: None,
+        };
+        append_overlay(NATIVE_UUID, &[overlay_msg], &Redactor::defaults()).unwrap();
+        set_merge(NATIVE_UUID).unwrap();
+
+        let report = sync_into(&registry, &project, false);
+        assert_eq!(report.merged_native, 1, "errors: {:?}", report.errors);
+
+        let body = fs::read_to_string(&native).unwrap();
+        assert!(
+            body.contains("sk-abc123def456ghi789jkl012"),
+            "the user's own native file must not be redacted"
+        );
+        assert!(body.contains("answered in opencode"), "merged turn present");
+        assert!(
+            crate::marker::read(&native).is_none(),
+            "a native file must never carry the agentbridge marker"
+        );
+
+        // Still a real source on the next pass, not mistaken for our output.
+        let again = sync_into(&registry, &project, false);
+        assert_eq!(again.merged_native, 1);
+        assert!(orphans(&registry).is_empty());
+    }
+
+    /// The manifest is not the only record: with it gone, generated files are
+    /// still recognised, not re-ingested and multiplied, and can be cleaned up.
+    #[test]
+    fn test_lost_manifest_does_not_multiply_copies_and_orphans_are_cleaned() {
+        let _sb = Sandbox::new();
+        let live = live_root("claude-code").unwrap();
+        write_native_claude_session(&live, "/tmp/merge-project");
+        // Codex only counts as a (detected) target once its store exists.
+        fs::create_dir_all(sandbox_home().join(".codex/sessions")).unwrap();
+        // Scans the live roots, so generated copies are visible to discovery.
+        let registry = crate::connector::Registry::new(vec![
+            Box::new(crate::connectors::claude_code::TestClaudeCode::new(live.clone())),
+            Box::new(crate::connectors::codex_cli::CodexCliConnector::new()),
+        ]);
+        let other = PathBuf::from("/tmp/other-project");
+        let count_files = |root: &Path| {
+            walkdir::WalkDir::new(root)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().is_file())
+                .count()
+        };
+        let all_files = || count_files(&sandbox_home().join(".claude")) + count_files(&sandbox_home().join(".codex"));
+
+        let first = sync_into(&registry, &other, false);
+        assert!(
+            first.created.iter().any(|r| r.target_provider == "codex-cli")
+                && first.created.iter().any(|r| r.target_provider == "claude-code"),
+            "need generated copies in both tools to test cross-tool re-ingestion: {:?}",
+            first.created.iter().map(|r| &r.target_provider).collect::<Vec<_>>()
+        );
+        let files_after_first = all_files();
+
+        // Lose the manifest, as a restored backup or a deleted data dir would.
+        fs::remove_file(manifest_path()).unwrap();
+
+        let found = orphans(&registry);
+        assert!(!found.is_empty(), "marked files must be found without the manifest");
+        assert!(found.iter().all(|o| o.unmodified()), "{found:?}");
+
+        // Re-syncing must not treat those files as new sessions. File counts
+        // alone cannot show this (every path is deterministic, so a re-ingested
+        // copy lands on the same name), so check provenance: the only source
+        // that exists is the native claude-code session, and no row may claim
+        // a generated copy as its origin.
+        sync_into(&registry, &other, false);
+        assert_eq!(all_files(), files_after_first, "copies were multiplied");
+        let rows = read_manifest();
+        assert!(!rows.is_empty());
+        assert!(
+            rows.iter().all(|r| r.source_provider == "claude-code"),
+            "a generated copy was re-ingested as a source: {:?}",
+            rows.iter().map(|r| (&r.source_provider, &r.target_provider)).collect::<Vec<_>>()
+        );
+
+        // Dry run lists, a real run removes; the native session is untouched.
+        fs::remove_file(manifest_path()).unwrap();
+        let planned = unsync_orphans(&registry, true);
+        assert_eq!(planned.removed.len(), found.len());
+        assert_eq!(all_files(), files_after_first, "dry run must not delete");
+        let done = unsync_orphans(&registry, false);
+        assert_eq!(done.removed.len(), found.len());
+        assert!(
+            live.join(crate::convert::ClaudeCodeConverter::encode_project_dir("/tmp/merge-project"))
+                .join(format!("{}.jsonl", NATIVE_UUID))
+                .exists(),
+            "the native session must survive"
+        );
+    }
+
+    /// An orphan someone has continued working in is kept: with the manifest
+    /// gone there is no baseline to recover those turns against.
+    #[test]
+    fn test_orphan_with_new_turns_is_kept() {
+        let _sb = Sandbox::new();
+        let live = live_root("claude-code").unwrap();
+        write_native_claude_session(&live, "/tmp/merge-project");
+        let registry = native_registry(live);
+        let report = sync_into(&registry, Path::new("/tmp/other-project"), false);
+        let link = first_claude_link(&report);
+        append_claude_turn(&link.dest, &link.session_id, "work done after the sync");
+        fs::remove_file(manifest_path()).unwrap();
+
+        let found = orphans(&registry);
+        let mine = found.iter().find(|o| o.path == link.dest).expect("orphan listed");
+        assert!(!mine.unmodified(), "{mine:?}");
+
+        let done = unsync_orphans(&registry, false);
+        assert!(done.kept_foreign.contains(&link.dest));
+        assert!(link.dest.exists(), "a file with new turns must not be deleted");
+    }
+
+    #[test]
+    fn test_write_atomic_replaces_and_leaves_no_temp_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("manifest.jsonl");
+        write_atomic(&target, b"one\n").unwrap();
+        write_atomic(&target, b"two\n").unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "two\n");
+        let stray: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(stray.is_empty(), "temp file left behind: {stray:?}");
+
+        // A failed replace cleans up after itself and leaves the old file alone.
+        let dir_target = tmp.path().join("adir");
+        fs::create_dir(&dir_target).unwrap();
+        assert!(write_atomic(&dir_target, b"x").is_err());
+        let stray: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(stray.is_empty(), "temp file left after failure: {stray:?}");
+    }
+
+    // ------------------------------------------------------------------
+    // Never overwrite a file agentbridge did not create
+    // ------------------------------------------------------------------
+
+    /// Sync always also targets `$HOME`. A Claude session that is *native* to
+    /// `$HOME` already lives at exactly the path the `$HOME` copy would be
+    /// written to, so syncing from any other folder must not replace it with a
+    /// (lossy) converted copy.
+    #[test]
+    fn test_sync_never_overwrites_a_native_session_living_in_home() {
+        let _sb = Sandbox::new();
+        let live = live_root("claude-code").unwrap();
+        let home = sandbox_home();
+        write_native_claude_session(&live, home.to_str().unwrap());
+        let native = live
+            .join(crate::convert::ClaudeCodeConverter::encode_project_dir(home.to_str().unwrap()))
+            .join(format!("{}.jsonl", NATIVE_UUID));
+        let before = fs::read(&native).unwrap();
+        let registry = native_registry(live);
+
+        let report = sync_into(&registry, Path::new("/tmp/elsewhere"), false);
+
+        assert_eq!(
+            fs::read(&native).unwrap(),
+            before,
+            "the user's own session file was rewritten by sync (errors: {:?})",
+            report.errors
+        );
+        assert!(
+            report.created.iter().all(|r| r.dest != native),
+            "sync claimed the native file as one of its own copies"
+        );
+        // And unsync must therefore never delete it.
+        unsync(false);
+        assert!(native.exists(), "unsync deleted a native session");
+    }
+
+    #[test]
+    fn test_sync_report_absorb_sums_work_but_not_redacted_sessions() {
+        let mut a = SyncReport { unchanged: 2, skipped_native: 1, sessions_redacted: 3, ..Default::default() };
+        let b = SyncReport {
+            unchanged: 5,
+            merged_native: 1,
+            codex_indexed: 4,
+            sessions_redacted: 3,
+            errors: vec!["e".into()],
+            ..Default::default()
+        };
+        a.absorb(b);
+        assert_eq!((a.unchanged, a.skipped_native, a.merged_native, a.codex_indexed), (7, 1, 1, 4));
+        assert_eq!(a.sessions_redacted, 3, "the same sessions, not 6 of them");
+        assert_eq!(a.errors.len(), 1);
+    }
+
+    // ------------------------------------------------------------------
+    // Safety: reading must never write (SPEC §7 "must-fail" tests)
+    // ------------------------------------------------------------------
+
+    /// path -> (length, mtime, content hash) for every file under `root`,
+    /// directories included, so a created `-wal`/`-shm`/lock file shows up.
+    fn tree_snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, (u64, Option<std::time::SystemTime>, u64)> {
+        use std::hash::{Hash, Hasher};
+        walkdir::WalkDir::new(root)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .map(|e| {
+                let meta = e.metadata().unwrap();
+                let hash = if meta.is_file() {
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    fs::read(e.path()).unwrap_or_default().hash(&mut h);
+                    h.finish()
+                } else {
+                    0
+                };
+                (e.path().to_path_buf(), (meta.len(), meta.modified().ok(), hash))
+            })
+            .collect()
+    }
+
+    /// Makes a tree read-only, and always puts the permissions back so the
+    /// temp dir can be deleted even when an assertion fails.
+    struct ReadOnlyTree(PathBuf);
+    impl ReadOnlyTree {
+        fn lock(root: &Path) -> Self {
+            Self::chmod(root, true);
+            Self(root.to_path_buf())
+        }
+        fn chmod(root: &Path, readonly: bool) {
+            use std::os::unix::fs::PermissionsExt;
+            for e in walkdir::WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+                let mode = match (e.file_type().is_dir(), readonly) {
+                    (true, true) => 0o555,
+                    (false, true) => 0o444,
+                    (true, false) => 0o755,
+                    (false, false) => 0o644,
+                };
+                let _ = fs::set_permissions(e.path(), fs::Permissions::from_mode(mode));
+            }
+        }
+    }
+    impl Drop for ReadOnlyTree {
+        fn drop(&mut self) {
+            Self::chmod(&self.0, false);
+        }
+    }
+
+    /// Every operation that is supposed to be read-only.
+    fn run_read_only_operations(registry: &crate::connector::Registry, project: &Path) {
+        for c in registry.all() {
+            if !c.detect() {
+                continue;
+            }
+            for raw in c.scan().unwrap().filter_map(|r| r.ok()) {
+                let _ = c.load(&raw.id);
+            }
+        }
+        let _ = discover(registry);
+        let _ = status();
+        let _ = orphans(registry);
+        let _ = pull_back(true);
+        let _ = sync_into(registry, project, true);
+        let _ = unsync(true);
+        let _ = unsync_orphans(registry, true);
+    }
+
+    #[test]
+    fn test_read_only_operations_write_nothing_anywhere() {
+        let _sb = Sandbox::new();
+        let home = sandbox_home();
+        make_opencode_db(&home);
+        make_agy_store();
+        fs::create_dir_all(home.join(".codex/sessions")).unwrap();
+        let fx = fixture_root();
+
+        // Populate all four stores through agentbridge's own writers.
+        let seed = crate::connector::Registry::new(vec![
+            Box::new(crate::connectors::claude_code::TestClaudeCode::new(fx.join("claude-code"))),
+            Box::new(crate::connectors::codex_cli::TestCodexCli::new(fx.join("codex-cli"))),
+            Box::new(crate::connectors::opencode::OpenCodeConnector::new()),
+            Box::new(crate::connectors::antigravity::AntigravityConnector::new()),
+        ]);
+        let project = PathBuf::from("/tmp/some-project");
+        let seeded = sync_into(&seed, &project, false);
+        for t in ["claude-code", "codex-cli", "opencode", "antigravity"] {
+            assert!(seeded.created.iter().any(|r| r.target_provider == t), "{t} not seeded");
+        }
+
+        // Now read the live stores themselves.
+        let live = crate::connector::Registry::new(vec![
+            Box::new(crate::connectors::claude_code::TestClaudeCode::new(live_root("claude-code").unwrap())),
+            Box::new(crate::connectors::codex_cli::CodexCliConnector::new()),
+            Box::new(crate::connectors::opencode::OpenCodeConnector::new()),
+            Box::new(crate::connectors::antigravity::AntigravityConnector::new()),
+        ]);
+
+        let before = tree_snapshot(&home);
+        run_read_only_operations(&live, &project);
+        let after = tree_snapshot(&home);
+        let changed: Vec<_> = after
+            .iter()
+            .filter(|(k, v)| before.get(*k) != Some(v))
+            .map(|(k, _)| k.display().to_string())
+            .chain(before.keys().filter(|k| !after.contains_key(*k)).map(|k| format!("(deleted) {}", k.display())))
+            .collect();
+        assert!(changed.is_empty(), "read-only operations changed: {changed:?}");
+
+        // Same again with the whole tree read-only: nothing may attempt a
+        // write, and a store that cannot be opened must degrade, not panic.
+        let _ro = ReadOnlyTree::lock(&home);
+        let before = tree_snapshot(&home);
+        run_read_only_operations(&live, &project);
+        assert_eq!(before, tree_snapshot(&home), "read-only tree changed");
     }
 }

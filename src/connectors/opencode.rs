@@ -14,10 +14,10 @@
 //! `SQLITE_OPEN_READ_ONLY` so a live OpenCode process is never blocked and
 //! this can never mutate the operator's real data.
 
-use crate::connector::{Connector, ConnectorError, ConnectorResult, InjectTarget, SessionStream};
+use crate::connector::{Connector, ConnectorError, ConnectorResult, SessionStream};
 use crate::model::{Message, RawSession, Role, Session, TokenTotals};
 use chrono::{DateTime, TimeZone, Utc};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -40,10 +40,7 @@ impl OpenCodeConnector {
     /// — that would tell SQLite the file cannot change and risk reading torn
     /// or stale data while OpenCode is running.
     fn open(&self) -> ConnectorResult<Connection> {
-        Connection::open_with_flags(
-            &self.db_path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-        )
+        super::open_read_only(&self.db_path)
         .map_err(|e| ConnectorError::Parse {
             id: "opencode".to_string(),
             path: self.db_path.clone(),
@@ -290,10 +287,12 @@ impl Connector for OpenCodeConnector {
         ])
     }
 
-    fn inject(&self, _brief: &str, _dry_run: bool) -> ConnectorResult<InjectTarget> {
-        Err(ConnectorError::Other(anyhow::anyhow!(
-            "opencode inject not implemented"
-        )))
+    fn instruction_file(&self, project: &Path) -> Option<PathBuf> {
+        Some(project.join("AGENTS.md"))
+    }
+
+    fn launch_program(&self) -> Option<&'static str> {
+        Some("opencode")
     }
 }
 
@@ -405,5 +404,98 @@ mod tests {
     fn test_missing_db_is_not_detected() {
         let c = OpenCodeConnector::with_db(PathBuf::from("/nonexistent/opencode.db"));
         assert!(!c.detect());
+    }
+
+    // ---- another process holds a lock on the database ----
+
+    /// Run `f` on a thread and fail the test if it does not finish: a scan
+    /// that blocks on another tool's lock would stall every sync.
+    fn within<T: Send + 'static>(secs: u64, f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(secs))
+            .unwrap_or_else(|_| panic!("did not finish within {secs}s: the reader blocked on a lock"))
+    }
+
+    fn list_ids(db: PathBuf) -> Result<Vec<String>, String> {
+        let c = OpenCodeConnector::with_db(db);
+        match c.scan() {
+            Ok(stream) => Ok(stream.filter_map(|r| r.ok()).map(|r| r.id).collect()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// OpenCode runs in WAL mode: a writer mid-transaction must not hide the
+    /// committed sessions from a reader, and must not make it wait.
+    #[test]
+    fn test_scan_reads_committed_rows_while_a_writer_holds_a_transaction_open() {
+        let (_tmp, path) = fixture_db();
+        let writer = Connection::open(&path).unwrap();
+        writer.pragma_update(None, "journal_mode", "WAL").unwrap();
+        writer
+            .execute_batch(
+                "BEGIN IMMEDIATE;
+                 INSERT INTO session VALUES ('ses_new','p1',NULL,'/x','mid-write',1,2);",
+            )
+            .unwrap();
+
+        let ids = within(5, {
+            let p = path.clone();
+            move || list_ids(p)
+        })
+        .expect("a WAL reader must not fail while a writer is mid-transaction");
+        assert!(ids.contains(&"ses_abc".to_string()), "committed session missing: {ids:?}");
+        assert!(!ids.contains(&"ses_new".to_string()), "uncommitted row leaked: {ids:?}");
+
+        writer.execute_batch("COMMIT;").unwrap();
+        let ids = list_ids(path).unwrap();
+        assert!(ids.contains(&"ses_new".to_string()), "committed row not seen: {ids:?}");
+    }
+
+    /// A rollback-journal database held under an EXCLUSIVE lock cannot be read
+    /// at all. The reader must say so promptly instead of hanging or panicking.
+    #[test]
+    fn test_scan_degrades_instead_of_hanging_on_an_exclusive_lock() {
+        let (_tmp, path) = fixture_db();
+        let holder = Connection::open(&path).unwrap();
+        holder.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+
+        let start = std::time::Instant::now();
+        let outcome = within(10, {
+            let p = path.clone();
+            move || {
+                let c = OpenCodeConnector::with_db(p);
+                // Either an error, or an empty/partial list, is acceptable;
+                // blocking or panicking is not.
+                c.scan().map(|s| s.filter_map(|r| r.ok()).count()).map_err(|e| e.to_string())
+            }
+        });
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "a locked database should be given up on quickly, took {:?}",
+            start.elapsed()
+        );
+        eprintln!("exclusive-lock scan outcome: {outcome:?}");
+
+        // And it works again the moment the lock is released.
+        holder.execute_batch("ROLLBACK;").unwrap();
+        assert!(list_ids(path).unwrap().contains(&"ses_abc".to_string()));
+    }
+
+    /// Loading a session by id must degrade the same way.
+    #[test]
+    fn test_load_does_not_hang_or_panic_on_an_exclusive_lock() {
+        let (_tmp, path) = fixture_db();
+        let holder = Connection::open(&path).unwrap();
+        holder.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+        let r = within(10, {
+            let p = path.clone();
+            move || OpenCodeConnector::with_db(p).load("ses_abc").map(|s| s.messages.len()).map_err(|e| e.to_string())
+        });
+        eprintln!("exclusive-lock load outcome: {r:?}");
+        holder.execute_batch("ROLLBACK;").unwrap();
+        assert!(OpenCodeConnector::with_db(path).load("ses_abc").unwrap().messages.len() >= 2);
     }
 }

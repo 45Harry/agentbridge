@@ -5,7 +5,7 @@
 //! or in any core module, should need to change.
 
 use crate::model::{RawSession, Session};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub type ConnectorResult<T> = Result<T, ConnectorError>;
 
@@ -31,10 +31,7 @@ pub enum ConnectorError {
     Other(#[from] anyhow::Error),
 }
 
-/// Where an injected brief should be written for a given agent, and how.
-/// Each connector decides the concrete mechanism (a file the agent reads on
-/// startup, an env var, a CLI flag) — this only carries what M4/M6 need to
-/// report back to the user and to `agentbridge clean`.
+/// Where an injected brief was (or, under `--dry-run`, would be) written.
 #[derive(Debug, Clone)]
 pub struct InjectTarget {
     /// Absolute path of the file the brief was written into (or would be,
@@ -90,14 +87,32 @@ pub trait Connector: Send + Sync {
     /// has no native resume mechanism agentbridge can drive.
     fn resume_cmd(&self, session: &Session) -> Option<Vec<String>>;
 
-    /// Write `brief` into wherever this agent will read it as startup
-    /// context, using the agent's native mechanism where one exists.
-    /// Content must be wrapped in clearly delimited begin/end fence markers
-    /// (see `crate::inject`) so `agentbridge clean` can remove exactly what
-    /// was added, and must never overwrite hand-written user content outside
-    /// that fence. Must support a dry-run mode that computes and returns the
-    /// `InjectTarget` without writing.
-    fn inject(&self, brief: &str, dry_run: bool) -> ConnectorResult<InjectTarget>;
+    /// The file in `project` this agent reads as startup instructions (e.g.
+    /// `CLAUDE.md`, `AGENTS.md`), or `None` if agentbridge cannot inject
+    /// context into it. Only names the file: the fenced, reversible write is
+    /// the same for every agent and lives in `crate::inject`.
+    fn instruction_file(&self, _project: &Path) -> Option<PathBuf> {
+        None
+    }
+
+    /// The program that launches this agent, for `agentbridge start`.
+    fn launch_program(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Write `brief` into `project`'s instruction file for this agent, between
+    /// begin/end fence markers so `agentbridge clean` can remove exactly what
+    /// was added and nothing the user wrote by hand. With `dry_run`, computes
+    /// and returns the target without writing.
+    fn inject(&self, brief: &str, project: &Path, dry_run: bool) -> ConnectorResult<InjectTarget> {
+        let path = self.instruction_file(project).ok_or_else(|| {
+            ConnectorError::Other(anyhow::anyhow!(
+                "{} has no startup instruction file agentbridge can inject into",
+                self.display_name()
+            ))
+        })?;
+        crate::inject::write_fenced(&path, brief, dry_run)
+    }
 }
 
 /// The connector registry. `crate::connectors::all()` is the single place

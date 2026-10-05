@@ -1,4 +1,4 @@
-use crate::connector::{Connector, ConnectorError, ConnectorResult, InjectTarget, SessionStream};
+use crate::connector::{Connector, ConnectorError, ConnectorResult, SessionStream};
 use crate::model::{Message, RawSession, Role, Session, TokenTotals};
 use chrono::{DateTime, TimeZone, Utc};
 use serde_json::Value;
@@ -91,19 +91,10 @@ impl Connector for CodexCliConnector {
             Some(r) if r.exists() => r,
             _ => return Err(ConnectorError::NotFound(id.to_string())),
         };
-
-        for entry in WalkDir::new(&root).into_iter().filter_map(|e| e.ok()) {
-            if entry.file_type().is_file() {
-                let path = entry.path();
-                if path.extension().is_some_and(|ext| ext == "jsonl")
-                    && let Some(name) = path.file_name().and_then(|n| n.to_str())
-                    && name.starts_with("rollout-") && name.contains(id)
-                {
-                    return load_from_path(path, id);
-                }
-            }
+        match find_rollout(&root, id) {
+            Some(path) => load_from_path(&path, id),
+            None => Err(ConnectorError::NotFound(id.to_string())),
         }
-        Err(ConnectorError::NotFound(id.to_string()))
     }
 
     fn resume_cmd(&self, session: &crate::model::Session) -> Option<Vec<String>> {
@@ -114,11 +105,48 @@ impl Connector for CodexCliConnector {
         ])
     }
 
-    fn inject(&self, _brief: &str, _dry_run: bool) -> ConnectorResult<InjectTarget> {
-        Err(ConnectorError::Other(anyhow::anyhow!(
-            "inject not yet implemented for Codex CLI"
-        )))
+    fn instruction_file(&self, project: &Path) -> Option<PathBuf> {
+        Some(project.join("AGENTS.md"))
     }
+
+    fn launch_program(&self) -> Option<&'static str> {
+        Some("codex")
+    }
+}
+
+/// Every rollout file under `root`.
+fn rollout_files(root: &Path) -> impl Iterator<Item = PathBuf> {
+    WalkDir::new(root)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.into_path())
+        .filter(|p| {
+            p.extension().is_some_and(|ext| ext == "jsonl")
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("rollout-"))
+        })
+}
+
+/// The rollout holding session `id`.
+///
+/// The filename is a fast path (real Codex puts the session id in it), but it is
+/// only a hint: `scan()` takes the id from *inside* the file, so a rollout whose
+/// name and contents disagree would be listed and then fail to load. Fall back
+/// to the same in-file id `scan()` uses, so anything it lists can be loaded.
+fn find_rollout(root: &Path, id: &str) -> Option<PathBuf> {
+    rollout_files(root)
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.contains(id))
+        })
+        .or_else(|| {
+            rollout_files(root).find(|p| {
+                matches!(scan_codex_file(p), Ok(Some(raw)) if raw.id == id)
+            })
+        })
 }
 
 fn sessions_dir() -> Option<PathBuf> {
@@ -183,6 +211,19 @@ fn parse_codex_timestamp(val: Option<&Value>) -> Option<DateTime<Utc>> {
         }
         _ => None,
     }
+}
+
+/// The latest record timestamp near the end of a rollout, never earlier than the
+/// session's start. See `super::tail_records` for why the head is not enough.
+fn tail_last_event(path: &Path, started: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
+    super::tail_records(path)
+        .iter()
+        // Modern rollouts stamp every record `timestamp`; the legacy
+        // conversation format used `created_at`.
+        .filter_map(|rec| {
+            parse_codex_timestamp(rec.get("timestamp").or_else(|| rec.get("created_at")))
+        })
+        .fold(started, |latest, ts| latest.max(Some(ts)))
 }
 
 fn scan_codex_file(path: &Path) -> ConnectorResult<Option<RawSession>> {
@@ -258,7 +299,7 @@ fn scan_codex_file(path: &Path) -> ConnectorResult<Option<RawSession>> {
                     provider: "codex-cli".to_string(),
                     project_path: cwd,
                     started_at: timestamp,
-                    last_event_at: timestamp,
+                    last_event_at: tail_last_event(path, timestamp),
                     title: None,
                     source,
                     source_path: path.to_path_buf(),
@@ -282,7 +323,7 @@ fn scan_codex_file(path: &Path) -> ConnectorResult<Option<RawSession>> {
                     provider: "codex-cli".to_string(),
                     project_path: cwd,
                     started_at: timestamp,
-                    last_event_at: timestamp,
+                    last_event_at: tail_last_event(path, timestamp),
                     title,
                     source: None,
                     source_path: path.to_path_buf(),
@@ -351,26 +392,16 @@ impl Connector for TestCodexCli {
     }
 
     fn load(&self, id: &str) -> ConnectorResult<Session> {
-        for entry in WalkDir::new(&self.root).into_iter().filter_map(|e| e.ok()) {
-            if entry.file_type().is_file() {
-                let path = entry.path();
-                if path.extension().is_some_and(|ext| ext == "jsonl")
-                    && let Some(name) = path.file_name().and_then(|n| n.to_str())
-                        && name.starts_with("rollout-") && name.contains(id) {
-                            return load_from_path(path, id);
-                        }
-            }
+        match find_rollout(&self.root, id) {
+            Some(path) => load_from_path(&path, id),
+            None => Err(ConnectorError::NotFound(id.to_string())),
         }
-        Err(ConnectorError::NotFound(id.to_string()))
     }
 
     fn resume_cmd(&self, _session: &Session) -> Option<Vec<String>> {
         None
     }
 
-    fn inject(&self, _brief: &str, _dry_run: bool) -> ConnectorResult<InjectTarget> {
-        Err(ConnectorError::Other(anyhow::anyhow!("inject not available in test connector")))
-    }
 }
 
 fn extract_cx_content_flexible(val: &Value) -> Option<String> {
@@ -419,6 +450,8 @@ fn load_from_path(path: &Path, id: &str) -> ConnectorResult<Session> {
     let mut project_path: Option<String> = None;
     let mut model_provider: Option<String> = None;
     let mut ordinal: u64 = 0;
+    // call_id -> tool name, so an output can say which tool it answers.
+    let mut call_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
     for line_result in reader.lines() {
         let line = match line_result {
@@ -501,22 +534,67 @@ fn load_from_path(path: &Path, id: &str) -> ConnectorResult<Session> {
             }
             "response_item" => {
                 if let Some(p) = payload {
-                    let role = p.get("role").and_then(|v| v.as_str()).unwrap_or("assistant");
-                    let content = extract_cx_content_flexible(&val);
-                    let role_enum = if role == "user" { Role::User } else { Role::Assistant };
-                    let m = Message {
-                        session_id: id.to_string(),
-                        ordinal,
-                        role: role_enum,
-                        timestamp,
-                        text: content,
-                        tool_name: None,
-                        tool_input: None,
-                        tool_result: None,
-                        parent_ordinal: None,
+                    // A `response_item` is not always a chat message. Real
+                    // rollouts interleave function calls, their outputs and
+                    // encrypted reasoning blocks; reading them all as messages
+                    // turned each into an empty assistant turn and lost the
+                    // tool name and arguments.
+                    let kind = p.get("type").and_then(|v| v.as_str()).unwrap_or("message");
+                    let call_id = p.get("call_id").and_then(|v| v.as_str());
+                    let mut push = |role: Role,
+                                    text: Option<String>,
+                                    tool_name: Option<String>,
+                                    tool_input: Option<Value>,
+                                    tool_result: Option<Value>| {
+                        messages.push(Message {
+                            session_id: id.to_string(),
+                            ordinal,
+                            role,
+                            timestamp,
+                            text,
+                            tool_name,
+                            tool_input,
+                            tool_result,
+                            parent_ordinal: None,
+                        });
+                        ordinal += 1;
                     };
-                    messages.push(m);
-                    ordinal += 1;
+                    match kind {
+                        "function_call" | "custom_tool_call" | "local_shell_call" => {
+                            let name = if kind == "local_shell_call" {
+                                Some("shell".to_string())
+                            } else {
+                                p.get("name").and_then(|v| v.as_str()).map(str::to_string)
+                            };
+                            // Arguments are a JSON document in a string.
+                            let raw = p
+                                .get("arguments")
+                                .or_else(|| p.get("input"))
+                                .or_else(|| p.get("action"));
+                            let input = raw.map(|a| match a {
+                                Value::String(text) => serde_json::from_str(text)
+                                    .unwrap_or_else(|_| Value::String(text.clone())),
+                                other => other.clone(),
+                            });
+                            if let (Some(cid), Some(n)) = (call_id, &name) {
+                                call_names.insert(cid.to_string(), n.clone());
+                            }
+                            push(Role::Assistant, None, name, input, None);
+                        }
+                        "function_call_output" | "custom_tool_call_output" => {
+                            let name = call_id.and_then(|c| call_names.get(c).cloned());
+                            push(Role::Tool, None, name, None, p.get("output").cloned());
+                        }
+                        "message" => {
+                            let role =
+                                p.get("role").and_then(|v| v.as_str()).unwrap_or("assistant");
+                            let role_enum = if role == "user" { Role::User } else { Role::Assistant };
+                            push(role_enum, extract_cx_content_flexible(&val), None, None, None);
+                        }
+                        // `reasoning` (encrypted), `web_search_call`, ... carry
+                        // no turn agentbridge can represent.
+                        _ => {}
+                    }
                 }
             }
             "tool_use" => {

@@ -640,7 +640,7 @@ pub fn written_title(body: &Path, id: &str) -> Option<String> {
     if !db.is_file() {
         return None;
     }
-    let conn = Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    let conn = crate::connectors::open_read_only(&db).ok()?;
     conn.query_row(
         "SELECT title FROM conversation_summaries WHERE conversation_id = ?1",
         params![id],
@@ -703,7 +703,7 @@ pub fn remove_one(home: &Path, id: &str) -> Result<bool, WriteError> {
 /// How many agentbridge-inserted conversations are present.
 pub fn count_written(home: &Path) -> usize {
     let db = summaries_db(home);
-    Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    crate::connectors::open_read_only(&db)
         .and_then(|c| {
             c.query_row(
                 "SELECT COUNT(*) FROM conversation_summaries WHERE agent_name = ?1",

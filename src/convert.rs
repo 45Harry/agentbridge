@@ -37,7 +37,63 @@ pub trait SessionConverter {
     fn resume_cmd(&self, session_path: &Path) -> Vec<String>;
 }
 
-pub struct ClaudeCodeConverter;
+/// Which tool call each tool result answers.
+///
+/// Both real tools reject a transcript whose calls and results do not pair up:
+/// a result whose id matches no call, or a call with no result, fails the very
+/// next API request on resume. Real sessions run tools in parallel (several
+/// calls, then several results), so one "pending id" is not enough.
+///
+/// A result is matched to the earliest unanswered call with the same tool name
+/// (readers recover the name from the real call id), or to the earliest
+/// unanswered call when it carries no name. Whatever stays unmatched is an
+/// orphan: `skip[i]` is true and the converter leaves that turn out, which loses
+/// one half of a broken pair instead of producing a session the tool cannot open.
+struct ToolPairs {
+    /// For a call, the index of its result; for a result, the index of its call.
+    partner: Vec<Option<usize>>,
+    skip: Vec<bool>,
+}
+
+fn pair_tool_turns(messages: &[crate::model::Message]) -> ToolPairs {
+    let n = messages.len();
+    let mut partner = vec![None; n];
+    let mut pending: Vec<usize> = Vec::new();
+    for (i, m) in messages.iter().enumerate() {
+        match m.role {
+            Role::Assistant if m.tool_name.is_some() => pending.push(i),
+            Role::Tool => {
+                let pos = match &m.tool_name {
+                    Some(name) => pending
+                        .iter()
+                        .position(|&c| messages[c].tool_name.as_ref() == Some(name)),
+                    None => (!pending.is_empty()).then_some(0),
+                };
+                if let Some(p) = pos {
+                    let call = pending.remove(p);
+                    partner[call] = Some(i);
+                    partner[i] = Some(call);
+                }
+            }
+            _ => {}
+        }
+    }
+    let skip = messages
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let is_tool_turn = m.role == Role::Tool
+                || (m.role == Role::Assistant && m.tool_name.is_some());
+            is_tool_turn && partner[i].is_none()
+        })
+        .collect();
+    ToolPairs { partner, skip }
+}
+
+pub struct ClaudeCodeConverter {
+    /// Stamp the output with the durable agentbridge marker (src/marker.rs).
+    stamp: bool,
+}
 
 impl Default for ClaudeCodeConverter {
     fn default() -> Self {
@@ -46,8 +102,16 @@ impl Default for ClaudeCodeConverter {
 }
 
 impl ClaudeCodeConverter {
+    /// Converter for derived copies: output is marked as agentbridge's own.
     pub fn new() -> Self {
-        Self
+        Self { stamp: true }
+    }
+
+    /// Converter for rewriting a session's *own* native file (merge-back,
+    /// same-tool resume). That file is a real session, so it must never carry
+    /// the marker or discovery would stop treating it as a source.
+    pub fn unmarked() -> Self {
+        Self { stamp: false }
     }
 
     /// Encode an absolute path the way Claude Code names its project dirs:
@@ -115,11 +179,17 @@ impl SessionConverter for ClaudeCodeConverter {
 
         // Claude Code's own sessions always open with these two control
         // records; its resume path expects them before any turn records.
-        records.push(json!({
+        // The extra `agentbridge` key marks the file as ours (src/marker.rs),
+        // so it is still recognised if the manifest is ever lost.
+        let mut mode = json!({
             "type": "mode",
             "mode": "normal",
             "sessionId": sid,
-        }));
+        });
+        if self.stamp {
+            mode[crate::marker::KEY] = crate::marker::value(session);
+        }
+        records.push(mode);
         records.push(json!({
             "type": "permission-mode",
             "permissionMode": "default",
@@ -132,9 +202,13 @@ impl SessionConverter for ClaudeCodeConverter {
         let mut last_uuid: Option<String> = None;
         // A tool_result block must carry the tool_use_id of the call it
         // answers, otherwise the pair can't be reassociated on read.
-        let mut pending_tool_id: Option<String> = None;
+        let pairs = pair_tool_turns(&session.messages);
+        let mut call_ids: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
 
-        for msg in &session.messages {
+        for (idx, msg) in session.messages.iter().enumerate() {
+            if pairs.skip[idx] {
+                continue;
+            }
             let uuid = uuid::Uuid::new_v4().to_string();
             let ts = format_timestamp_z(msg.timestamp);
 
@@ -166,7 +240,7 @@ impl SessionConverter for ClaudeCodeConverter {
                     // message, not a distinct record type.
                     let content = if let Some(tool) = &msg.tool_name {
                         let tool_id = format!("toolu_{}", uuid.replace('-', ""));
-                        pending_tool_id = Some(tool_id.clone());
+                        call_ids.insert(idx, tool_id.clone());
                         json!([{
                             "type": "tool_use",
                             "id": tool_id,
@@ -199,8 +273,8 @@ impl SessionConverter for ClaudeCodeConverter {
                         "role": "user",
                         "content": [{
                             "type": "tool_result",
-                            "tool_use_id": pending_tool_id
-                                .take()
+                            "tool_use_id": pairs.partner[idx]
+                                .and_then(|call| call_ids.get(&call).cloned())
                                 .unwrap_or_else(|| format!("toolu_{}", uuid.replace('-', ""))),
                             "content": tool_result_text(msg.tool_result.as_ref()),
                         }],
@@ -307,7 +381,10 @@ fn set_mtime_from_session(path: &Path, session: &Session) {
     let _ = file.set_modified(time);
 }
 
-pub struct CodexCliConverter;
+pub struct CodexCliConverter {
+    /// See [`ClaudeCodeConverter`]: stamp the rollout as agentbridge's own.
+    stamp: bool,
+}
 
 impl Default for CodexCliConverter {
     fn default() -> Self {
@@ -317,7 +394,12 @@ impl Default for CodexCliConverter {
 
 impl CodexCliConverter {
     pub fn new() -> Self {
-        Self
+        Self { stamp: true }
+    }
+
+    /// For rewriting a session's own native rollout; never marked.
+    pub fn unmarked() -> Self {
+        Self { stamp: false }
     }
 }
 
@@ -376,7 +458,7 @@ impl SessionConverter for CodexCliConverter {
 
             // Codex identifies a session by the leading session_meta record; the
             // real format nests everything under `payload`.
-            records.push(json!({
+            let mut meta = json!({
                 "timestamp": meta_ts,
                 "type": "session_meta",
                 "payload": {
@@ -389,7 +471,12 @@ impl SessionConverter for CodexCliConverter {
                     "source": "cli",
                     "thread_source": "user",
                 },
-            }));
+            });
+            if self.stamp {
+                // Marks the rollout as ours (src/marker.rs).
+                meta["payload"][crate::marker::KEY] = crate::marker::value(session);
+            }
+            records.push(meta);
 
             if let Some(first) = first_user {
                 let ts = format_timestamp_z(first.timestamp);
@@ -410,9 +497,14 @@ impl SessionConverter for CodexCliConverter {
 
             // Codex pairs a call with its output by matching call_id, so a
             // tool result must reuse the id of the call it answers.
-            let mut pending_call_id: Option<String> = None;
+            let pairs = pair_tool_turns(&session.messages);
+            let mut call_ids: std::collections::HashMap<usize, String> =
+                std::collections::HashMap::new();
 
-            for msg in &session.messages {
+            for (idx, msg) in session.messages.iter().enumerate() {
+                if pairs.skip[idx] {
+                    continue;
+                }
                 let ts = format_timestamp_z(msg.timestamp);
                 let payload = match msg.role {
                     Role::User => json!({
@@ -423,7 +515,7 @@ impl SessionConverter for CodexCliConverter {
                     Role::Assistant => {
                         if let Some(tool) = &msg.tool_name {
                             let call_id = format!("call_{}", msg.ordinal);
-                            pending_call_id = Some(call_id.clone());
+                            call_ids.insert(idx, call_id.clone());
                             json!({
                                 "type": "function_call",
                                 "name": tool,
@@ -442,8 +534,8 @@ impl SessionConverter for CodexCliConverter {
                     }
                     Role::Tool => json!({
                         "type": "function_call_output",
-                        "call_id": pending_call_id
-                            .take()
+                        "call_id": pairs.partner[idx]
+                            .and_then(|call| call_ids.get(&call).cloned())
                             .unwrap_or_else(|| format!("call_{}", msg.ordinal)),
                         "output": tool_result_text(msg.tool_result.as_ref()),
                     }),
@@ -632,75 +724,6 @@ impl Session {
 
         body
     }
-}
-
-pub fn build_cross_tool_brief(sessions: &[Session]) -> String {
-    let mut brief = String::new();
-    brief.push_str("# agentbridge Cross-Tool Session Brief\n\n");
-    brief.push_str(&format!("Aggregated from {} sessions across all providers.\n\n", sessions.len()));
-
-    let mut facts: Vec<String> = Vec::new();
-    let mut tools_used: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut files_touched: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut commands_run: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-
-    for session in sessions {
-        for msg in &session.messages {
-            if let Some(text) = &msg.text
-                && text.len() > 20 && text.len() < 500 {
-                    facts.push(format!("- [{}] {}: {}", session.provider, session.id, text.lines().next().unwrap_or("")));
-                }
-            if let Some(tool_name) = &msg.tool_name {
-                tools_used.insert(tool_name.clone());
-            }
-        }
-        for artifact in &session.artifacts {
-            match artifact.kind {
-                crate::model::ArtifactKind::FileTouched => {
-                    files_touched.insert(artifact.path_or_command.clone());
-                }
-                crate::model::ArtifactKind::CommandRun => {
-                    commands_run.insert(artifact.path_or_command.clone());
-                }
-                _ => {}
-            }
-        }
-    }
-
-    if !tools_used.is_empty() {
-        brief.push_str("## Tools Used\n\n");
-        for tool in &tools_used {
-            brief.push_str(&format!("- {}\n", tool));
-        }
-        brief.push('\n');
-    }
-
-    if !facts.is_empty() {
-        brief.push_str(&format!("## Key Insights ({} extracted)\n\n", facts.len()));
-        for fact in facts.iter().take(30) {
-            brief.push_str(fact);
-            brief.push('\n');
-        }
-        brief.push('\n');
-    }
-
-    if !files_touched.is_empty() {
-        brief.push_str("## Files Referenced\n\n");
-        for f in files_touched.iter().take(20) {
-            brief.push_str(&format!("- {}\n", f));
-        }
-        brief.push('\n');
-    }
-
-    if !commands_run.is_empty() {
-        brief.push_str("## Commands Run\n\n");
-        for c in commands_run.iter().take(20) {
-            brief.push_str(&format!("- `{}`\n", c));
-        }
-        brief.push('\n');
-    }
-
-    brief
 }
 
 #[cfg(test)]
@@ -1211,30 +1234,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_build_cross_tool_brief() {
-        let mut session = test_session();
-        session.messages.push(Message {
-            session_id: TEST_SID.to_string(),
-            ordinal: 4,
-            role: Role::Assistant,
-            timestamp: Some(DateTime::parse_from_rfc3339("2026-07-01T12:05:00Z").unwrap().with_timezone(&Utc)),
-            text: Some("I found the issue in the configuration file: the timeout was set too low at 30 seconds, which caused the connection pool to exhaust during peak load.".to_string()),
-            tool_name: None,
-            tool_input: None,
-            tool_result: None,
-            parent_ordinal: None,
-        });
-        let sessions = vec![session];
-        let brief = build_cross_tool_brief(&sessions);
-
-        assert!(brief.contains("Cross-Tool Session Brief"), "should have header");
-        assert!(brief.contains("Tools Used"), "should have tools section");
-        assert!(brief.contains("Bash"), "should mention tools used");
-        assert!(brief.contains(TEST_SID), "should mention session");
-        assert!(brief.contains("configuration"), "should contain insight text");
-        assert!(brief.contains("claude-code"), "should mention provider in facts");
-    }
 
     #[test]
     fn test_converter_with_empty_messages() {
@@ -1286,5 +1285,441 @@ mod tests {
             .filter_map(|m| m.text.clone())
             .collect();
         assert!(texts.iter().any(|t| t.contains("Hello")), "user text preserved");
+    }
+
+    // ------------------------------------------------------------------
+    // Randomised round trip: write a session in each tool's native format,
+    // read it back through our own connector, compare what survived.
+    // Seeded, so a failure reproduces; the seed is in the panic message.
+    // ------------------------------------------------------------------
+
+    /// Text that has broken serializers before: quotes, backslashes, newlines,
+    /// control characters, emoji, right-to-left, JSON-looking and
+    /// marker-looking strings, leading/trailing whitespace, and very long runs.
+    fn nasty_text(rng: &mut fastrand::Rng) -> String {
+        const POOL: &[&str] = &[
+            "plain words",
+            "line one\nline two\n\nline four",
+            "she said \"hi\" and left \\ a backslash",
+            "tab\there and\r\ncrlf",
+            "emoji 🚀🔥 and CJK 日本語 and RTL שלום",
+            "{\"looks\": \"like json\", \"n\": [1,2,3]}",
+            "<!-- agentbridge:begin --> and <!-- agentbridge:end -->",
+            "   leading and trailing spaces   ",
+            "ends with a backslash \\",
+            "nul-ish \u{1} \u{7f} control",
+            "a",
+            "~~~ ``` ~~~ markdown fences ```",
+            "very long: ",
+        ];
+        let base = POOL[rng.usize(..POOL.len())];
+        if base == "very long: " {
+            return format!("{base}{}", "lorem ipsum dolor ".repeat(rng.usize(100..2000)));
+        }
+        let mut s = base.to_string();
+        if rng.bool() {
+            s.push_str(POOL[rng.usize(..POOL.len() - 1)]);
+        }
+        s
+    }
+
+    fn random_session(rng: &mut fastrand::Rng, provider: &str) -> Session {
+        let n = rng.usize(1..30);
+        let base = 1_780_000_000i64;
+        let mut messages = Vec::new();
+        let mut ord = 0u64;
+        for i in 0..n {
+            let ts = DateTime::from_timestamp(base + (i as i64) * 7, 0);
+            // Real conversations alternate; tool calls always come from the
+            // assistant and are answered by a tool result.
+            let user = i % 2 == 0;
+            let tool_turn = !user && rng.u8(..4) == 0;
+            let msg = |role, text: Option<String>, tool_name: Option<String>, input, result, ord| Message {
+                session_id: "rt".into(),
+                ordinal: ord,
+                role,
+                timestamp: ts,
+                text,
+                tool_name,
+                tool_input: input,
+                tool_result: result,
+                parent_ordinal: None,
+            };
+            if tool_turn {
+                messages.push(msg(
+                    Role::Assistant,
+                    None,
+                    Some("Bash".into()),
+                    Some(serde_json::json!({ "command": nasty_text(rng) })),
+                    None,
+                    ord,
+                ));
+                ord += 1;
+                messages.push(msg(
+                    Role::Tool,
+                    None,
+                    Some("Bash".into()),
+                    None,
+                    Some(serde_json::Value::String(nasty_text(rng))),
+                    ord,
+                ));
+            } else {
+                messages.push(msg(
+                    if user { Role::User } else { Role::Assistant },
+                    Some(nasty_text(rng)),
+                    None,
+                    None,
+                    None,
+                    ord,
+                ));
+            }
+            ord += 1;
+        }
+        Session {
+            id: if rng.bool() {
+                uuid::Uuid::new_v4().to_string()
+            } else {
+                format!("ses_{:x}", rng.u64(..))
+            },
+            provider: provider.to_string(),
+            project_id: "/work/round trip-proj".into(),
+            started_at: DateTime::from_timestamp(base, 0),
+            last_event_at: DateTime::from_timestamp(base + 1000, 0),
+            model: None,
+            title: if rng.bool() { Some(nasty_text(rng)) } else { None },
+            token_totals: TokenTotals::default(),
+            source_path: PathBuf::from("/x"),
+            raw_payload: serde_json::Value::Null,
+            body_available: true,
+            messages,
+            artifacts: vec![],
+        }
+    }
+
+    /// What a round trip must preserve: who said what, in order, and which tool.
+    fn projection(s: &Session) -> Vec<(Role, String, Option<String>)> {
+        s.messages
+            .iter()
+            .map(|m| {
+                let text = m
+                    .text
+                    .clone()
+                    .or_else(|| {
+                        m.tool_result.as_ref().map(|r| match r {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        })
+                    })
+                    .or_else(|| m.tool_input.as_ref().map(|i| i.to_string()))
+                    .unwrap_or_default();
+                (m.role, text, m.tool_name.clone())
+            })
+            .collect()
+    }
+
+    /// Compare two conversations, reporting only the first turn that differs.
+    fn assert_same_conversation(label: &str, seed: u64, got: &Session, want: &Session) {
+        let (g, w) = (projection(got), projection(want));
+        for i in 0..g.len().max(w.len()) {
+            if g.get(i) != w.get(i) {
+                panic!(
+                    "{label} seed {seed}: turn {i} differs (got {} turns, wanted {})\n  got:  {:?}\n  want: {:?}",
+                    g.len(),
+                    w.len(),
+                    g.get(i),
+                    w.get(i)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_random_sessions_survive_a_claude_round_trip() {
+        for seed in 0..60u64 {
+            let mut rng = fastrand::Rng::with_seed(seed);
+            let session = random_session(&mut rng, "codex-cli");
+            let tmp = tempfile::tempdir().unwrap();
+            let path = ClaudeCodeConverter::new().convert(&session, tmp.path()).unwrap();
+            let id = path.file_stem().unwrap().to_string_lossy().to_string();
+            let back = crate::connectors::claude_code::load_file(&path, &id)
+                .unwrap_or_else(|e| panic!("seed {seed}: unreadable: {e}"));
+            assert_same_conversation("claude", seed, &back, &session);
+            assert_eq!(back.title, session.title, "seed {seed}: title changed");
+        }
+    }
+
+    #[test]
+    fn test_random_sessions_survive_a_codex_round_trip() {
+        for seed in 0..60u64 {
+            let mut rng = fastrand::Rng::with_seed(seed);
+            let session = random_session(&mut rng, "claude-code");
+            let tmp = tempfile::tempdir().unwrap();
+            let paths = CodexCliConverter::new()
+                .convert_multi(&session, tmp.path(), &["/work/round trip-proj".to_string()])
+                .unwrap();
+            let sid = ClaudeCodeConverter::session_uuid(&session.id);
+            let back = crate::connectors::codex_cli::load_file(&paths[0], &sid)
+                .unwrap_or_else(|e| panic!("seed {seed}: unreadable: {e}"));
+            assert_same_conversation("codex", seed, &back, &session);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Tool call / result pairing: a transcript whose ids do not pair up is
+    // rejected by the real tools on resume.
+    // ------------------------------------------------------------------
+
+    fn call(name: &str, cmd: &str, ord: u64) -> Message {
+        Message {
+            session_id: "p".into(),
+            ordinal: ord,
+            role: Role::Assistant,
+            timestamp: DateTime::from_timestamp(1_780_000_000 + ord as i64, 0),
+            text: None,
+            tool_name: Some(name.into()),
+            tool_input: Some(serde_json::json!({ "command": cmd })),
+            tool_result: None,
+            parent_ordinal: None,
+        }
+    }
+
+    fn result(name: Option<&str>, out: &str, ord: u64) -> Message {
+        Message {
+            session_id: "p".into(),
+            ordinal: ord,
+            role: Role::Tool,
+            timestamp: DateTime::from_timestamp(1_780_000_000 + ord as i64, 0),
+            text: None,
+            tool_name: name.map(str::to_string),
+            tool_input: None,
+            tool_result: Some(serde_json::Value::String(out.into())),
+            parent_ordinal: None,
+        }
+    }
+
+    fn session_with(messages: Vec<Message>) -> Session {
+        let mut s = test_session();
+        s.messages = messages;
+        s
+    }
+
+    /// `(id, command-or-output)` pairs read back from a written transcript.
+    type IdPairs = Vec<(String, String)>;
+
+    /// (call id, command) for every call and (answered id, output) for every
+    /// result in a written Claude file.
+    fn claude_ids(path: &Path) -> (IdPairs, IdPairs) {
+        let (mut calls, mut results) = (vec![], vec![]);
+        for line in std::fs::read_to_string(path).unwrap().lines() {
+            let v: Value = serde_json::from_str(line).unwrap();
+            let Some(blocks) = v["message"]["content"].as_array() else { continue };
+            for b in blocks {
+                match b["type"].as_str() {
+                    Some("tool_use") => calls.push((
+                        b["id"].as_str().unwrap().to_string(),
+                        b["input"]["command"]
+                            .as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| b["input"].to_string()),
+                    )),
+                    Some("tool_result") => results.push((
+                        b["tool_use_id"].as_str().unwrap().to_string(),
+                        b["content"].as_str().unwrap().to_string(),
+                    )),
+                    _ => {}
+                }
+            }
+        }
+        (calls, results)
+    }
+
+    fn codex_ids(path: &Path) -> (IdPairs, IdPairs) {
+        let (mut calls, mut results) = (vec![], vec![]);
+        for line in std::fs::read_to_string(path).unwrap().lines() {
+            let v: Value = serde_json::from_str(line).unwrap();
+            let p = &v["payload"];
+            match p["type"].as_str() {
+                Some("function_call") => {
+                    let args: Value = serde_json::from_str(p["arguments"].as_str().unwrap()).unwrap();
+                    calls.push((
+                        p["call_id"].as_str().unwrap().to_string(),
+                        args["command"]
+                            .as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| args.to_string()),
+                    ));
+                }
+                Some("function_call_output") => results.push((
+                    p["call_id"].as_str().unwrap().to_string(),
+                    p["output"].as_str().unwrap().to_string(),
+                )),
+                _ => {}
+            }
+        }
+        (calls, results)
+    }
+
+    /// Every result must answer exactly one call, and every call must be
+    /// answered: the property the real tools check on resume.
+    fn assert_paired(label: &str, calls: &[(String, String)], results: &[(String, String)]) {
+        let mut ids: Vec<_> = calls.iter().map(|c| &c.0).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), calls.len(), "{label}: duplicate call ids {calls:?}");
+        for (cid, _) in calls {
+            assert_eq!(
+                results.iter().filter(|r| &r.0 == cid).count(),
+                1,
+                "{label}: call {cid} must have exactly one result: calls {calls:?} results {results:?}"
+            );
+        }
+        for (rid, _) in results {
+            assert!(calls.iter().any(|c| &c.0 == rid), "{label}: result {rid} answers no call");
+        }
+    }
+
+    #[test]
+    fn test_parallel_tool_calls_pair_each_result_with_its_own_call() {
+        // Two tools run in parallel: both calls, then both results.
+        let s = session_with(vec![
+            call("Bash", "ls", 0),
+            call("Grep", "needle", 1),
+            result(Some("Bash"), "files", 2),
+            result(Some("Grep"), "match", 3),
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+
+        let (calls, results) = claude_ids(&ClaudeCodeConverter::new().convert(&s, tmp.path()).unwrap());
+        assert_paired("claude", &calls, &results);
+        let id_of = |cmd: &str| calls.iter().find(|c| c.1 == cmd).unwrap().0.clone();
+        assert!(results.contains(&(id_of("ls"), "files".to_string())), "{results:?}");
+        assert!(results.contains(&(id_of("needle"), "match".to_string())), "{results:?}");
+
+        let paths = CodexCliConverter::new().convert_multi(&s, tmp.path(), &["/p".to_string()]).unwrap();
+        let (calls, results) = codex_ids(&paths[0]);
+        assert_paired("codex", &calls, &results);
+        let id_of = |cmd: &str| calls.iter().find(|c| c.1 == cmd).unwrap().0.clone();
+        assert!(results.contains(&(id_of("ls"), "files".to_string())), "{results:?}");
+        assert!(results.contains(&(id_of("needle"), "match".to_string())), "{results:?}");
+    }
+
+    #[test]
+    fn test_results_arriving_out_of_order_still_find_their_call_by_tool_name() {
+        let s = session_with(vec![
+            call("Bash", "ls", 0),
+            call("Grep", "needle", 1),
+            result(Some("Grep"), "match", 2), // answered first
+            result(Some("Bash"), "files", 3),
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let (calls, results) = claude_ids(&ClaudeCodeConverter::new().convert(&s, tmp.path()).unwrap());
+        assert_paired("claude", &calls, &results);
+        let id_of = |cmd: &str| calls.iter().find(|c| c.1 == cmd).unwrap().0.clone();
+        assert!(results.contains(&(id_of("needle"), "match".to_string())), "{results:?}");
+        assert!(results.contains(&(id_of("ls"), "files".to_string())), "{results:?}");
+    }
+
+    #[test]
+    fn test_orphan_calls_and_results_are_dropped_not_written() {
+        // A call interrupted before it returned, and a result whose call is
+        // not in the transcript (e.g. cut off by compaction).
+        let s = session_with(vec![
+            result(Some("Bash"), "stray result", 0),
+            call("Bash", "interrupted", 1),
+            call("Bash", "ls", 2),
+            result(Some("Bash"), "files", 3),
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+
+        let (calls, results) = claude_ids(&ClaudeCodeConverter::new().convert(&s, tmp.path()).unwrap());
+        assert_paired("claude", &calls, &results);
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        let (calls, results) = codex_ids(
+            &CodexCliConverter::new().convert_multi(&s, tmp.path(), &["/p".to_string()]).unwrap()[0],
+        );
+        assert_paired("codex", &calls, &results);
+        assert_eq!(calls.len(), 1, "{calls:?}");
+    }
+
+    #[test]
+    fn test_unnamed_results_pair_in_order() {
+        // Fixtures and older files carry no tool name on the result.
+        let s = session_with(vec![
+            call("Bash", "first", 0),
+            result(None, "one", 1),
+            call("Bash", "second", 2),
+            result(None, "two", 3),
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let (calls, results) = claude_ids(&ClaudeCodeConverter::new().convert(&s, tmp.path()).unwrap());
+        assert_paired("claude", &calls, &results);
+        let id_of = |cmd: &str| calls.iter().find(|c| c.1 == cmd).unwrap().0.clone();
+        assert!(results.contains(&(id_of("first"), "one".to_string())));
+        assert!(results.contains(&(id_of("second"), "two".to_string())));
+    }
+
+    /// The random round-trip generator only makes call-then-result pairs, so
+    /// also fuzz parallel and broken shapes: pairing must hold for every one.
+    #[test]
+    fn test_random_tool_shapes_always_produce_a_paired_transcript() {
+        for seed in 0..80u64 {
+            let mut rng = fastrand::Rng::with_seed(seed);
+            let mut msgs = Vec::new();
+            let names = ["Bash", "Grep", "Read"];
+            for i in 0..rng.usize(1..14) {
+                let n = names[rng.usize(..names.len())];
+                if rng.u8(..3) == 0 {
+                    msgs.push(result(if rng.bool() { Some(n) } else { None }, &format!("out{i}"), i as u64));
+                } else {
+                    msgs.push(call(n, &format!("cmd{i}"), i as u64));
+                }
+            }
+            let s = session_with(msgs);
+            let tmp = tempfile::tempdir().unwrap();
+            let (calls, results) = claude_ids(&ClaudeCodeConverter::new().convert(&s, tmp.path()).unwrap());
+            assert_paired(&format!("claude seed {seed}"), &calls, &results);
+            let (calls, results) = codex_ids(
+                &CodexCliConverter::new().convert_multi(&s, tmp.path(), &["/p".to_string()]).unwrap()[0],
+            );
+            assert_paired(&format!("codex seed {seed}"), &calls, &results);
+        }
+    }
+
+    /// Real sessions use parallel tool calls and get interrupted mid-call. Every
+    /// transcript converted from real data must still pair up. Read-only on the
+    /// real store; writes only into a temp dir; prints counts, never text.
+    #[test]
+    #[ignore = "reads the operator's real Claude Code sessions"]
+    fn test_real_sessions_convert_to_paired_transcripts() {
+        let registry = crate::connectors::all();
+        let c = registry.by_id("claude-code").unwrap();
+        if !c.detect() {
+            eprintln!("skipping: no Claude Code sessions on this machine");
+            return;
+        }
+        let (mut converted, mut calls_total, mut dropped) = (0usize, 0usize, 0usize);
+        for raw in c.scan().unwrap().filter_map(|r| r.ok()).filter(|r| r.body_available).take(200) {
+            let Ok(session) = c.load(&raw.id) else { continue };
+            let src_calls = session
+                .messages
+                .iter()
+                .filter(|m| m.role == Role::Assistant && m.tool_name.is_some())
+                .count();
+            let tmp = tempfile::tempdir().unwrap();
+            let (cc, cr) = claude_ids(&ClaudeCodeConverter::new().convert(&session, tmp.path()).unwrap());
+            assert_paired(&format!("claude {}", raw.id), &cc, &cr);
+            let paths = CodexCliConverter::new()
+                .convert_multi(&session, tmp.path(), &["/p".to_string()])
+                .unwrap();
+            let (xc, xr) = codex_ids(&paths[0]);
+            assert_paired(&format!("codex {}", raw.id), &xc, &xr);
+            converted += 1;
+            calls_total += src_calls;
+            dropped += src_calls - cc.len();
+        }
+        eprintln!(
+            "{converted} real sessions converted, {calls_total} tool calls, {dropped} dropped as orphans"
+        );
+        assert!(converted > 0);
     }
 }

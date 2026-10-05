@@ -1,4 +1,5 @@
 pub mod antigravity_write;
+pub mod brief;
 pub mod auto;
 pub mod codex_write;
 pub mod connector;
@@ -7,6 +8,12 @@ pub mod convert;
 pub mod inject;
 pub mod index;
 pub mod label;
+pub mod lock;
+pub mod llm;
+pub mod marker;
+pub mod mcp;
 pub mod model;
 pub mod opencode_write;
+pub mod redact;
+pub mod store;
 pub mod sync;
