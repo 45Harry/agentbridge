@@ -688,3 +688,60 @@ history, 12 of 12 written back into the remaining tools, and a repeat sync
 changed nothing. The one miss was Codex declining to repeat the word on a
 session started in Claude Code. The question was reworded, a declined question
 is now asked once more, and that pair passed on a rerun. Tests 175 → 181.
+
+## 2026-10-05 — OpenCode copies must carry an OpenCode shaped id
+
+Reported by the operator: continuing a synced session in OpenCode on a free
+OpenCode Zen model failed with `Error from provider (Console): OpenCode's free
+tier can only be used from within OpenCode`. A brand new OpenCode session on
+the same model worked, and the same synced session worked on OpenRouter. The
+earlier live checks had only asked OpenCode through OpenRouter, so this was
+never exercised.
+
+Cause, shown on a scratch copy of the real database: renaming the row from
+agentbridge's `ses_ab` + 32 hex id to an id of OpenCode's own shape (`ses_`,
+12 hex, 14 letters or digits) made the same session answer, with its messages
+and parts untouched. OpenCode sends the session id with each request and the
+free tier rejects one that is not shaped like its own.
+
+Decision: `opencode_write::derive_id` now produces exactly that shape, still
+deterministic per (origin tool, origin id, project). A row is agentbridge's by
+the marker in its metadata, never by its id, so nothing else depended on the
+old prefix. `migrate_ids` renames rows already written, with their messages
+and parts, and the manifest follows; it runs at the start of every sync and
+of `sync --changed`, and waits while OpenCode is open.
+
+Also: the three `ensure_safe_to_write` guards are skipped in unit tests. They
+look at the whole machine's process list, so six sync tests failed whenever
+the operator had OpenCode open. Tests 181 → 183.
+
+Not yet verified: the rename on the operator's real database, because
+OpenCode was open. The id shape itself was verified against the real free
+tier.
+
+## 2026-10-05 (later) — agentbridge keeps no copy of a session
+
+The operator found `~/.agentbridge` at 28 GB and asked why sessions were being
+copied there at all. Measured: `cache/` held 280,683 files and 28.3 GB, of
+which 11.3 GB was pointed at by nothing and most of the rest only by a holding
+folder from the 2026-10-02 cleanup. About 2 GB was shared with copies that are
+actually in a tool's store.
+
+The cache was DESIGN.md's Rule 2: convert once into `~/.agentbridge/cache`,
+then hardlink into the tool's store. While the link holds, the cache costs no
+extra bytes. It stops holding as soon as a tool rewrites its file or a copy is
+removed, and then the cache entry is a full stray copy that nothing cleans up.
+
+Decision: there is no cache. A session is converted into a per run staging
+folder, placed in the target tool's store, and the staging folder is removed
+when the run ends. One converted file per session and tool still has to exist,
+because a tool cannot read another tool's format, but it exists once, in that
+tool's store. A copy that is already there is replaced only when the session's
+content changed, and its manifest row takes the new file's inode so `unsync`
+still recognizes it. Any sync deletes the old `cache/` folder.
+
+On the operator's machine: `~/.agentbridge` went from 28 GB to 70 MB (manifest,
+overlay, state), and free disk from 19 GB to 45 GB once the holding folder was
+deleted on their say. Tests 183 → 184.
+
+DESIGN.md §4 Rule 2 and Rule 3 describe the old scheme and are now out of date.

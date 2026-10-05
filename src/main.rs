@@ -862,6 +862,15 @@ fn cmd_sync(
     // written since the last run there is nothing to do, and a new terminal
     // costs a stat sweep instead of a full sync.
     let started = chrono::Utc::now();
+    if !dry_run && agentbridge::sync::drop_legacy_cache() {
+        println!("  removed   the old cache folder (agentbridge keeps no copies of sessions)");
+    }
+    if changed && !dry_run {
+        let moved = agentbridge::sync::migrate_opencode_rows();
+        if moved > 0 {
+            println!("  renamed   {} OpenCode copies to OpenCode's own id shape", moved);
+        }
+    }
     let since = if changed {
         let state = agentbridge::sync::last_sync_state();
         let now = agentbridge::auto::fingerprint_digest(registry);

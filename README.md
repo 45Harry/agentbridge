@@ -122,8 +122,9 @@ and refuses to run while the tool is open. Details per tool in `CONNECTORS.md`.
 
 1. **Index in place.** Sessions are never copied — the index points at the
    files already on disk.
-2. **Convert once, link many.** Each session is converted once into
-   `~/.agentbridge/cache`; every directory gets a hardlink to that one file.
+2. **No second copy.** A tool cannot read another tool's format, so each
+   session is converted once and written into that tool's own store.
+   agentbridge keeps no copy of it in `~/.agentbridge`.
 3. **Never touch a tool's own sessions.** Recovered work lives in an
    agentbridge-owned overlay; `unsync` removes only what agentbridge created.
 

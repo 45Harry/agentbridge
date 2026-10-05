@@ -88,7 +88,9 @@ pub fn is_opencode_running() -> bool {
 /// the write primitives so the primitives stay testable on a machine where
 /// OpenCode happens to be running.
 pub fn ensure_safe_to_write() -> Result<(), WriteError> {
-    if is_opencode_running() {
+    // Unit tests write to temp stores, never the real one, so whether the
+    // operator happens to have the tool open must not decide if they pass.
+    if !cfg!(test) && is_opencode_running() {
         return Err(WriteError::OpenCodeRunning);
     }
     Ok(())
@@ -111,12 +113,87 @@ pub fn backup(db: &Path) -> Result<PathBuf, WriteError> {
 /// table's primary key. One row per project is therefore both the minimum for
 /// visibility everywhere and the maximum before the picker lists the same
 /// session twice.
+///
+/// The id has exactly the shape OpenCode gives its own: `ses_`, twelve hex
+/// characters, fourteen letters and digits. That is not cosmetic. OpenCode
+/// sends the session id with every model request, and its free tier answers
+/// a session whose id is any other shape with "OpenCode's free tier can only
+/// be used from within OpenCode" (found live; the earlier `ses_ab` plus 32
+/// hex form made every synced session unusable on the free models). A row is
+/// known to be agentbridge's by the marker in its metadata, never by its id.
 pub fn derive_id(source_provider: &str, source_id: &str, project_id: &str) -> String {
-    let ns = uuid::Uuid::new_v5(
-        &uuid::Uuid::NAMESPACE_URL,
-        format!("{}:{}:{}", source_provider, source_id, project_id).as_bytes(),
-    );
-    format!("ses_ab{}", ns.simple())
+    const ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    let key = format!("{}:{}:{}", source_provider, source_id, project_id);
+    let head = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, key.as_bytes());
+    let tail = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, format!("{key}:tail").as_bytes());
+    let hex: String = head.as_bytes()[..6].iter().map(|b| format!("{b:02x}")).collect();
+    let rest: String = tail.as_bytes()[..14]
+        .iter()
+        .map(|b| ALPHABET[(*b as usize) % ALPHABET.len()] as char)
+        .collect();
+    format!("ses_{hex}{rest}")
+}
+
+/// Give every row agentbridge wrote the id `derive_id` now produces, keeping
+/// its messages and parts. Rows written before the id took OpenCode's own
+/// shape cannot be used with OpenCode's free models until this has run.
+/// Returns each `(old id, new id)` so the manifest can follow.
+pub fn migrate_ids(db: &Path) -> Result<Vec<(String, String)>, WriteError> {
+    let sql = |e: rusqlite::Error| WriteError::Sql(e.to_string());
+    let mut conn = Connection::open(db).map_err(sql)?;
+    let rows: Vec<(String, String, String)> = {
+        let mut stmt = conn
+            .prepare("SELECT id, project_id, metadata FROM session WHERE metadata LIKE ?1")
+            .map_err(sql)?;
+        stmt.query_map(params![format!("%{}%", MARKER)], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .map_err(sql)?
+        .filter_map(|r| r.ok())
+        .collect()
+    };
+    let mut moves: Vec<(String, String)> = Vec::new();
+    for (id, project_id, metadata) in rows {
+        let meta: serde_json::Value = serde_json::from_str(&metadata).unwrap_or_default();
+        let (Some(provider), Some(source)) = (
+            meta.get("source_provider").and_then(|v| v.as_str()),
+            meta.get("source_id").and_then(|v| v.as_str()),
+        ) else {
+            continue;
+        };
+        let wanted = derive_id(provider, source, &project_id);
+        if wanted != id {
+            moves.push((id, wanted));
+        }
+    }
+    if moves.is_empty() {
+        return Ok(moves);
+    }
+    // The child tables point at the session id, and the schema has no
+    // ON UPDATE rule, so the three updates are made together with the check
+    // off. It can only be switched outside a transaction.
+    conn.execute_batch("PRAGMA foreign_keys = OFF;").map_err(sql)?;
+    let tx = conn.transaction().map_err(sql)?;
+    for (old, new) in &moves {
+        let taken: bool = tx
+            .query_row("SELECT 1 FROM session WHERE id = ?1", params![new], |_| Ok(()))
+            .is_ok();
+        if taken {
+            // A newer copy already sits at the right id; the old one is a
+            // leftover of the same session.
+            tx.execute("DELETE FROM part WHERE session_id = ?1", params![old]).map_err(sql)?;
+            tx.execute("DELETE FROM message WHERE session_id = ?1", params![old]).map_err(sql)?;
+            tx.execute("DELETE FROM session WHERE id = ?1", params![old]).map_err(sql)?;
+            continue;
+        }
+        tx.execute("UPDATE session SET id = ?2 WHERE id = ?1", params![old, new]).map_err(sql)?;
+        tx.execute("UPDATE message SET session_id = ?2 WHERE session_id = ?1", params![old, new])
+            .map_err(sql)?;
+        tx.execute("UPDATE part SET session_id = ?2 WHERE session_id = ?1", params![old, new])
+            .map_err(sql)?;
+    }
+    tx.commit().map_err(sql)?;
+    Ok(moves)
 }
 
 /// The pre-0.3.4 id: one row per session for the whole machine. Rows under it
@@ -866,7 +943,48 @@ mod tests {
             derive_id("claude-code", "abc", "proj_a"),
             "one row per project means one id per project"
         );
-        assert!(a.starts_with("ses_ab"));
+        // Exactly OpenCode's own shape: `ses_`, 12 hex, 14 letters or digits.
+        // Real ones for comparison: ses_f04630257ffepyyOZrwjoHsBpm.
+        let body = a.strip_prefix("ses_").expect("starts like OpenCode's");
+        assert_eq!(body.len(), 26, "{a}");
+        assert!(body[..12].chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()), "{a}");
+        assert!(body[12..].chars().all(|c| c.is_ascii_alphanumeric()), "{a}");
+    }
+
+    /// Found live 2026-10-05: on a session agentbridge had written, OpenCode's
+    /// free models answered "OpenCode's free tier can only be used from
+    /// within OpenCode". The same session under an OpenCode shaped id worked.
+    /// Rows already written under the old shape are renamed in place.
+    #[test]
+    fn test_migrate_gives_old_rows_an_opencode_shaped_id_and_keeps_their_turns() {
+        let (_tmp, db) = db_with_schema();
+        let s = a_session();
+        let (new_id, turns, _) = write_session(&db, &s, "/home/u/p").unwrap();
+
+        // Put the row back under the old `ses_ab` + 32 hex shape.
+        let old_id = "ses_ab0123456789abcdef0123456789abcdef";
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        for sql in [
+            "UPDATE session SET id = ?2 WHERE id = ?1",
+            "UPDATE message SET session_id = ?2 WHERE session_id = ?1",
+            "UPDATE part SET session_id = ?2 WHERE session_id = ?1",
+        ] {
+            conn.execute(sql, params![new_id, old_id]).unwrap();
+        }
+        drop(conn);
+
+        let moves = migrate_ids(&db).unwrap();
+        assert_eq!(moves, vec![(old_id.to_string(), new_id.clone())]);
+
+        let conn = Connection::open(&db).unwrap();
+        let count = |sql: &str, id: &str| -> i64 { conn.query_row(sql, params![id], |r| r.get(0)).unwrap() };
+        assert_eq!(count("SELECT COUNT(*) FROM session WHERE id = ?1", old_id), 0);
+        assert_eq!(count("SELECT COUNT(*) FROM session WHERE id = ?1", &new_id), 1);
+        assert_eq!(count("SELECT COUNT(*) FROM message WHERE session_id = ?1", &new_id) as usize, turns);
+        assert!(count("SELECT COUNT(*) FROM part WHERE session_id = ?1", &new_id) > 0);
+        assert_eq!(count("SELECT COUNT(*) FROM session WHERE id = ?1", "ses_real"), 1, "OpenCode's own row is untouched");
+        assert!(migrate_ids(&db).unwrap().is_empty(), "a second pass has nothing to do");
     }
 
     #[test]

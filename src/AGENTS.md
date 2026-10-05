@@ -42,6 +42,7 @@ The whole crate. The library (`lib.rs` and the modules it lists) does discovery,
 - `sync` and `pull` take `sync.lock` in the data dir. The shell hook starts many runs at once; without the lock they copy each other's copies.
 - Before writing a file target, check what is already there. A file that is not in the manifest and is not a copy belongs to the tool and is left alone.
 - agy rebuilds its index when it starts and blanks the title and marker on rows it did not write. Recognise and replace agentbridge's agy rows by their version 5 id (`antigravity_write::is_derived_id`), never by the marker alone.
+- A copy written into OpenCode must have an id of OpenCode's own shape (`ses_`, 12 hex, 14 letters or digits; `opencode_write::derive_id`). OpenCode's free models refuse a session with any other id shape. Tell agentbridge's rows by the metadata marker, never by the id.
 - A fresh OpenCode database has no `global` project row. `opencode_write::write_session` creates it; any other insert path must too, or the foreign key fails.
 - The shell hook runs `sync --changed`: it compares a stored fingerprint and shares only sessions changed since the last run (`sync_into_since`). Leave SQLite's `-shm` file out of that fingerprint; reading a database changes it.
 - SQLite WAL writes do not change the `.db` mtime. The fingerprint also stats the `-wal` and `-shm` siblings.

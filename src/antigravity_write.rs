@@ -101,7 +101,9 @@ pub fn is_antigravity_running() -> bool {
 /// the write primitives so the primitives stay testable on a machine where
 /// Antigravity happens to be running.
 pub fn ensure_safe_to_write() -> Result<(), WriteError> {
-    if is_antigravity_running() {
+    // Unit tests write to temp stores, never the real one, so whether the
+    // operator happens to have the tool open must not decide if they pass.
+    if !cfg!(test) && is_antigravity_running() {
         return Err(WriteError::AntigravityRunning);
     }
     Ok(())

@@ -44,7 +44,7 @@ Stored in `docs/specs/`. Format: `docs/specs/NNNN-title.md`. Older design record
 ## Rules
 
 - A tool's own session files are never changed. New turns are recovered into an overlay that agentbridge owns (`~/.agentbridge/overlay`).
-- A session body is never stored twice. Convert once into `~/.agentbridge/cache`, then hardlink into each directory.
+- agentbridge keeps no copy of any session. A converted session is written straight into the target tool's own store and nowhere else; `~/.agentbridge` holds only the manifest, the overlay of recovered turns, and small state files.
 - Sync must be idempotent and deterministic. Ids are UUID v5 of the source id and paths come from the session's own start time. No random ids and no `Utc::now()` in names.
 - Everything agentbridge creates goes in the manifest, so `unsync` removes exactly that. Never `rm -rf ~/.agentbridge`; run `agentbridge unsync`.
 - Every command that writes supports `--dry-run`.

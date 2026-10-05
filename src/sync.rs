@@ -557,8 +557,27 @@ pub fn data_dir() -> PathBuf {
         .unwrap_or_else(|_| home().join(".agentbridge"))
 }
 
-fn cache_root(target: &str) -> PathBuf {
-    data_dir().join("cache").join(target)
+/// Where a converted session is written before it is moved into the target
+/// tool's own store. Nothing stays here: agentbridge keeps no copy of any
+/// session. A tool cannot read another tool's format, so one converted file
+/// per session has to exist, and it lives in that tool's store and nowhere
+/// else. (An earlier design kept every artifact in `~/.agentbridge/cache` and
+/// hardlinked it out; leftovers there grew to 28 GB on a real machine.)
+fn staging_root(target: &str) -> PathBuf {
+    staging_dir().join(target)
+}
+
+/// This run's staging folder. Per process, so two runs never share files.
+fn staging_dir() -> PathBuf {
+    data_dir().join("staging").join(std::process::id().to_string())
+}
+
+/// True when both files hold the same bytes.
+fn same_content(a: &Path, b: &Path) -> bool {
+    match (fs::metadata(a), fs::metadata(b)) {
+        (Ok(x), Ok(y)) if x.len() == y.len() => fs::read(a).ok() == fs::read(b).ok(),
+        _ => false,
+    }
 }
 
 fn manifest_path() -> PathBuf {
@@ -831,7 +850,8 @@ fn merge_back_native(
             let Some(live) = live_root("codex-cli") else {
                 return Err("merge-back: no codex-cli live root".to_string());
             };
-            let cache = cache_root("codex-cli");
+            let cache = staging_root("codex-cli");
+            let _staged = StagingGuard;
             let dir = session.project_path().unwrap_or_default();
             let artifact = CodexCliConverter::new()
                 .convert_multi(&session, &cache, std::slice::from_ref(&dir))?
@@ -848,6 +868,26 @@ fn merge_back_native(
         // field agentbridge does not decode. The caller excludes it before
         // reaching here; this arm is the backstop.
         other => Err(format!("merge-back not supported for {}", other)),
+    }
+}
+
+/// Delete the folder older builds kept every converted session in. Copies
+/// already in the tools' stores are their own files and are not affected;
+/// this only frees what nothing else points at. Returns true if it was there.
+pub fn drop_legacy_cache() -> bool {
+    let cache = data_dir().join("cache");
+    cache.exists() && fs::remove_dir_all(cache).is_ok()
+}
+
+/// Removes this run's staging folder when it goes out of scope, so no
+/// converted file outlives the run that made it.
+struct StagingGuard;
+
+impl Drop for StagingGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(staging_dir());
+        // The parent goes too once no other run is using it.
+        let _ = fs::remove_dir(data_dir().join("staging"));
     }
 }
 
@@ -890,6 +930,47 @@ pub fn record_sync_state(at: chrono::DateTime<chrono::Utc>, fingerprint: &str) -
     )
 }
 
+/// Rename OpenCode rows still under an old id shape and point `manifest` at
+/// the new ids. Returns how many rows moved. Does nothing while OpenCode is
+/// open.
+fn rename_opencode_rows(manifest: &mut [LinkRecord]) -> usize {
+    let Some(db) = opencode_db().filter(|db| db.is_file()) else {
+        return 0;
+    };
+    if crate::opencode_write::ensure_safe_to_write().is_err() {
+        return 0;
+    }
+    let moves = crate::opencode_write::migrate_ids(&db).unwrap_or_default();
+    for (old, new) in &moves {
+        for r in manifest
+            .iter_mut()
+            .filter(|r| r.target_provider == "opencode" && r.cache.as_os_str() == old.as_str())
+        {
+            r.cache = PathBuf::from(new);
+        }
+    }
+    moves.len()
+}
+
+/// The same rename, for a caller that is not about to sync. `sync --changed`
+/// stops early when nothing is new, and old rows must not wait for a new
+/// session before they become usable.
+pub fn migrate_opencode_rows() -> usize {
+    let Some(_lock) = acquire_run_lock() else {
+        return 0;
+    };
+    let mut manifest = read_manifest();
+    let moved = rename_opencode_rows(&mut manifest);
+    if moved > 0 {
+        let body: String = manifest
+            .iter()
+            .map(|r| serde_json::to_string(r).unwrap_or_default() + "\n")
+            .collect();
+        let _ = fs::write(manifest_path(), body);
+    }
+    moved
+}
+
 /// `sync_into`, limited to sessions that changed at or after `since`.
 ///
 /// This is what makes an automatic sync cheap: a machine holds thousands of
@@ -913,6 +994,10 @@ pub fn sync_into_since(
             }
         }
     };
+    let _staged = StagingGuard;
+    if !dry_run {
+        drop_legacy_cache();
+    }
     let mut index: Index = discover(registry);
     if let Some(since) = since {
         // Dropped before anything is opened: judging whether an entry is a
@@ -945,6 +1030,12 @@ pub fn sync_into_since(
     let rows_on_disk = read_manifest_raw().len();
     let mut manifest = read_manifest();
     let mut manifest_dirty = manifest.len() != rows_on_disk;
+    // Rows written before OpenCode copies took OpenCode's own id shape are
+    // renamed in place, and the manifest follows them. Until then OpenCode's
+    // free models refuse those sessions.
+    if !dry_run && rename_opencode_rows(&mut manifest) > 0 {
+        manifest_dirty = true;
+    }
     let already: Vec<(String, PathBuf)> = manifest
         .iter()
         .map(|r| (r.session_id.clone(), r.dest.clone()))
@@ -1118,7 +1209,7 @@ pub fn sync_into_since(
                     } else {
                         live_root(target).unwrap_or_default().join("(planned)")
                     },
-                    cache: cache_root(target).join("(planned)"),
+                    cache: staging_root(target).join("(planned)"),
                     session_id: entry.id.clone(),
                     source_provider: entry.provider.clone(),
                     target_provider: target.clone(),
@@ -1274,8 +1365,9 @@ pub fn sync_into_since(
                 continue;
             }
 
-            // Rule 2: derive once into the cache.
-            let cache = cache_root(target);
+            // Convert once, into this run's staging folder. Each file is moved
+            // on into the tool's store below and the folder is emptied.
+            let cache = staging_root(target);
             let live = live_root(target).unwrap_or_default();
             let converter = match converter_for(target) { Some(c) => c, None => continue };
             // Codex scopes the resume picker to the rollout's session_meta
@@ -1337,22 +1429,31 @@ pub fn sync_into_since(
                 let dest = live.join(rel);
 
                 if already.iter().any(|(id, d)| id == &entry.id && d == &dest) && dest.exists() {
-                    // The artifact was just re-converted and the live copy shares
-                    // its inode (hardlink), so the copy *is* refreshed even though
-                    // nothing is linked. The manifest count must follow, or the
-                    // next pull reads agentbridge's own refresh as tool drift.
+                    // Already in the tool's store. Replace it only when the
+                    // session really changed, so an idle sync rewrites nothing.
+                    // The manifest count must follow, or the next pull reads
+                    // agentbridge's own refresh as tool drift.
                     //
                     // Title tracks session.title here, unlike the OpenCode branch
                     // below: `load_materialized` for codex-cli reads the rollout
                     // *file*, which never carries a title in the modern format —
                     // never `ensure_codex_row`'s DB-side fallback, which pull_back
                     // can never observe through that read path anyway.
+                    if !same_content(artifact, &dest)
+                        && let Err(e) = link_or_copy(artifact, &dest)
+                    {
+                        report.errors.push(format!("refresh {}: {}", entry.id, e));
+                        continue;
+                    }
                     if let Some(row) = manifest
                         .iter_mut()
                         .find(|r| r.session_id == entry.id && r.dest == dest)
                     {
                         row.message_count = session.messages.len();
                         row.title = session.title.clone();
+                        // The file may be a new one now; `unsync` checks this.
+                        row.inode = inode_of(&dest);
+                        row.cache = dest.clone();
                         manifest_dirty = true;
                     }
                     // A materialized rollout still needs its `threads` row for
@@ -1379,15 +1480,16 @@ pub fn sync_into_since(
                     continue;
                 }
 
-                // Rule 3: presence by hardlink, not copy.
+                // Into the tool's store. The staged file is removed when the
+                // run ends, leaving this as the only one.
                 match link_or_copy(artifact, &dest) {
                     Ok(inode) => {
                         if is_codex {
                             ensure_codex_row(&mut report, &mut codex_backed_up, &session, &dest, std::slice::from_ref(dir));
                         }
                         report.created.push(LinkRecord {
+                            cache: dest.clone(),
                             dest,
-                            cache: artifact.clone(),
                             session_id: entry.id.clone(),
                             source_provider: entry.provider.clone(),
                             target_provider: target.clone(),
@@ -2286,8 +2388,10 @@ mod tests {
         // And the rows agentbridge wrote must still never become sources.
         sync_into(&registry, Path::new("/tmp/merge-project"), false);
         let rows = read_manifest();
+        let ours = crate::opencode_write::written_ids(&db);
+        assert!(!ours.is_empty());
         assert!(
-            rows.iter().all(|r| !r.session_id.starts_with("ses_ab")),
+            rows.iter().all(|r| !ours.contains(&r.session_id)),
             "agentbridge's own OpenCode rows must not be re-materialized"
         );
         let before = rows.len();
@@ -2487,6 +2591,79 @@ mod tests {
         let (read_at, fp) = last_sync_state().expect("state is read back");
         assert_eq!(fp, "abc123");
         assert_eq!(read_at.timestamp(), at.timestamp());
+    }
+
+    /// Copies written under the old id shape are renamed by the next sync, and
+    /// the manifest keeps pointing at them, so `pull` still finds their turns.
+    #[test]
+    fn test_sync_renames_old_shaped_opencode_rows_and_the_manifest_follows() {
+        let _sb = Sandbox::new();
+        let live = live_root("claude-code").unwrap();
+        write_native_claude_session(&live, "/tmp/merge-project");
+        let db = make_opencode_db();
+        let registry = opencode_registry(live);
+        sync_into(&registry, Path::new("/tmp/merge-project"), false);
+
+        // Rewind one row, and its manifest entry, to the old shape.
+        let mut rows = read_manifest();
+        let i = rows.iter().position(|r| r.target_provider == "opencode").unwrap();
+        let good = rows[i].cache.to_string_lossy().to_string();
+        let old = "ses_ab0123456789abcdef0123456789abcdef";
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        for sql in [
+            "UPDATE session SET id = ?2 WHERE id = ?1",
+            "UPDATE message SET session_id = ?2 WHERE session_id = ?1",
+            "UPDATE part SET session_id = ?2 WHERE session_id = ?1",
+        ] {
+            conn.execute(sql, params![good, old]).unwrap();
+        }
+        drop(conn);
+        rows[i].cache = PathBuf::from(old);
+        let body: String = rows.iter().map(|r| serde_json::to_string(r).unwrap() + "\n").collect();
+        fs::write(manifest_path(), body).unwrap();
+        let before = rows.len();
+
+        sync_into(&registry, Path::new("/tmp/merge-project"), false);
+
+        let after = read_manifest();
+        assert_eq!(after.len(), before, "renamed, not added again");
+        assert!(after.iter().all(|r| r.cache.as_os_str() != old), "no manifest row is left on the old id");
+        assert!(after.iter().any(|r| r.cache.as_os_str() == good.as_str()));
+        let ids = crate::opencode_write::written_ids(&db);
+        assert!(ids.contains(&good) && !ids.contains(&old.to_string()), "{ids:?}");
+        assert!(pull_back(false).errors.is_empty());
+    }
+
+    /// agentbridge keeps no copy of any session. After a sync the only
+    /// converted file is the one in the target tool's store, the folder older
+    /// builds filled is gone, and a later sync still refreshes that file.
+    #[test]
+    fn test_sync_keeps_no_copy_in_agentbridges_own_folder() {
+        let _sb = Sandbox::new();
+        let registry = crate::connectors::all_for_testing(&fixture_root());
+        // What an older build left behind.
+        let legacy = data_dir().join("cache/claude-code/old");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("leftover.jsonl"), "x").unwrap();
+
+        let report = sync_into(&registry, Path::new("/tmp/some-project"), false);
+        let link = first_claude_link(&report);
+
+        assert!(!data_dir().join("cache").exists(), "the old cache folder is removed");
+        assert!(!data_dir().join("staging").exists(), "nothing is left staged");
+        assert_eq!(fs::metadata(&link.dest).unwrap().nlink(), 1, "the tool's file is the only one");
+
+        // A turn recovered from another tool still reaches that file.
+        append_claude_turn(&link.dest, &link.session_id, "ADDED ELSEWHERE");
+        pull_back(false);
+        sync_into(&registry, Path::new("/tmp/some-project"), false);
+        assert!(fs::read_to_string(&link.dest).unwrap().contains("ADDED ELSEWHERE"));
+        assert!(!data_dir().join("staging").exists());
+
+        // And unsync still knows the file as its own after the refresh.
+        let removed = unsync(false);
+        assert!(removed.removed.contains(&link.dest) && removed.kept_foreign.is_empty());
     }
 
     /// Two syncs at once is the race above. The second one must stand down.
@@ -2850,7 +3027,7 @@ mod tests {
             "dry run must not write a manifest"
         );
         assert!(
-            !cache_root("claude-code").exists(),
+            !staging_root("claude-code").exists(),
             "dry run must not materialize artifacts"
         );
     }
@@ -3531,7 +3708,7 @@ mod tests {
 
         let report = unsync(false);
         assert!(
-            !cache_root("claude-code").exists(),
+            !staging_root("claude-code").exists(),
             "unsync must drop the derived cache too"
         );
         assert_eq!(
