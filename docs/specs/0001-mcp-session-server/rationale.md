@@ -1,8 +1,10 @@
-# 0001. Rationale: read sessions through an MCP server instead of copying them
+# 0001. Rationale: read sessions through an MCP server, and write new work back to the origin
 
 ## Context
 
-> ⚠️ Premise note: you asked to reach any session from any folder "without making a single copy". A tool's own resume list can only ever show sessions stored in that tool's own format and place, so without copies there is no native resume. What can be done without copies is letting the AI read the old session in and continue from it. This spec delivers that, and keeps `agentbridge resume` for the rare case where a true native resume matters.
+> ⚠️ Premise note: you asked to reach any session from any folder "without making a single copy". A tool's own resume list can only ever show sessions stored in that tool's own format and place, so without copies there is no native resume in other tools. What can be done without copies is letting the AI read the old session in and continue from it. This spec delivers that, and keeps `agentbridge resume` for the rare case where a true native resume matters.
+
+> ⚠️ Premise note (update, write back): you then asked that the continued work show up when you open the session in the tool it started in. That means writing into the tools' own session stores, which the project rules forbade ("a tool's own session files are never changed") because it is where the worst bugs in this repo happened (a 240 record session truncated to one line, Codex sessions that opened empty). The spec allows it in the narrowest form: add at the end only, back up first, never while the tool is open, record every turn so `unsync` can take it out. Expect this part to need the most care and the most live checking.
 
 Each tool lists only the sessions it saved itself, and only for the folder it was opened in. Today agentbridge closes that gap by converting every session and writing a copy into every tool's store, folder by folder (`sync`), kept fresh by a shell hook and reconciled by `pull`. On this machine that means 264 tracked copies across 7 Claude Code folders, a 5.1 GB OpenCode database, and sessions that are visible only in folders where a terminal happened to run `sync`. You reported that sessions from other tools were not reachable from where you were working.
 
@@ -70,3 +72,18 @@ Choices made in this spec without a separate question, each with the runner up:
 - MCP entries are rows in the existing manifest with a new `kind` field, so the rule "everything agentbridge creates goes in the manifest" holds and `unsync` stays a full undo. Runner up: a separate `mcp.json` state file, simpler but breaks that rule.
 - The `list_sessions` index is rebuilt on every call. Runner up: an in memory cache invalidated by the existing fingerprint, deferred until a measured slowness.
 - `since` is an ISO date filter rather than a date match inside `query`, so it can compare instead of matching text.
+
+Write back, choices you made: add only at the end with backup and no writes while the tool is open; run automatically; detect continuations from the `read_session` call; all four tools; when both sides moved, add anyway under a note; chains go all the way back; with several sessions read, the last one is the origin; `unsync` removes written turns.
+
+Write back, choices made in this spec, each with the runner up:
+- Runs at server start and at end of input (the continuing tool closing). Start alone would almost never succeed for the origin's own tool, because that tool is open at the moment it starts the server. Runner up: a shell hook, which you used before and asked to remove.
+- Not an MCP tool. Runner up: a `save_to_origin` tool, rejected because it depends on the AI remembering to call it and lets the AI trigger writes.
+- The note turn opens every batch, not only when both sides moved. One rule is simpler to build and to read than two. Runner up: a note only when the origin also moved.
+- Turns written through the existing writers (`convert.rs`, `opencode_write`, `antigravity_write`), extended to append. Runner up: new writers, rejected because the existing ones already carry the lessons from real bugs (both Codex views, the trailing newline, OpenCode's id shape).
+- Written turn ids are UUID v5 of the origin and continuation identities plus the ordinal, so a rerun writes the same ids and duplicates are caught. Runner up: tracking by position, which breaks when the origin also moves.
+
+### Options considered for write back
+
+- **Append into the origin (chosen).** Pros: the origin shows everything in its own tool. Cons: writes into stores agentbridge does not own; per tool formats to get right.
+- **Overlay only (what `pull` does today).** Pros: never writes into a tool's store. Cons: the origin's own tool never shows the new turns, which is exactly what you asked for.
+- **Write a new sibling session in the origin tool** ("Claude session X, continued"). Pros: never touches the original session. Cons: two sessions to open instead of one; still writes into the store.
