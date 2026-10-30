@@ -47,6 +47,10 @@ pub struct RawSession {
     /// still produce this record. `Connector::load` will error if called on
     /// an id with `body_available: false`.
     pub body_available: bool,
+    /// The first thing a person typed, for search (`label::prompt_preview`).
+    /// `None` when the connector cannot read it cheaply during a scan.
+    #[serde(default)]
+    pub first_prompt: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]

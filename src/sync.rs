@@ -45,6 +45,49 @@ pub struct LinkRecord {
     /// report on the first pull after upgrading.
     #[serde(default)]
     pub title: Option<String>,
+    /// What this row records: `"session"` (a session copy, every row written
+    /// before spec 0001), `"mcp-config"` (an entry `mcp install` added to a
+    /// tool's settings file) or `"writeback"` (turns written back into an
+    /// origin session). Every reader filters by it.
+    #[serde(default = "session_kind")]
+    pub kind: String,
+    /// For `mcp-config` rows: the exact value agentbridge wrote under its key
+    /// (TOML as its JSON equivalent). For `writeback` rows: what was written.
+    #[serde(default)]
+    pub entry: Option<serde_json::Value>,
+    /// For `mcp-config` rows: install created the settings file.
+    #[serde(default)]
+    pub created_file: bool,
+    /// For `mcp-config` rows: install also created the object that holds the
+    /// entry (`mcpServers`, `mcp`, `[mcp_servers]`), so uninstall removes it
+    /// again when it is left empty and the file goes back to how it was.
+    #[serde(default)]
+    pub created_parent: bool,
+    /// For `mcp-config` rows: the settings file existed but held nothing (or
+    /// only whitespace) before install, so uninstall writes it back empty
+    /// rather than leaving `{}`.
+    #[serde(default)]
+    pub blank_before: bool,
+    /// For `mcp-config` rows: the exact text install replaced and the text it
+    /// put there (`{"removed": …, "inserted": …}`), so uninstall can swap the
+    /// bytes back even where the editor reflowed whitespace around the entry.
+    #[serde(default)]
+    pub undo: Option<serde_json::Value>,
+}
+
+pub const KIND_SESSION: &str = "session";
+pub const KIND_MCP_CONFIG: &str = "mcp-config";
+pub const KIND_WRITEBACK: &str = "writeback";
+
+fn session_kind() -> String {
+    KIND_SESSION.to_string()
+}
+
+impl LinkRecord {
+    /// A row for a session copy written by `sync` or `resume`.
+    pub fn is_session_copy(&self) -> bool {
+        self.kind == KIND_SESSION
+    }
 }
 
 #[derive(Debug, Default)]
@@ -307,18 +350,26 @@ struct Pending {
 /// exactly one tool is never a conflict and is folded in directly, same as
 /// always.
 pub fn pull_back_with(dry_run: bool, resolver: &mut dyn ConflictResolver) -> PullReport {
-    let mut report = PullReport::default();
     let _lock = if dry_run {
         None
     } else {
         match acquire_run_lock() {
             Some(lock) => Some(lock),
             None => {
+                let mut report = PullReport::default();
                 report.errors.push(BUSY.to_string());
                 return report;
             }
         }
     };
+    pull_back_locked(dry_run, resolver)
+}
+
+/// `pull_back_with` for a caller that already holds `sync.lock` (the
+/// migration inside `mcp install`, which keeps it from the dry pull until the
+/// last copy is gone).
+pub fn pull_back_locked(dry_run: bool, resolver: &mut dyn ConflictResolver) -> PullReport {
+    let mut report = PullReport::default();
     // Repeated rows for one copy would each report the same new turn, and
     // read as a conflict of a tool against itself.
     let rows_on_disk = read_manifest_raw().len();
@@ -467,11 +518,7 @@ pub fn pull_back_with(dry_run: bool, resolver: &mut dyn ConflictResolver) -> Pul
     }
 
     if changed && !dry_run {
-        let body: String = manifest
-            .iter()
-            .map(|r| serde_json::to_string(r).unwrap_or_default() + "\n")
-            .collect();
-        let _ = fs::write(manifest_path(), body);
+        let _ = write_session_rows(&manifest);
     }
 
     report
@@ -501,6 +548,10 @@ pub struct SyncReport {
 #[derive(Debug, Default)]
 pub struct UnsyncReport {
     pub removed: Vec<PathBuf>,
+    /// Settings files whose `agentbridge` entry was removed.
+    pub settings_restored: Vec<PathBuf>,
+    /// Origin sessions the written back turns were taken out of.
+    pub writeback_cleaned: Vec<PathBuf>,
     /// Left alone because the inode no longer matches what we created.
     pub kept_foreign: Vec<PathBuf>,
     pub missing: usize,
@@ -529,7 +580,7 @@ const BUSY: &str = "another agentbridge sync is running; skipped (that run cover
 /// tool's own startup shells count, so several runs begin together; each read
 /// the manifest before the others wrote it and took their copies for
 /// sessions. `None` means another run holds the lock.
-fn acquire_run_lock() -> Option<RunLock> {
+pub fn acquire_run_lock() -> Option<RunLock> {
     let dir = data_dir();
     fs::create_dir_all(&dir).ok()?;
     let path = dir.join("sync.lock");
@@ -713,19 +764,36 @@ fn file_id(path: &Path) -> std::io::Result<u64> {
 /// Recorded so `unsync` can refuse to delete a path the tool has since
 /// replaced with a file of its own. `0` when unreadable, which `unsync` treats
 /// as "no match" and therefore leaves alone.
+/// A file's identity (inode, or the NTFS file index), `0` when unreadable.
+pub fn file_identity(path: &Path) -> u64 {
+    inode_of(path)
+}
+
 fn inode_of(path: &Path) -> u64 {
     file_id(path).unwrap_or(0)
 }
 
-/// The manifest as `status`, `pull` and `unsync` should see it: one row per
-/// session written to one place.
+/// The session copies in the manifest, as `status`, `pull`, `sync` and
+/// `unsync` should see them: one row per session written to one place. Rows
+/// of other kinds (`mcp-config`, `writeback`) are never in this list; read
+/// them with `read_manifest_kind`.
 pub fn read_manifest() -> Vec<LinkRecord> {
     dedup_manifest(read_manifest_raw())
 }
 
-/// Every row on disk, repeats included. Callers that rewrite the manifest use
-/// this to tell whether collapsing the repeats changed anything.
+/// The manifest's rows of one `kind`, repeats collapsed.
+pub fn read_manifest_kind(kind: &str) -> Vec<LinkRecord> {
+    dedup_manifest(read_all_rows().into_iter().filter(|r| r.kind == kind).collect())
+}
+
+/// Every session row on disk, repeats included. Callers that rewrite the
+/// manifest use this to tell whether collapsing the repeats changed anything.
 fn read_manifest_raw() -> Vec<LinkRecord> {
+    read_all_rows().into_iter().filter(|r| r.is_session_copy()).collect()
+}
+
+/// Every row on disk, of every kind.
+fn read_all_rows() -> Vec<LinkRecord> {
     let path = manifest_path();
     let Ok(content) = fs::read_to_string(&path) else {
         return Vec::new();
@@ -735,6 +803,33 @@ fn read_manifest_raw() -> Vec<LinkRecord> {
         .filter(|l| !l.trim().is_empty())
         .filter_map(|l| serde_json::from_str(l).ok())
         .collect()
+}
+
+fn rows_body<'a>(rows: impl IntoIterator<Item = &'a LinkRecord>) -> String {
+    rows.into_iter()
+        .map(|r| serde_json::to_string(r).unwrap_or_default() + "\n")
+        .collect()
+}
+
+/// Replace the manifest's session rows with `rows`, keeping every row of
+/// another kind as it is. The session code paths own only session rows.
+fn write_session_rows<'a>(rows: impl IntoIterator<Item = &'a LinkRecord>) -> std::io::Result<()> {
+    let others: Vec<LinkRecord> = read_all_rows().into_iter().filter(|r| !r.is_session_copy()).collect();
+    let body = rows_body(&others) + &rows_body(rows);
+    if let Some(parent) = manifest_path().parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(manifest_path(), body)
+}
+
+/// Replace the manifest's rows of `kind` with `rows`, keeping every other row.
+pub fn write_manifest_kind(kind: &str, rows: &[LinkRecord]) -> std::io::Result<()> {
+    let others: Vec<LinkRecord> = read_all_rows().into_iter().filter(|r| r.kind != kind).collect();
+    let body = rows_body(&others) + &rows_body(rows);
+    if let Some(parent) = manifest_path().parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(manifest_path(), body)
 }
 
 fn append_manifest(records: &[LinkRecord]) -> std::io::Result<()> {
@@ -791,9 +886,12 @@ fn append_manifest(records: &[LinkRecord]) -> std::io::Result<()> {
 /// sessions that share a `dest` are left alone — `append_manifest` owns that
 /// rule.
 fn dedup_manifest(rows: Vec<LinkRecord>) -> Vec<LinkRecord> {
+    // Session rows keep the key they always had. Rows of the other kinds are
+    // unique per (kind, tool, file, key, session).
     let key = |r: &LinkRecord| {
-        let row_id = (r.target_provider == "opencode").then(|| r.cache.clone());
-        (r.session_id.clone(), r.dest.clone(), row_id)
+        let row_id = (r.target_provider == "opencode" || !r.is_session_copy()).then(|| r.cache.clone());
+        let tool = (!r.is_session_copy()).then(|| r.target_provider.clone());
+        (r.kind.clone(), tool, r.session_id.clone(), r.dest.clone(), row_id)
     };
     let mut last: std::collections::HashMap<_, usize> = std::collections::HashMap::new();
     for (i, r) in rows.iter().enumerate() {
@@ -985,11 +1083,7 @@ pub fn migrate_opencode_rows() -> usize {
     let mut manifest = read_manifest();
     let moved = rename_opencode_rows(&mut manifest);
     if moved > 0 {
-        let body: String = manifest
-            .iter()
-            .map(|r| serde_json::to_string(r).unwrap_or_default() + "\n")
-            .collect();
-        let _ = fs::write(manifest_path(), body);
+        let _ = write_session_rows(&manifest);
     }
     moved
 }
@@ -1222,6 +1316,12 @@ pub fn sync_into_since(
 
             if dry_run {
                 report.created.push(LinkRecord {
+                    kind: KIND_SESSION.to_string(),
+                    entry: None,
+                    created_file: false,
+                    created_parent: false,
+                    blank_before: false,
+                    undo: None,
                     dest: if is_opencode {
                         opencode_db().unwrap_or_default()
                     } else if is_antigravity {
@@ -1279,6 +1379,12 @@ pub fn sync_into_since(
                 }
                 for row in rows {
                     let record = LinkRecord {
+                        kind: KIND_SESSION.to_string(),
+                        entry: None,
+                        created_file: false,
+                        created_parent: false,
+                        blank_before: false,
+                        undo: None,
                         // The body is the artifact a pull re-reads, so it is
                         // the `dest`; `unsync` removes it and its index row
                         // together by the marker.
@@ -1349,6 +1455,12 @@ pub fn sync_into_since(
                 }
                 for row in rows {
                     let record = LinkRecord {
+                        kind: KIND_SESSION.to_string(),
+                        entry: None,
+                        created_file: false,
+                        created_parent: false,
+                        blank_before: false,
+                        undo: None,
                         dest: db.clone(),
                         cache: PathBuf::from(row.id),
                         session_id: entry.id.clone(),
@@ -1511,6 +1623,12 @@ pub fn sync_into_since(
                             ensure_codex_row(&mut report, &mut codex_backed_up, &session, &dest, std::slice::from_ref(dir));
                         }
                         report.created.push(LinkRecord {
+                            kind: KIND_SESSION.to_string(),
+                            entry: None,
+                            created_file: false,
+                            created_parent: false,
+                            blank_before: false,
+                            undo: None,
                             cache: dest.clone(),
                             dest,
                             session_id: entry.id.clone(),
@@ -1532,11 +1650,7 @@ pub fn sync_into_since(
         // Rewrite refreshed rows before appending newly created ones, so the
         // append never clobbers the update.
         if manifest_dirty {
-            let body: String = manifest
-                .iter()
-                .map(|r| serde_json::to_string(r).unwrap_or_default() + "\n")
-                .collect();
-            if let Err(e) = fs::write(manifest_path(), body) {
+            if let Err(e) = write_session_rows(&manifest) {
                 report.errors.push(format!("manifest update failed: {}", e));
             }
         }
@@ -1742,16 +1856,39 @@ pub fn unsync_matching(dry_run: bool, filter: &UnsyncFilter) -> UnsyncReport {
     }
 
     if !dry_run {
-        let body: String = keep
-            .iter()
-            .map(|r| serde_json::to_string(r).unwrap_or_default() + "\n")
-            .collect();
-        let _ = fs::write(manifest_path(), body);
+        let _ = write_session_rows(&keep);
     }
     report
 }
 
+/// Remove everything agentbridge created: session copies, the entries
+/// `mcp install` added to tools' settings files, and turns written back into
+/// origin sessions. Each kind has its own removal code; a settings file is
+/// never deleted as if it were a copy.
 pub fn unsync(dry_run: bool) -> UnsyncReport {
+    unsync_with(dry_run, &crate::mcp_install::tool_is_open)
+}
+
+/// `unsync` with the "is this tool open" check supplied by the caller.
+pub fn unsync_with(dry_run: bool, is_open: &crate::mcp_install::OpenCheck) -> UnsyncReport {
+    let mut report = unsync_sessions(dry_run);
+    let settings = crate::mcp_install::uninstall(dry_run, is_open);
+    for done in settings.removed {
+        report.settings_restored.push(done.file);
+    }
+    for kept in settings.kept {
+        report.kept_foreign.push(kept.file);
+    }
+    let written = crate::writeback::unsync(dry_run, is_open);
+    report.writeback_cleaned.extend(written.cleaned);
+    report.kept_foreign.extend(written.kept.into_iter().map(|(p, _)| p));
+    report
+}
+
+/// Remove the session copies only (rows of kind `session`), leaving every
+/// other kind of row and what it records in place. Takes no lock: the caller
+/// decides (the migration inside `mcp install` holds `sync.lock`).
+pub fn unsync_sessions(dry_run: bool) -> UnsyncReport {
     let mut report = UnsyncReport::default();
     let records = read_manifest();
 
@@ -1852,11 +1989,7 @@ pub fn unsync(dry_run: bool) -> UnsyncReport {
             .iter()
             .filter(|r| report.kept_foreign.contains(&r.dest))
             .collect();
-        let body: String = keep
-            .iter()
-            .map(|r| serde_json::to_string(r).unwrap_or_default() + "\n")
-            .collect();
-        let _ = fs::write(manifest_path(), body);
+        let _ = write_session_rows(keep.iter().copied());
     }
 
     report
@@ -1996,6 +2129,12 @@ mod tests {
 
         // A manifest record claiming an inode that does not match reality.
         let rec = LinkRecord {
+            kind: KIND_SESSION.to_string(),
+            entry: None,
+            created_file: false,
+            created_parent: false,
+            blank_before: false,
+            undo: None,
             dest: foreign.clone(),
             cache: tmp.path().join("cache.jsonl"),
             session_id: "s1".into(),
@@ -3592,6 +3731,12 @@ mod tests {
         // as a rename nobody made (found live, outside the sandbox,
         // 2026-08-14 — see RowWritten::title).
         append_manifest(&[LinkRecord {
+            kind: KIND_SESSION.to_string(),
+            entry: None,
+            created_file: false,
+            created_parent: false,
+            blank_before: false,
+            undo: None,
             dest: db.clone(),
             cache: PathBuf::from(&oc_id),
             session_id: source.id.clone(),
@@ -3707,6 +3852,12 @@ mod tests {
             crate::opencode_write::write_session(&db, &source, "/tmp/some-project").unwrap();
         assert!(!written_title.is_empty(), "write_session must fall back to something");
         append_manifest(&[LinkRecord {
+            kind: KIND_SESSION.to_string(),
+            entry: None,
+            created_file: false,
+            created_parent: false,
+            blank_before: false,
+            undo: None,
             dest: db.clone(),
             cache: PathBuf::from(&oc_id),
             session_id: source.id.clone(),
@@ -3785,6 +3936,12 @@ mod tests {
         let _sb = Sandbox::new();
         let dest = PathBuf::from("/tmp/dest.jsonl");
         let stale = LinkRecord {
+            kind: KIND_SESSION.to_string(),
+            entry: None,
+            created_file: false,
+            created_parent: false,
+            blank_before: false,
+            undo: None,
             dest: dest.clone(),
             cache: PathBuf::from("/tmp/c1"),
             session_id: "s".to_string(),
@@ -3796,6 +3953,12 @@ mod tests {
             title: None,
         };
         let fresh = LinkRecord {
+            kind: KIND_SESSION.to_string(),
+            entry: None,
+            created_file: false,
+            created_parent: false,
+            blank_before: false,
+            undo: None,
             dest,
             cache: PathBuf::from("/tmp/c2"),
             session_id: "s".to_string(),

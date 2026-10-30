@@ -49,7 +49,7 @@
 use crate::connector::{Connector, ConnectorError, ConnectorResult, InjectTarget, SessionStream};
 use crate::model::{Message, RawSession, Role, Session, TokenTotals};
 use chrono::{DateTime, TimeZone, Utc};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
 /// Every Antigravity surface that keeps sessions, in the order they are
@@ -125,10 +125,7 @@ impl AntigravityConnector {
     }
 
     fn open_body(&self, id: &str, path: &Path) -> ConnectorResult<Connection> {
-        Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-        )
+        crate::connectors::open_read_only(path)
         .map_err(|e| ConnectorError::Parse {
             id: id.to_string(),
             path: path.to_path_buf(),
@@ -144,10 +141,7 @@ impl AntigravityConnector {
         if !db.is_file() {
             return None;
         }
-        let conn = Connection::open_with_flags(
-            &db,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-        )
+        let conn = crate::connectors::open_read_only(&db)
         .ok()?;
         // `title` is the user's explicit rename and must win over `preview`,
         // which is only the first words of the opening message. Reading
@@ -216,10 +210,7 @@ struct BlobMeta {
 /// `trajectory_metadata_blob`; a caller that also has a summaries row layers
 /// the explicit title over the top.
 pub(crate) fn load_body(path: &Path, id: &str) -> ConnectorResult<Session> {
-    let conn = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-    )
+    let conn = crate::connectors::open_read_only(path)
     .map_err(|e| ConnectorError::Parse {
         id: id.to_string(),
         path: path.to_path_buf(),
@@ -277,6 +268,24 @@ pub(crate) fn load_body(path: &Path, id: &str) -> ConnectorResult<Session> {
         // recoverable text is still kept, since dropping it would silently
         // renumber the transcript.
         let Some((role, text)) = step_message(step_type, &payload) else {
+            // Not a conversational turn, but maybe a tool call: kept so a
+            // conversation that called agentbridge's `read_session` can be
+            // told apart (write back), and so tool use shows when read.
+            // Only finished steps get here, so a denied call (status 7)
+            // never counts as having read anything.
+            if let Some((name, input)) = tool_call(&payload) {
+                messages.push(Message {
+                    session_id: id.to_string(),
+                    ordinal: messages.len() as u64,
+                    role: Role::Assistant,
+                    timestamp: ts,
+                    text: None,
+                    tool_name: Some(name),
+                    tool_input: input,
+                    tool_result: None,
+                    parent_ordinal: None,
+                });
+            }
             continue;
         };
         messages.push(Message {
@@ -524,6 +533,7 @@ impl Iterator for AntigravityScanIter<'_> {
                 .or(summary.last_modified)
                 .or(started_at);
             let project = summary.project.or(blob.project);
+            let first_prompt = first_user_prompt(&conn);
             return Some(Ok(RawSession {
                 id,
                 provider: "antigravity".to_string(),
@@ -534,6 +544,7 @@ impl Iterator for AntigravityScanIter<'_> {
                 source: None,
                 source_path: db,
                 body_available: true,
+                first_prompt,
             }));
         }
     }
@@ -684,6 +695,47 @@ fn step_message(step_type: i64, payload: &[u8]) -> Option<(Role, Option<String>)
         }
         _ => None,
     }
+}
+
+/// Steps a scan reads from the start of a conversation looking for the first
+/// prompt.
+const FIRST_PROMPT_STEPS: i64 = 20;
+
+/// The first user turn's text (step type 14) among the opening steps.
+fn first_user_prompt(conn: &Connection) -> Option<String> {
+    let mut stmt = conn
+        .prepare("SELECT step_payload FROM steps WHERE step_type = 14 ORDER BY idx LIMIT ?1")
+        .ok()?;
+    let rows = stmt
+        .query_map([FIRST_PROMPT_STEPS], |row| row.get::<_, Option<Vec<u8>>>(0))
+        .ok()?;
+    rows.filter_map(Result::ok)
+        .flatten()
+        .find_map(|p| user_text(&p).as_deref().and_then(crate::label::prompt_preview))
+}
+
+/// A tool call carried by a step (seen on type 132, agy 1.2.17): the call
+/// sits at `.5.4`, with the call id at `.5.4.1`, the tool name at `.5.4.2`
+/// and the arguments as a JSON string at `.5.4.3`. An MCP call is named
+/// `call_mcp_tool` with `{"ServerName", "ToolName", "Arguments"}`; it is
+/// returned as `mcp__<server>__<tool>` with `Arguments` as the input, the
+/// same shape Claude Code uses. The call's output is not decoded yet.
+fn tool_call(payload: &[u8]) -> Option<(String, Option<serde_json::Value>)> {
+    let call = proto_descend(payload, &[5, 4])?;
+    let name = non_empty(proto_string_field(call, 2))?;
+    let args: Option<serde_json::Value> = proto_string_field(call, 3).map(|a| {
+        serde_json::from_str(&a).unwrap_or(serde_json::Value::String(a))
+    });
+    if name == "call_mcp_tool"
+        && let Some(a) = &args
+        && let (Some(server), Some(tool)) = (
+            a.get("ServerName").and_then(|v| v.as_str()),
+            a.get("ToolName").and_then(|v| v.as_str()),
+        )
+    {
+        return Some((format!("mcp__{}__{}", server, tool), a.get("Arguments").cloned()));
+    }
+    Some((name, args))
 }
 
 /// User text for step type 14: `payload.19.2`, falling back to the inner
@@ -956,6 +1008,31 @@ mod tests {
             !text.unwrap().contains("Defining the Role"),
             "private reasoning at .20.3 must never be surfaced as the response"
         );
+    }
+
+    /// Regression: tool calls were dropped, so a conversation that read a
+    /// session through agentbridge could not be detected as a continuation.
+    /// Shape from a real agy 1.2.17 conversation (2026-10-30).
+    #[test]
+    fn test_tool_call_steps_are_read() {
+        let args = r#"{"Arguments":{"id":"abc","tool":"claude-code"},"ServerName":"agentbridge","ToolName":"read_session"}"#;
+        let mut call = str_field(1, "call_1069056");
+        call.extend(str_field(2, "call_mcp_tool"));
+        call.extend(str_field(3, args));
+        let meta = msg_field(4, &call);
+        let payload = msg_field(5, &meta);
+        let (name, input) = tool_call(&payload).unwrap();
+        assert_eq!(name, "mcp__agentbridge__read_session");
+        assert_eq!(input, Some(serde_json::json!({"id": "abc", "tool": "claude-code"})));
+        assert!(crate::writeback::is_read_call(&name));
+
+        let mut plain = str_field(1, "call_9");
+        plain.extend(str_field(2, "read_file"));
+        plain.extend(str_field(3, r#"{"Path":"/x"}"#));
+        let (name, input) = tool_call(&msg_field(5, &msg_field(4, &plain))).unwrap();
+        assert_eq!(name, "read_file");
+        assert_eq!(input, Some(serde_json::json!({"Path": "/x"})));
+        assert!(tool_call(&user_payload(1)).is_none(), "a user turn is not a tool call");
     }
 
     #[test]

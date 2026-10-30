@@ -795,3 +795,131 @@ OpenCode and agy hold. Tests 184 → 187.
 
 Not verified: whether Codex's interactive screen still invents a name when one
 is already present. Its app server did not, in a control run with no name.
+
+## 2026-10-30 — Sessions are read through an MCP server; continued work is written back to the origin
+
+Spec: `docs/specs/0001-mcp-session-server/`. **Supersedes** the copy based
+sync of 2026-07-30 onwards (`sync`, `pull`, `status`, `auto` stay one more
+release with a deprecation note) and the rule "a tool's own session files are
+never changed".
+
+Decision: `agentbridge mcp` is an MCP server over stdio, written in house
+(serde_json, no async runtime, no SDK). It offers two read only tools,
+`list_sessions` and `read_session`, that read every tool's store live on every
+call. `agentbridge mcp install` adds one entry per detected tool to that tool's
+settings file, with format preserving editors (`jsonc-parser` CST for the JSON
+style files, `toml_edit` for Codex), after migrating off copies (pull, remove
+the hook, remove every copy). Write back adds a continuation's new turns to
+the end of the session it read last, in the origin's own format.
+
+The rule now reads: a tool's own session messages are never changed or
+removed; agentbridge only adds write back turns at the end, records each one,
+backs up first, and never writes while that tool is open.
+
+Choices made while building, beyond the spec:
+- `read_session` loads Claude Code and Codex sessions from the discovered
+  entry's own file, not by id. A lookup by id walks the store and returns the
+  first file with that id, which for a session `sync` had copied into other
+  folders is often a copy; the spec's "path must match" check would then have
+  failed on real sessions.
+- The Claude Code and Codex readers now fill `tool_name`, `tool_input` and
+  `tool_result` (one message per record still, so manifest counts do not
+  move). Scans read the first prompt and the last event time from the tail.
+- Manifest rows carry `kind`, `entry`, `created_file`, plus two flags the spec
+  did not name: `created_parent` (install created `mcpServers`/`mcp`/
+  `[mcp_servers]`) and `blank_before` (the file was empty). Both are needed for
+  uninstall to leave each file byte identical.
+- Write back recognises turns it wrote by recorded id and by a content
+  fingerprint (text and tool fields, not time: OpenCode and Antigravity shift
+  times to keep order). The lock is only taken when there is something to
+  write, so a server start with nothing to do touches no file.
+- Into OpenCode and Antigravity, tool calls are written as text turns, not in
+  the tool's own tool shape, which agentbridge cannot validate offline.
+- OpenCode ids for appended messages extend the session's current highest id
+  (`<max>_ab<n><hash>`), so they sort after every existing message and before
+  any id OpenCode makes later.
+
+Not verified against the real tools (build plan steps 2, 5, 10, 12, 13, 16):
+which settings file Antigravity reads; how Codex names an MCP call in its
+rollout (detection matches any tool name containing `agentbridge` and ending
+in `read_session`); that each tool opens an origin with appended turns
+(Claude Code with the extra `agentbridge` field, Codex with both views, OpenCode
+with the new ids, agy with appended steps). Antigravity continuations are not
+detected yet: its reader does not decode tool calls (step 11).
+
+Found by running against copies of the real stores and settings files
+(2026-10-30), each fixed with a regression test:
+- Old `sync` copies whose manifest rows were lost were listed as the user's
+  own: Codex copies (recognised by the `-<8 hex>` folder tag in the file
+  name) and OpenCode copies that OpenCode had retitled (recognised by the
+  marker in the row's metadata). 16 of the 25 newest OpenCode sessions were
+  copies.
+- OpenCode tool output sat inside `tool_input`; it is now `tool_result`.
+- A trailing comma and blank lines in `opencode.jsonc` did not survive
+  install then uninstall. Install now records the exact text span it replaced
+  and uninstall swaps it back, falling back to the structural edit only when
+  the tool has rewritten the file since.
+- A backup of a JSONL origin named `….jsonl` was listed as a second session
+  by both readers (and would be by Codex and Claude Code). Session backups
+  are now `<name>.jsonl.agentbridge-backup-<stamp>`.
+- Codex's `threads` row is matched by thread id as well as path.
+
+Checked live (2026-10-30, sandbox copies of the real stores, real tool
+binaries):
+- Claude Code (`claude -p`, Haiku): the AI found a Codex session from another
+  folder with `list_sessions` and summed it up from `read_session` (AC-16).
+  Resuming a Claude Code origin that had turns written back, it quoted a
+  codeword that only the written turns held (AC-25).
+- Antigravity (`agy -p --conversation`): quoted the codeword from turns
+  written back into one of its conversations (AC-25). agy reads MCP servers
+  from `~/.gemini/config/mcp_config.json` (named in its binary; a live run
+  started agentbridge from it), so install now writes there (step 5). In print
+  mode agy soft-denies MCP calls unless tools are approved.
+- OpenCode (`opencode export`, `opencode run`): reads the written turns and
+  sends the session to its model like an untouched one; the answer itself was
+  not seen because the machine's OpenCode API key has expired.
+
+Found by the live runs and fixed:
+- Claude Code stops its MCP servers with SIGINT, then SIGTERM, then a kill,
+  so the server never reached its end of input write back. Write back now
+  runs in a helper process (`mcp writeback --after-server`, own process
+  group) that writes once at start and again after the server is gone, which
+  it learns from a pipe that closes however the server ends. The server
+  itself writes nothing.
+- OpenCode ids for appended messages grew longer with every turn; each now
+  extends the session's original last id.
+- The Antigravity reader now reads tool call steps, so a session continued in
+  Antigravity is detected (step 11).
+
+Real run on the operator's machine (2026-10-30, after `mcp install` there:
+hook removed, 284 copies removed, three databases backed up first). One new
+session per tool under `~/agentbridge-livetest/`, each holding a codeword:
+- Claude Code (`claude -p`) found and read the Codex, OpenCode and agy
+  sessions; Codex (`codex exec`) found and read the Claude Code, OpenCode and
+  agy sessions.
+- Write back on its own after each run: resuming the Codex origin, Codex
+  listed `BIRCH-2, CLAUDE-ON-BIRCH`; resuming the agy origin, agy listed
+  `DELTA-4, CLAUDE-ON-DELTA, CODEX-ON-DELTA`.
+- Held back by the gates, as designed: the Claude Code origin (Claude Code was
+  running) and the OpenCode origin (OpenCode was open).
+- Not run: OpenCode as the continuing tool (its API key has expired, every
+  model fails) and agy as the continuing tool (print mode denies MCP calls
+  without a `permissions.allow` rule).
+
+Found by the real run and fixed:
+- Codex starts MCP servers with a trimmed environment, so
+  `CLAUDE_CONFIG_DIR` never reached the server and every Claude Code session
+  vanished from Codex. Install now writes the store variables set at install
+  time (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_DATA_HOME`,
+  `ANTIGRAVITY_HOME`, `AGENTBRIDGE_DATA_DIR`) into each entry (`env`, or
+  `environment` for OpenCode).
+- Codex 0.146 calls MCP tools from its `exec` code tool and logs them as
+  `event_msg` `mcp_tool_call_end`. The reader now reads those, and names the
+  `exec` call after the MCP tool it runs, so a Codex continuation is detected
+  and the code tool's output (the whole origin) is never written back.
+- The migration deleted copies from OpenCode's, Codex's and agy's databases
+  without a backup (the old `unsync` path); it now backs each one up first.
+- `codex exec` cancels MCP calls (`approval: never`); in a script pass
+  `-c 'mcp_servers.agentbridge.default_tools_approval_mode="approve"'`.
+
+Tests 188 → 237.
