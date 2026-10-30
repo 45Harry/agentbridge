@@ -7,9 +7,9 @@ conversation in Claude Code and continue it in Codex, OpenCode or Antigravity,
 from any directory.
 
 Each tool only lists the sessions it started itself, in the directory you
-launched it from. agentbridge makes every session show up in every tool, and
-shares new work back across all of them. Your tools' own session files are
-never modified.
+launched it from. agentbridge runs as a small MCP server inside every tool, so
+the AI in any tool, in any folder, can find a session from any other tool and
+read it straight from the original files. Nothing is copied.
 
 ## Install
 
@@ -20,38 +20,65 @@ pipx install agentbridge-rs     # or: uv tool install agentbridge-rs
 Or with Cargo: `cargo install --git https://github.com/45Harry/agentbridge`.
 The command is `agentbridge` either way. Linux, macOS and Windows.
 
-## Quick start
+## Set up
+
+Close your AI tools, then:
 
 ```bash
-agentbridge init          # see which sessions are on this machine (read only)
-agentbridge auto install  # share new and changed sessions in every new terminal
-agentbridge sync          # make this directory's sessions visible in all tools
+agentbridge mcp install --dry-run   # see what would change
+agentbridge mcp install
 ```
 
-Then resume any session in the tool you like:
+This adds one `agentbridge` entry to each detected tool's MCP settings
+(`~/.claude.json`, `~/.codex/config.toml`, OpenCode's `opencode.json[c]`,
+Antigravity's `mcp_config.json`), keeping every other line, comment and
+setting as it was, with a backup next to each file. A tool that is open is
+skipped and named; run the command again after closing it.
 
-```bash
-claude --resume <id>
-codex resume <id>
-agentbridge resume <id> opencode
-agentbridge resume <id> antigravity
-```
+If you used an older agentbridge, install first recovers any new turns from
+its copies (`pull`), then removes the shell hook and every copy it made.
 
-Every command that writes accepts `--dry-run`. `agentbridge unsync` removes
-exactly what agentbridge created and nothing else.
+The entry holds the binary's full path, so **run `agentbridge mcp install`
+again after upgrading or moving agentbridge**. Undo with
+`agentbridge mcp uninstall` (or `agentbridge unsync`, which removes everything
+agentbridge created).
+
+## Use it
+
+Open any tool, in any folder, and ask in plain words:
+
+> Find my Claude session about the checkout page and continue it.
+
+The AI calls `list_sessions` (sessions of the current folder first, then every
+other folder; searchable by title, first message, folder, tool and id) and
+`read_session` (page 1 is the newest 40 messages; it can page back further).
+
+When you continue a session in another tool, agentbridge adds those new turns
+to the end of the original session, in its own tool, under a note
+"continued in <tool> on <date>". This write back runs on its own when a tool
+starts or closes agentbridge's server, and only while the origin's tool is
+closed (with any Claude Code window open, Claude sessions wait). Run it by hand
+with `agentbridge mcp writeback --dry-run`.
+
+**What the server can see:** every session of every tool for your user, in
+every folder, returned as stored (no redaction). Whatever the AI reads goes to
+that tool's AI provider. Antigravity tool calls come back without their
+output.
 
 ## Commands
 
 | Command | What it does |
 | --- | --- |
+| `mcp install` / `uninstall` | Set up (or remove) the MCP server in every detected tool |
+| `mcp` | The MCP server itself (the tools start it; you don't need to) |
+| `mcp writeback` | Add continued work to the end of the origin session |
 | `init`, `ls`, `info` | Discover and list sessions and detected tools (read only) |
-| `status` | Show which synced copies have new work |
-| `sync` | Make every session in this directory visible in every tool |
-| `pull` | Bring back turns and renames made in any tool |
-| `resume <id> <tool>` | Copy one session into one tool |
+| `resume <id> <tool>` | Copy one session into one tool, for a true native resume |
 | `inject <tool> <ids...>`, `start <tool>` | Start a tool with context from other sessions |
-| `auto install` / `uninstall` / `watch` | Shell hook, or a daemon that re-syncs on change |
-| `unsync` | Remove what agentbridge created (`--project`, `--session` to narrow) |
+| `unsync` | Remove everything agentbridge created |
+| `sync`, `pull`, `status`, `auto` | The old copy based sync. Replaced by `mcp install`; removed in the next release |
+
+Every command that writes accepts `--dry-run`.
 
 ## Supported tools
 
@@ -62,11 +89,8 @@ exactly what agentbridge created and nothing else.
 | OpenCode | `~/.local/share/opencode/opencode.db` | yes | yes\* |
 | Antigravity | `~/.gemini/antigravity-*/` | yes | yes\* |
 
-\* Shared databases: agentbridge backs them up first, tags its own rows, and
-won't write while the tool is open.
-
-Copies are titled `origin tool · session name · start time · id`, so one
-conversation is easy to spot in every tool's list.
+\* Write back into a shared database: agentbridge backs it up first, records
+every row it adds, and won't write while the tool is open.
 
 ## More
 

@@ -212,6 +212,9 @@ fn scan_codex_file(path: &Path) -> ConnectorResult<Option<RawSession>> {
         .to_string();
 
     let reader = BufReader::new(file);
+    let mut found: Option<RawSession> = None;
+    let mut first_prompt: Option<String> = None;
+    let mut after_head = 0usize;
 
     for line_result in reader.lines() {
         let line = match line_result {
@@ -230,6 +233,24 @@ fn scan_codex_file(path: &Path) -> ConnectorResult<Option<RawSession>> {
         };
 
         let event_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        if found.is_some() {
+            // Past the head record: look a little further for the first thing
+            // a person typed. Only the screen's view (`event_msg`
+            // `user_message`) is used: the model's view (`response_item`)
+            // also carries injected AGENTS.md text that no tag marks as
+            // bookkeeping.
+            if first_prompt.is_none() {
+                first_prompt = codex_user_text(event_type, &val)
+                    .as_deref()
+                    .and_then(crate::label::prompt_preview);
+            }
+            after_head += 1;
+            if first_prompt.is_some() || after_head >= SCAN_HEAD_LINES {
+                break;
+            }
+            continue;
+        }
 
         match event_type {
             "session_meta" => {
@@ -253,7 +274,7 @@ fn scan_codex_file(path: &Path) -> ConnectorResult<Option<RawSession>> {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
 
-                return Ok(Some(RawSession {
+                found = Some(RawSession {
                     id,
                     provider: "codex-cli".to_string(),
                     project_path: cwd,
@@ -263,7 +284,8 @@ fn scan_codex_file(path: &Path) -> ConnectorResult<Option<RawSession>> {
                     source,
                     source_path: path.to_path_buf(),
                     body_available: true,
-                }));
+                    first_prompt: None,
+                });
             }
             "conversation" => {
                 let id = val
@@ -277,7 +299,7 @@ fn scan_codex_file(path: &Path) -> ConnectorResult<Option<RawSession>> {
                 let timestamp = parse_codex_timestamp(val.get("created_at"));
                 let title = val.get("title").and_then(|v| v.as_str()).map(|s| s.to_string());
 
-                return Ok(Some(RawSession {
+                found = Some(RawSession {
                     id,
                     provider: "codex-cli".to_string(),
                     project_path: cwd,
@@ -287,13 +309,46 @@ fn scan_codex_file(path: &Path) -> ConnectorResult<Option<RawSession>> {
                     source: None,
                     source_path: path.to_path_buf(),
                     body_available: true,
-                }));
+                    first_prompt: None,
+                });
             }
             _ => continue,
         }
     }
 
-    Ok(None)
+    let Some(mut raw) = found else {
+        return Ok(None);
+    };
+    raw.first_prompt = first_prompt;
+    // The last event, from the file's tail (the head only dates the start).
+    raw.last_event_at = crate::connectors::tail_records(path)
+        .iter()
+        .find_map(|v| {
+            parse_codex_timestamp(v.get("timestamp"))
+                .or_else(|| parse_codex_timestamp(v.get("created_at")))
+        })
+        .or(raw.last_event_at);
+    Ok(Some(raw))
+}
+
+/// Records a scan reads past the head record while looking for the first
+/// prompt.
+const SCAN_HEAD_LINES: usize = 50;
+
+/// The text of a user turn as Codex's screen shows it, or the fixture
+/// format's `user_turn`.
+fn codex_user_text(event_type: &str, val: &Value) -> Option<String> {
+    let p = val.get("payload");
+    match event_type {
+        "event_msg" => {
+            let p = p?;
+            (p.get("type").and_then(|v| v.as_str()) == Some("user_message"))
+                .then(|| p.get("message").and_then(|v| v.as_str()).map(str::to_string))
+                .flatten()
+        }
+        "user_turn" => extract_cx_content_flexible(val),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -396,6 +451,16 @@ fn extract_cx_content_flexible(val: &Value) -> Option<String> {
     val.get("content").and_then(|v| v.as_str()).map(|s| s.to_string())
 }
 
+/// The MCP tool a Codex code tool call runs: the first
+/// `tools.mcp__<server>__<tool>(` in its source.
+fn mcp_tool_in_code(code: &str) -> Option<String> {
+    let start = code.find("tools.mcp__")? + "tools.".len();
+    let rest = &code[start..];
+    let end = rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))?;
+    let name = &rest[..end];
+    (rest[end..].starts_with('(') && name.matches("__").count() >= 2).then(|| name.to_string())
+}
+
 /// Read a session from an explicit path rather than by id.
 ///
 /// Used by write-back to re-read a file agentbridge materialized (which lives
@@ -422,6 +487,9 @@ fn load_from_path(path: &Path, id: &str) -> ConnectorResult<Session> {
     // session Codex owns (`label::is_copy`).
     let mut meta_payload = serde_json::Value::Null;
     let mut ordinal: u64 = 0;
+    // `call_id` -> tool name, so an output can name the call it answers.
+    let mut call_names: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
 
     for line_result in reader.lines() {
         let line = match line_result {
@@ -476,6 +544,38 @@ fn load_from_path(path: &Path, id: &str) -> ConnectorResult<Session> {
                 }
             }
             "event_msg" => {
+                // An MCP call as Codex logs it once it ends: the server, tool,
+                // arguments and result, whatever the model used to make it.
+                if let Some(p) = payload
+                    && p.get("type").and_then(|v| v.as_str()) == Some("mcp_tool_call_end")
+                    && let Some(inv) = p.get("invocation")
+                {
+                    let server = inv.get("server").and_then(|v| v.as_str()).unwrap_or_default();
+                    let tool = inv.get("tool").and_then(|v| v.as_str()).unwrap_or_default();
+                    let result = p.get("result").and_then(|r| r.get("Ok").or_else(|| r.get("Err"))).map(|r| {
+                        r.get("content")
+                            .and_then(|c| c.as_array())
+                            .map(|blocks| {
+                                Value::String(
+                                    blocks.iter().filter_map(|b| b.get("text").and_then(|t| t.as_str())).collect::<Vec<_>>().join("\n"),
+                                )
+                            })
+                            .unwrap_or_else(|| r.clone())
+                    });
+                    messages.push(Message {
+                        session_id: id.to_string(),
+                        ordinal,
+                        role: Role::Tool,
+                        timestamp,
+                        text: None,
+                        tool_name: Some(format!("mcp__{}__{}", server, tool)),
+                        tool_input: inv.get("arguments").cloned(),
+                        tool_result: result,
+                        parent_ordinal: None,
+                    });
+                    ordinal += 1;
+                    continue;
+                }
                 if let Some(p) = payload {
                     // The head-scan preview echo (`payload.message` as a plain
                     // string, type `user_message`) duplicates the response_item
@@ -507,18 +607,53 @@ fn load_from_path(path: &Path, id: &str) -> ConnectorResult<Session> {
             }
             "response_item" => {
                 if let Some(p) = payload {
+                    let item_type = p.get("type").and_then(|v| v.as_str()).unwrap_or("");
                     let role = p.get("role").and_then(|v| v.as_str()).unwrap_or("assistant");
                     let content = extract_cx_content_flexible(&val);
-                    let role_enum = if role == "user" { Role::User } else { Role::Assistant };
+                    let call_id = p.get("call_id").and_then(|v| v.as_str());
+                    // Tool calls and their outputs are response items of their
+                    // own, paired by `call_id`. `function_call` carries its
+                    // arguments as a JSON string; `custom_tool_call` (patches)
+                    // carries raw `input` text.
+                    let (role_enum, tool_name, tool_input, tool_result) = match item_type {
+                        "function_call" | "custom_tool_call" => {
+                            let mut name = p.get("name").and_then(|v| v.as_str()).map(str::to_string);
+                            // Codex 0.146 calls MCP tools from a code tool:
+                            // `exec` with `tools.mcp__<server>__<tool>(...)`.
+                            // Named after the MCP tool it runs, so the call
+                            // and its output are known for what they are.
+                            if let Some(inner) = p.get("input").and_then(|v| v.as_str()).and_then(mcp_tool_in_code) {
+                                name = Some(inner);
+                            }
+                            if let (Some(cid), Some(n)) = (call_id, &name) {
+                                call_names.insert(cid.to_string(), n.clone());
+                            }
+                            let input = p
+                                .get("arguments")
+                                .or_else(|| p.get("input"))
+                                .map(|a| match a.as_str() {
+                                    Some(text) => serde_json::from_str(text)
+                                        .unwrap_or_else(|_| Value::String(text.to_string())),
+                                    None => a.clone(),
+                                });
+                            (Role::Assistant, name, input, None)
+                        }
+                        "function_call_output" | "custom_tool_call_output" => {
+                            let name = call_id.and_then(|cid| call_names.get(cid).cloned());
+                            (Role::Tool, name, None, p.get("output").cloned())
+                        }
+                        _ if role == "user" => (Role::User, None, None, None),
+                        _ => (Role::Assistant, None, None, None),
+                    };
                     let m = Message {
                         session_id: id.to_string(),
                         ordinal,
                         role: role_enum,
                         timestamp,
                         text: content,
-                        tool_name: None,
-                        tool_input: None,
-                        tool_result: None,
+                        tool_name,
+                        tool_input,
+                        tool_result,
                         parent_ordinal: None,
                     };
                     messages.push(m);

@@ -8,7 +8,10 @@ The whole crate. The library (`lib.rs` and the modules it lists) does discovery,
 
 | File | Owns |
 |---|---|
-| `main.rs` | clap CLI: `ls`, `index`, `init`, `sync`, `pull`, `auto`, `status`, `unsync`, `resume`, `inject`, `start`, `info`, `tui` |
+| `main.rs` | clap CLI: `ls`, `index`, `init`, `mcp` (+ `install`, `uninstall`, `writeback`), `sync`, `pull`, `auto`, `status`, `unsync`, `resume`, `inject`, `start`, `info`, `tui` |
+| `mcp.rs` | The MCP server: JSON-RPC over stdio, `list_sessions`, `read_session`, copy filter, id resolution |
+| `mcp_install.rs` | `mcp install`/`uninstall`: settings editors per tool, backups, checked atomic writes, migration off copies |
+| `writeback.rs` | Detects continuations (`read_session` calls) and appends their turns to the origin chain; undo for `unsync` |
 | `index.rs` | Discovery. Metadata plus a pointer to the source file, never a copy of the body |
 | `sync.rs` | Cache, hardlink fan out, manifest, `sync_into`, `pull_back`, `status`, `unsync` |
 | `convert.rs` | Writers for the Claude Code and Codex file formats, plus the brief builder |
@@ -34,6 +37,8 @@ The whole crate. The library (`lib.rs` and the modules it lists) does discovery,
 
 ## Gotchas
 
+- Manifest rows have a `kind` (`session`, `mcp-config`, `writeback`). `read_manifest()` returns session rows only; anything that rewrites the manifest goes through `write_session_rows` or `write_manifest_kind`, which keep the other kinds.
+- Nothing but protocol messages may reach stdout while `agentbridge mcp` runs. Log with `eprintln!`.
 - Generated JSONL must end with a newline. Without it, the tool's next record is appended onto the last line and corrupts the session.
 - Never `fs::copy` onto a destination that already shares the source's inode. It truncates the file before reading it.
 - Files agentbridge wrote must never be picked up as source sessions. The manifest marks them, and it keeps only the last row per destination.

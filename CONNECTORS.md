@@ -487,3 +487,91 @@ Run against an isolated copy (`HOME`, `ANTIGRAVITY_HOME`,
 5. Three further `sync` passes left the count at 26 — no feedback loop.
 6. `unsync` returned the store to exactly 12 bodies / 102 rows; all 12 original
    bodies byte-identical (`cmp`), recovered work preserved in the overlay.
+
+## 8. What a scan reads for the MCP server (spec 0001, 2026-10-30)
+
+`list_sessions` searches each session's first prompt and sorts by its last
+event, so `scan()` now reads a little more than the first record. All of it
+is still read only and cheap; a body is never read in full during a scan.
+
+| Tool | `first_prompt` source | `last_event_at` source |
+|---|---|---|
+| Claude Code | First `user` record that is not `isMeta` and whose text is not bookkeeping (`label::prompt_preview`), reading up to 50 records past `cwd` | Last `timestamp` in the file's final 64 KB (`connectors::tail_records`) |
+| Codex | First `event_msg` with `payload.type = "user_message"` (the screen's view), up to 50 records past `session_meta`. The model's view (`response_item` role `user`) is skipped: it also holds the injected `# AGENTS.md instructions` text, which carries no tag that marks it as bookkeeping | Last `timestamp` in the final 64 KB |
+| OpenCode | One query per session: the first 5 `text` parts of `user` messages, ordered by `message.time_created`; the first that is not bookkeeping | `session.time_updated` (unchanged) |
+| Antigravity | The first step of type 14 (user turn) among the first 20, text from `payload.19.2` | Last step's time (unchanged) |
+
+The preview is cut to 300 Unicode characters. Every read only SQLite open in
+`src/connectors/` goes through `connectors::open_read_only`, which waits up to
+2 seconds (`busy_timeout`) for a tool that is writing.
+
+Tool calls, now filled by `load()` (one message per record, so counts are
+unchanged):
+
+- **Claude Code**: an `assistant` record's first `tool_use` block gives
+  `tool_name` (`name`) and `tool_input` (`input`). A `user` record holding a
+  `tool_result` block and no text becomes `Role::Tool`, with `tool_result`
+  from the block's `content` and `tool_name` looked up by `tool_use_id`.
+- **Codex**: `response_item` of type `function_call` or `custom_tool_call`
+  gives `tool_name` (`name`) and `tool_input` (`arguments` parsed from its JSON
+  string, else `input` as text). `function_call_output` and
+  `custom_tool_call_output` become `Role::Tool` with `tool_result` from
+  `output` and `tool_name` looked up by `call_id`.
+- **OpenCode**: a `tool` part keeps call and result together; `tool_input`
+  is `state.input`, `tool_result` is `state.output` (or `state.error`).
+- **Antigravity** (agy 1.2.17, read off a real conversation 2026-10-30): a
+  tool call is a step (type 132) whose `.5.4` holds the call id (`.5.4.1`),
+  the tool name (`.5.4.2`) and the arguments as a JSON string (`.5.4.3`). An
+  MCP call is `call_mcp_tool` with `{"ServerName","ToolName","Arguments"}`,
+  read as `mcp__<server>__<tool>` with `Arguments` as the input. Only finished
+  steps (status 3) are read, so a call print mode denied (status 7) is not.
+  The output is not decoded yet.
+
+Not yet checked against a live tool: how an MCP call to agentbridge itself is
+named in each transcript (build plan step 12).
+
+## 9. MCP settings and write back formats (spec 0001, 2026-10-30)
+
+**How an MCP call to agentbridge appears in a transcript (build plan step
+12).** Claude Code (checked live 2026-10-30): `mcp__agentbridge__read_session`,
+arguments as the `tool_use` block's `input`, the result as a `tool_result`
+block whose `content` is the JSON text. Antigravity (checked live): a step
+of type 132 with `call_mcp_tool`, see §8. OpenCode keeps a tool
+call and its result in one part: `{"type":"tool","tool":"agentbridge_read_session",
+"state":{"input":{...},"output":...}}` (expected; not yet seen live). Codex: no
+rollout on this machine holds an MCP call, so the name is not confirmed; the
+detector matches any tool name containing `agentbridge` and ending in
+`read_session`. Record the real names here after the live check.
+
+**Settings files `mcp install` edits.**
+
+| Tool | File | Entry |
+|---|---|---|
+| Claude Code | `$CLAUDE_CONFIG_DIR/.claude.json`, else `~/.claude.json` | `mcpServers.agentbridge = {"type":"stdio","command":"<abs>","args":["mcp"]}` |
+| Codex | `$CODEX_HOME/config.toml`, else `~/.codex/config.toml` | `[mcp_servers.agentbridge]` `command`, `args = ["mcp"]` |
+| OpenCode | `$XDG_CONFIG_HOME/opencode/opencode.jsonc`, else `opencode.json` there | `mcp.agentbridge = {"type":"local","command":["<abs>","mcp"],"enabled":true}` |
+| Antigravity | `~/.gemini/config/mcp_config.json` (verified: agy 1.2.17 names this path, and a live run started the server from it; the IDE's `~/.gemini/antigravity/mcp_config.json` is a symlink to it) | `mcpServers.agentbridge = {"command":"<abs>","args":["mcp"]}` |
+
+**Write back, per origin tool.** Every appended turn opens with a note turn
+("continued in <tool> on <date>") and carries agentbridge's marker.
+
+- **Claude Code**: whole records appended to the session file (a newline added
+  first if the last line had none). `uuid` is a v5 id, `parentUuid` chains onto
+  the file's last record, `sessionId`, `cwd`, `version`, `gitBranch` and the
+  model are taken from the file's tail. Extra field
+  `"agentbridge": {"writeback_of": "<tool>:<id>", "id": "<uuid>"}`.
+- **Codex**: `response_item` records, plus `event_msg` `user_message` /
+  `agent_message` for each turn that says something (both views), each with the
+  same `agentbridge` field. Then `threads.updated_at` (and `updated_at_ms`) for
+  that `rollout_path` is moved forward in `$CODEX_HOME/state_5.sqlite`.
+- **OpenCode**: one `message` and one `text` `part` per turn. Message ids
+  extend the session's highest id (`<max>_ab<nnnn><8 hex>`); the marker sits
+  in the message `data`. Tool calls are written as text. `session.time_updated`
+  moves forward.
+- **Antigravity**: steps appended to the conversation body (`idx` = max + 1),
+  type 14 for user turns and 15 otherwise, encoded by
+  `antigravity_write::encode_step`. Tool calls as text.
+
+`unsync` removes the records whose marker id, or the rows whose id, a
+`writeback` manifest row lists, and takes back the newline it added when
+nothing else follows it.
