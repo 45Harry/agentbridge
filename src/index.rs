@@ -23,6 +23,8 @@ pub struct IndexEntry {
     pub title: Option<String>,
     /// See `RawSession::source`.
     pub source: Option<String>,
+    /// See `RawSession::first_prompt`.
+    pub first_prompt: Option<String>,
 }
 
 /// Result of a discovery pass.
@@ -80,6 +82,7 @@ pub fn discover(registry: &Registry) -> Index {
                             last_event_at: raw.last_event_at,
                             title: raw.title,
                             source: raw.source,
+                            first_prompt: raw.first_prompt,
                         }),
                         // A single malformed session is recorded and skipped;
                         // the rest of the scan continues.

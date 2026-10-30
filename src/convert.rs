@@ -555,7 +555,7 @@ fn dir_tag(cwd: &str) -> String {
 }
 
 /// Remove a trailing `-<8 hex>` dir tag from a rollout stem, if present.
-fn strip_dir_tag(stem: &str) -> &str {
+pub(crate) fn strip_dir_tag(stem: &str) -> &str {
     if stem.len() > 9 {
         let (base, tail) = stem.split_at(stem.len() - 9);
         if tail.starts_with('-') && tail[1..].chars().all(|c| c.is_ascii_hexdigit()) {
@@ -599,7 +599,7 @@ impl SessionConverter for OpenCodeConverter {
 /// Claude Code / Codex write timestamps in the `...Z` millisecond form
 /// (`2026-07-15T04:01:37.079Z`), not the `+00:00` offset form that
 /// `to_rfc3339()` produces.
-fn format_timestamp_z(ts: Option<DateTime<Utc>>) -> Value {
+pub(crate) fn format_timestamp_z(ts: Option<DateTime<Utc>>) -> Value {
     match ts {
         Some(dt) => Value::String(dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()),
         None => Value::String(Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()),
@@ -619,7 +619,7 @@ fn merge(base: Value, extra: Value) -> Value {
 
 /// Tool results are rendered as text; a raw JSON value is stringified rather
 /// than nested, matching how Claude Code stores tool_result content.
-fn tool_result_text(v: Option<&Value>) -> String {
+pub(crate) fn tool_result_text(v: Option<&Value>) -> String {
     match v {
         Some(Value::String(s)) => s.clone(),
         Some(other) => serde_json::to_string(other).unwrap_or_default(),

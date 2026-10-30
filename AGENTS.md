@@ -22,6 +22,10 @@ cargo build
 # Run (bare `cargo run` opens the dashboard; `init` is read only discovery)
 cargo run -- init
 
+# The MCP server, and its setup (close the tools first)
+cargo run -- mcp
+cargo run -- mcp install --dry-run
+
 # Test
 cargo test
 
@@ -43,8 +47,8 @@ Stored in `docs/specs/`. Format: `docs/specs/NNNN-title.md`. Older design record
 
 ## Rules
 
-- A tool's own session files are never changed. New turns are recovered into an overlay that agentbridge owns (`~/.agentbridge/overlay`).
-- agentbridge keeps no copy of any session. A converted session is written straight into the target tool's own store and nowhere else; `~/.agentbridge` holds only the manifest, the overlay of recovered turns, and small state files.
+- A tool's own session messages are never changed or removed. agentbridge only adds write back turns at the end (`src/writeback.rs`), records each one, backs up first, and never writes while that tool is open. Turns recovered by the old `pull` live in an overlay agentbridge owns (`~/.agentbridge/overlay`).
+- agentbridge writes no copy of a session. Sessions are read live through the MCP server (`agentbridge mcp`); `resume` is the one command that still makes a copy. `~/.agentbridge` holds only the manifest, the overlay of recovered turns, and small state files.
 - Sync must be idempotent and deterministic. Ids are UUID v5 of the source id and paths come from the session's own start time. No random ids and no `Utc::now()` in names.
 - Everything agentbridge creates goes in the manifest, so `unsync` removes exactly that. Never `rm -rf ~/.agentbridge`; run `agentbridge unsync`.
 - Every command that writes supports `--dry-run`.

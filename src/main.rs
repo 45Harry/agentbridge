@@ -165,6 +165,42 @@ enum Commands {
     /// Show information about detected connectors
     #[command(name = "info")]
     Info,
+
+    /// Run the MCP server over stdio, so the AI in any tool can list and read
+    /// every session on this machine
+    #[command(name = "mcp")]
+    Mcp {
+        #[command(subcommand)]
+        action: Option<McpAction>,
+    },
+}
+
+#[derive(Subcommand)]
+enum McpAction {
+    /// Set up the MCP server in every detected tool (and move off copy
+    /// based sync: pull, then remove the shell hook and every copy)
+    Install {
+        /// Show what would change without writing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Remove exactly the MCP entries `mcp install` added
+    Uninstall {
+        /// Show what would be removed without writing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Add turns made in a continuation to the end of the session it
+    /// continued (runs on its own when `agentbridge mcp` starts and stops)
+    Writeback {
+        /// Show what would be written and where, without writing
+        #[arg(long)]
+        dry_run: bool,
+        /// Internal: the helper `agentbridge mcp` starts (write back now,
+        /// then again once the server that started it has ended)
+        #[arg(long, hide = true, conflicts_with = "dry_run")]
+        after_server: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -193,9 +229,27 @@ enum AutoAction {
     },
 }
 
+/// Printed by the copy based commands, which `mcp install` replaces.
+fn deprecated(command: &str) {
+    eprintln!(
+        "note: `agentbridge {}` is replaced by `agentbridge mcp install` and will be removed in the next release",
+        command
+    );
+}
+
 fn main() {
     let cli = Cli::parse();
     let registry = connectors::all();
+    match &cli.command {
+        Some(Commands::Sync { changed: false, .. }) => deprecated("sync"),
+        // The shell hook runs `sync --changed` in every new terminal; one
+        // line there would be noise in every shell. Its note is on `auto`.
+        Some(Commands::Sync { changed: true, .. }) => {}
+        Some(Commands::Pull { .. }) => deprecated("pull"),
+        Some(Commands::Status) => deprecated("status"),
+        Some(Commands::Auto { .. }) => deprecated("auto"),
+        _ => {}
+    }
 
     match cli.command {
         None => {
@@ -246,7 +300,215 @@ fn main() {
         Some(Commands::Status) => cmd_status(),
         Some(Commands::Unsync { dry_run, project, session }) => cmd_unsync(dry_run, project, session),
         Some(Commands::Info) => cmd_info(&registry),
+        Some(Commands::Mcp { action: None }) => cmd_mcp(),
+        Some(Commands::Mcp { action: Some(McpAction::Install { dry_run }) }) => cmd_mcp_install(&registry, dry_run),
+        Some(Commands::Mcp { action: Some(McpAction::Uninstall { dry_run }) }) => cmd_mcp_uninstall(dry_run),
+        Some(Commands::Mcp { action: Some(McpAction::Writeback { after_server: true, .. }) }) => cmd_writeback_after_server(&registry),
+        Some(Commands::Mcp { action: Some(McpAction::Writeback { dry_run, .. }) }) => cmd_mcp_writeback(&registry, dry_run),
     }
+}
+
+fn cmd_mcp_install(registry: &agentbridge::connector::Registry, dry_run: bool) {
+    use agentbridge::mcp_install::{display_name, Action};
+    let exe = match std::env::current_exe().and_then(std::fs::canonicalize) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("cannot find this binary's path: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let report = agentbridge::mcp_install::install(registry, &exe, dry_run, &agentbridge::mcp_install::tool_is_open);
+    let tag = if dry_run { "[dry-run] " } else { "" };
+    let would = |done: &str, will: &str| if dry_run { will.to_string() } else { done.to_string() };
+
+    let m = &report.migration;
+    if m.pulled > 0 {
+        println!("{}{} {} turn(s) from copies into the overlay", tag, would("recovered", "would recover"), m.pulled);
+    }
+    if let Some(rc) = &m.hook_removed {
+        println!("{}{} the shell hook from {}", tag, would("removed", "would remove"), rc.display());
+    }
+    for db in &m.backups {
+        println!("backed up {} first", db.display());
+    }
+    if m.copies_removed > 0 {
+        println!("{}{} {} session copies agentbridge made", tag, would("removed", "would remove"), m.copies_removed);
+    }
+    if m.copies_kept > 0 {
+        println!("kept {} copies a tool has since replaced", m.copies_kept);
+    }
+    if let Some(why) = &report.stopped {
+        eprintln!("Stopped: {}", why);
+        std::process::exit(1);
+    }
+    let mut retry = Vec::new();
+    for t in &report.tools {
+        let name = display_name(&t.tool);
+        let detail = t.detail.replace('\n', "\n               ");
+        let t = agentbridge::mcp_install::ToolOutcome { detail, ..t.clone() };
+        let t = &t;
+        match t.action {
+            Action::Added => println!("{}{:<12} {} {}
+               {}", tag, name, would("added to", "would add to"), t.file.display(), t.detail),
+            Action::Updated => println!("{}{:<12} {} {}
+               {}", tag, name, would("updated agentbridge's entry in", "would update agentbridge's entry in"), t.file.display(), t.detail),
+            Action::Unchanged => println!("{:<12} already set up in {}", name, t.file.display()),
+            Action::SkippedNotDetected => {}
+            Action::SkippedOpen => {
+                println!("{:<12} skipped: {}", name, t.detail);
+                retry.push(name);
+            }
+            _ => println!("{:<12} skipped ({}): {}", name, t.file.display(), t.detail),
+        }
+    }
+    if !retry.is_empty() {
+        println!();
+        println!("Close {} and run `agentbridge mcp install` again to set {} up.", retry.join(", "), if retry.len() == 1 { "it" } else { "them" });
+    } else if !dry_run {
+        println!();
+        println!("Done. Restart your tools, then ask the AI to list your sessions (it calls list_sessions).");
+        println!("Undo: agentbridge mcp uninstall. Run install again after upgrading or moving agentbridge.");
+    }
+}
+
+fn cmd_mcp_uninstall(dry_run: bool) {
+    use agentbridge::mcp_install::display_name;
+    let report = agentbridge::mcp_install::uninstall(dry_run, &agentbridge::mcp_install::tool_is_open);
+    if let Some(why) = &report.stopped {
+        eprintln!("Stopped: {}", why);
+        std::process::exit(1);
+    }
+    if report.removed.is_empty() && report.kept.is_empty() {
+        println!("Nothing to remove: agentbridge added no MCP entries.");
+        return;
+    }
+    let tag = if dry_run { "[dry-run] would remove" } else { "removed" };
+    for t in &report.removed {
+        println!("{} the entry from {} ({})", tag, t.file.display(), display_name(&t.tool));
+    }
+    for t in &report.kept {
+        println!("kept {} ({}): {}", t.file.display(), display_name(&t.tool), t.detail);
+    }
+}
+
+fn cmd_mcp_writeback(registry: &agentbridge::connector::Registry, dry_run: bool) {
+    let report = agentbridge::writeback::run(registry, dry_run, &agentbridge::mcp_install::tool_is_open);
+    print_writeback(&report, &mut std::io::stdout());
+    if report.written.is_empty() && report.waiting.is_empty() && report.errors.is_empty() && !report.busy {
+        println!("Nothing to write back: no session continued another one since the last run.");
+    }
+}
+
+fn print_writeback(report: &agentbridge::writeback::WritebackReport, out: &mut dyn std::io::Write) {
+    use agentbridge::mcp_install::display_name;
+    if report.busy {
+        let _ = writeln!(out, "another agentbridge run is writing; skipped (it covers this)");
+    }
+    for (ot, oid, ct, cid, n, dest) in &report.written {
+        let _ = writeln!(
+            out,
+            "{}{} {} turn(s) from {} {} into {} {} ({})",
+            if report.dry_run { "[dry-run] " } else { "" },
+            if report.dry_run { "would write" } else { "wrote" },
+            n,
+            display_name(ct),
+            cid,
+            display_name(ot),
+            oid,
+            dest.display()
+        );
+    }
+    for w in &report.waiting {
+        let _ = writeln!(out, "waiting: {}", w);
+    }
+    for e in &report.errors {
+        let _ = writeln!(out, "! {}", e);
+    }
+}
+
+/// `agentbridge mcp`: serve MCP on stdin/stdout until the tool closes the
+/// pipe. stdout carries protocol messages only; anything else goes to stderr.
+fn cmd_mcp() {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    eprintln!("agentbridge mcp {} serving in {}", env!("CARGO_PKG_VERSION"), cwd.display());
+    let registry = connectors::all;
+    // Write back never runs inside the server. A tool stops its MCP servers
+    // with SIGINT, then SIGTERM, then a kill a moment later (seen live with
+    // Claude Code), which would cut a write in half. Once the tool has its
+    // `initialize` answer, a helper process is started in its own process
+    // group: it writes back once, then waits for this process to end (its
+    // stdin is a pipe held here, which closes however this process ends) and
+    // writes back again.
+    let helper: std::cell::RefCell<Option<std::process::Child>> = std::cell::RefCell::new(None);
+    let mut server = agentbridge::mcp::Server::new(&registry, cwd).with_hooks(
+        Box::new(|| match spawn_writeback_helper() {
+            Ok(child) => *helper.borrow_mut() = Some(child),
+            Err(e) => eprintln!("agentbridge mcp: write back helper did not start: {}", e),
+        }),
+        Box::new(|| {
+            // Closing the pipe tells the helper this server is done.
+            if let Some(mut child) = helper.borrow_mut().take() {
+                drop(child.stdin.take());
+            }
+        }),
+    );
+    let stdin = std::io::stdin().lock();
+    let stdout = std::io::stdout().lock();
+    let code = agentbridge::mcp::serve(stdin, stdout, &mut server);
+    std::process::exit(code);
+}
+
+/// Start `agentbridge mcp writeback --after-server` detached from the tool:
+/// its own process group (so the tool's signals miss it), no stdout or
+/// stderr (the tool's pipes close when it exits), and a pipe for stdin that
+/// closes when this server ends.
+fn spawn_writeback_helper() -> std::io::Result<std::process::Child> {
+    let exe = std::env::current_exe()?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(["mcp", "writeback", "--after-server"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS
+        cmd.creation_flags(0x0000_0200 | 0x0000_0008);
+    }
+    cmd.spawn()
+}
+
+/// How long the helper waits after its server ended, so the tool finishes
+/// writing its transcript and exits (an open tool's sessions are not written).
+const AFTER_SERVER_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The helper `agentbridge mcp` starts: write back now, wait until the server
+/// that started it is gone, then write back again. Its report goes to
+/// `writeback.log` in the data dir when something was written or went wrong,
+/// since nobody is watching its output.
+fn cmd_writeback_after_server(registry: &agentbridge::connector::Registry) {
+    let run = || {
+        let report = agentbridge::writeback::run(registry, false, &agentbridge::mcp_install::tool_is_open);
+        if !report.written.is_empty() || !report.errors.is_empty() {
+            let mut line = Vec::new();
+            print_writeback(&report, &mut line);
+            let path = agentbridge::sync::data_dir().join("writeback.log");
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                use std::io::Write;
+                let _ = writeln!(f, "{} {}", chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true), String::from_utf8_lossy(&line).trim_end().replace('\n', "\n  "));
+            }
+        }
+    };
+    run();
+    // Blocks until the server's end of the pipe closes.
+    let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+    std::thread::sleep(AFTER_SERVER_DELAY);
+    run();
 }
 
 fn cmd_info(registry: &agentbridge::connector::Registry) {
@@ -954,10 +1216,17 @@ fn cmd_unsync(dry_run: bool, project: Option<String>, sessions: Vec<String>) {
         sessions,
     };
     let report = agentbridge::sync::unsync_matching(dry_run, &filter);
-    if dry_run {
-        println!("[dry-run] would remove {} file(s)", report.removed.len());
+    let (copies, settings, sessions) = if dry_run {
+        ("[dry-run] would remove", "[dry-run] would remove agentbridge's entry from", "[dry-run] would take written back turns out of")
     } else {
-        println!("removed {} file(s)", report.removed.len());
+        ("removed", "removed agentbridge's entry from", "took written back turns out of")
+    };
+    println!("{} {} session copies", copies, report.removed.len());
+    if !report.settings_restored.is_empty() {
+        println!("{} {} settings file(s)", settings, report.settings_restored.len());
+    }
+    if !report.writeback_cleaned.is_empty() {
+        println!("{} {} session(s)", sessions, report.writeback_cleaned.len());
     }
     if !report.kept_foreign.is_empty() {
         println!(

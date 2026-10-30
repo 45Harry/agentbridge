@@ -17,7 +17,7 @@
 use crate::connector::{Connector, ConnectorError, ConnectorResult, InjectTarget, SessionStream};
 use crate::model::{Message, RawSession, Role, Session, TokenTotals};
 use chrono::{DateTime, TimeZone, Utc};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -40,10 +40,7 @@ impl OpenCodeConnector {
     /// — that would tell SQLite the file cannot change and risk reading torn
     /// or stale data while OpenCode is running.
     fn open(&self) -> ConnectorResult<Connection> {
-        Connection::open_with_flags(
-            &self.db_path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-        )
+        crate::connectors::open_read_only(&self.db_path)
         .map_err(|e| ConnectorError::Parse {
             id: "opencode".to_string(),
             path: self.db_path.clone(),
@@ -62,6 +59,31 @@ pub fn default_db_path() -> PathBuf {
         .join("share")
         .join("opencode")
         .join("opencode.db")
+}
+
+/// How many of a session's first user text parts a scan looks at for its
+/// first prompt.
+const FIRST_PROMPT_PARTS: i64 = 5;
+
+/// The first thing a person typed in session `id`: the first user text part
+/// that is not bookkeeping. One small query per session, through the
+/// `session_id` column, so a scan stays cheap on a large database. `None`
+/// when the query fails (an older schema), and search then uses the title.
+fn first_prompt(conn: &Connection, id: &str) -> Option<String> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT p.data FROM message m JOIN part p ON p.message_id = m.id \
+             WHERE m.session_id = ?1 AND json_extract(m.data, '$.role') = 'user' \
+             AND json_extract(p.data, '$.type') = 'text' \
+             ORDER BY m.time_created, p.id LIMIT ?2",
+        )
+        .ok()?;
+    let rows = stmt
+        .query_map(rusqlite::params![id, FIRST_PROMPT_PARTS], |row| row.get::<_, String>(0))
+        .ok()?;
+    rows.filter_map(Result::ok)
+        .filter_map(|data| serde_json::from_str::<Value>(&data).ok())
+        .find_map(|v| v.get("text").and_then(|t| t.as_str()).and_then(crate::label::prompt_preview))
 }
 
 /// OpenCode stores epoch **milliseconds**, not seconds.
@@ -121,6 +143,7 @@ impl Connector for OpenCodeConnector {
                     source: None,
                     source_path: self.db_path.clone(),
                     body_available: true,
+                    first_prompt: None,
                 })
             })
             .map_err(|e| ConnectorError::Parse {
@@ -133,7 +156,11 @@ impl Connector for OpenCodeConnector {
         let out: Vec<ConnectorResult<RawSession>> = rows
             .into_iter()
             .map(|r| {
-                r.map_err(|e| ConnectorError::Parse {
+                r.map(|mut raw| {
+                    raw.first_prompt = first_prompt(&conn, &raw.id);
+                    raw
+                })
+                .map_err(|e| ConnectorError::Parse {
                     id: "opencode".to_string(),
                     path: self.db_path.clone(),
                     message: format!("row failed: {}", e),
@@ -219,7 +246,7 @@ impl Connector for OpenCodeConnector {
 
             // Each part becomes its own normalized message; a message with no
             // parts still yields one entry so the turn is not lost.
-            let (text, tool_name, tool_input) = match part_data
+            let (text, tool_name, tool_input, tool_result) = match part_data
                 .as_deref()
                 .and_then(|d| serde_json::from_str::<Value>(d).ok())
             {
@@ -228,17 +255,23 @@ impl Connector for OpenCodeConnector {
                         p.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()),
                         None,
                         None,
-                    ),
-                    Some("tool") => (
                         None,
-                        p.get("tool").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                        p.get("state").cloned(),
                     ),
+                    // A tool part holds the call and its result together:
+                    // `state.input` is what was asked, `state.output` (or
+                    // `state.error`) what came back. An older or partial
+                    // state without `input` is kept whole as the input.
+                    Some("tool") => {
+                        let state = p.get("state");
+                        let input = state.and_then(|s| s.get("input")).or(state).cloned();
+                        let output = state.and_then(|s| s.get("output").or_else(|| s.get("error"))).cloned();
+                        (None, p.get("tool").and_then(|v| v.as_str()).map(|s| s.to_string()), input, output)
+                    }
                     // step-start / step-finish / patch / file carry no
                     // conversational content — skip rather than emit blanks.
                     _ => continue,
                 },
-                None if msg_id != current_msg_id => (None, None, None),
+                None if msg_id != current_msg_id => (None, None, None, None),
                 None => continue,
             };
 
@@ -259,7 +292,7 @@ impl Connector for OpenCodeConnector {
                 text,
                 tool_name,
                 tool_input,
-                tool_result: None,
+                tool_result,
                 parent_ordinal: None,
             });
         }
@@ -345,6 +378,26 @@ mod tests {
         )
         .unwrap();
         (tmp, path)
+    }
+
+    /// Regression (live check on a copy of a real database, 2026-10-30): a
+    /// tool part's output sat inside `tool_input` and `tool_result` was
+    /// always empty, so `read_session` showed no output for any OpenCode
+    /// tool call.
+    #[test]
+    fn test_tool_part_splits_input_and_output() {
+        let (_t, db) = fixture_db();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute(
+            "INSERT INTO part VALUES ('prt_5','msg_2','ses_abc',1,1,?1)",
+            [r#"{"type":"tool","tool":"bash","state":{"status":"completed","input":{"command":"ls"},"output":"a.txt\nb.txt"}}"#],
+        )
+        .unwrap();
+        drop(conn);
+        let s = OpenCodeConnector::with_db(db).load("ses_abc").unwrap();
+        let call = s.messages.iter().find(|m| m.tool_name.as_deref() == Some("bash")).unwrap();
+        assert_eq!(call.tool_input, Some(serde_json::json!({"command": "ls"})));
+        assert_eq!(call.tool_result, Some(serde_json::json!("a.txt\nb.txt")));
     }
 
     #[test]

@@ -182,6 +182,9 @@ fn extract_cc_text_flexible(val: &Value) -> Option<String> {
     val.get("content").and_then(|v| v.as_str()).map(|s| s.to_string())
 }
 
+/// Records a scan reads past `cwd` while looking for the first prompt.
+const SCAN_HEAD_LINES: usize = 50;
+
 fn scan_file(path: &Path) -> ConnectorResult<Option<RawSession>> {
     let metadata = match fs::metadata(path) {
         Ok(m) => m,
@@ -212,6 +215,8 @@ fn scan_file(path: &Path) -> ConnectorResult<Option<RawSession>> {
     let mut cwd: Option<PathBuf> = None;
     let mut timestamp: Option<DateTime<Utc>> = None;
     let mut title: Option<String> = None;
+    let mut first_prompt: Option<String> = None;
+    let mut lines_read = 0usize;
 
     for line_result in reader.lines() {
         let line = match line_result {
@@ -253,21 +258,41 @@ fn scan_file(path: &Path) -> ConnectorResult<Option<RawSession>> {
             }
         }
 
-        if cwd.is_some() {
+        if first_prompt.is_none()
+            && matches!(event_type, "user" | "user_message")
+            && !val.get("isMeta").and_then(|v| v.as_bool()).unwrap_or(false)
+        {
+            first_prompt = extract_cc_text_flexible(&val)
+                .as_deref()
+                .and_then(crate::label::prompt_preview);
+        }
+        lines_read += 1;
+
+        // The head is all a scan reads: stop at the first prompt, or soon
+        // after `cwd` when the session opens with a long run of other records.
+        if cwd.is_some() && (first_prompt.is_some() || lines_read >= SCAN_HEAD_LINES) {
             break;
         }
     }
+
+    // The last event, from the file's tail. Tools append for hours after the
+    // first record, so the head alone would date every session by its start.
+    let last_event_at = crate::connectors::tail_records(path)
+        .iter()
+        .find_map(extract_cc_timestamp)
+        .or(timestamp);
 
     Ok(Some(RawSession {
         id,
         provider: "claude-code".to_string(),
         project_path: cwd,
         started_at: timestamp,
-        last_event_at: timestamp,
+        last_event_at,
         title,
         source: None,
         source_path: path.to_path_buf(),
         body_available: true,
+        first_prompt,
     }))
 }
 
@@ -314,6 +339,16 @@ fn extract_cc_custom_title(event_type: &str, val: &Value) -> Option<String> {
     }
 }
 
+/// The first content block of `kind` (`tool_use`, `tool_result`) in a
+/// record's `message.content` array.
+fn cc_block<'a>(val: &'a Value, kind: &str) -> Option<&'a Value> {
+    val.get("message")?
+        .get("content")?
+        .as_array()?
+        .iter()
+        .find(|b| b.get("type").and_then(|t| t.as_str()) == Some(kind))
+}
+
 /// Read a session from an explicit path rather than by id.
 ///
 /// Used by write-back to re-read a file agentbridge materialized (which lives
@@ -338,6 +373,9 @@ fn load_from_path(path: &Path, id: &str) -> ConnectorResult<Session> {
     let mut model: Option<String> = None;
     let mut title: Option<String> = None;
     let mut ordinal: u64 = 0;
+    // `tool_use` id -> tool name, so a result can name the call it answers.
+    let mut tool_names: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
 
     for line_result in reader.lines() {
         let line = match line_result {
@@ -403,15 +441,23 @@ fn load_from_path(path: &Path, id: &str) -> ConnectorResult<Session> {
         match event_type {
             "user" | "user_message" => {
                 let text = extract_cc_text_flexible(&val);
+                // A tool's output comes back as a user record holding a
+                // `tool_result` block; it is the tool speaking, not a person.
+                let result = cc_block(&val, "tool_result");
+                let tool_result = result.map(|b| b.get("content").cloned().unwrap_or(Value::Null));
+                let tool_name = result
+                    .and_then(|b| b.get("tool_use_id").and_then(|v| v.as_str()))
+                    .and_then(|use_id| tool_names.get(use_id).cloned());
+                let role = if result.is_some() && text.is_none() { Role::Tool } else { Role::User };
                 let msg = Message {
                     session_id: id.to_string(),
                     ordinal,
-                    role: Role::User,
+                    role,
                     timestamp,
                     text,
-                    tool_name: None,
+                    tool_name,
                     tool_input: None,
-                    tool_result: None,
+                    tool_result,
                     parent_ordinal: val.get("parentUuid").and_then(|v| v.as_str()).map(|_| 0),
                 };
                 messages.push(msg);
@@ -419,14 +465,26 @@ fn load_from_path(path: &Path, id: &str) -> ConnectorResult<Session> {
             }
             "assistant" | "assistant_message" => {
                 let text = extract_cc_text_flexible(&val);
+                // Tool calls are `tool_use` blocks inside an assistant record.
+                // Claude Code writes one block per record, so the first is the
+                // call; its id is kept to name the result that answers it.
+                let call = cc_block(&val, "tool_use");
+                let tool_name = call
+                    .and_then(|b| b.get("name").and_then(|v| v.as_str()))
+                    .map(str::to_string);
+                if let (Some(use_id), Some(name)) =
+                    (call.and_then(|b| b.get("id").and_then(|v| v.as_str())), &tool_name)
+                {
+                    tool_names.insert(use_id.to_string(), name.clone());
+                }
                 let msg = Message {
                     session_id: id.to_string(),
                     ordinal,
                     role: Role::Assistant,
                     timestamp,
                     text,
-                    tool_name: None,
-                    tool_input: None,
+                    tool_name,
+                    tool_input: call.and_then(|b| b.get("input").cloned()),
                     tool_result: None,
                     parent_ordinal: val.get("parentUuid").and_then(|v| v.as_str()).map(|_| 0),
                 };

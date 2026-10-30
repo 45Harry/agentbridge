@@ -378,6 +378,21 @@ fn strip_wrappers(text: &str) -> &str {
     }
 }
 
+/// How much of a session's first prompt a scan keeps for search.
+pub const PROMPT_PREVIEW_MAX: usize = 300;
+
+/// The search preview of a user turn: its text cut to
+/// `PROMPT_PREVIEW_MAX` characters (not bytes). `None` for an empty turn, a
+/// bookkeeping turn, or agentbridge's own placeholder, none of which a person
+/// typed.
+pub fn prompt_preview(text: &str) -> Option<String> {
+    let t = text.trim();
+    if t.is_empty() || is_bookkeeping(t) || t == CONTINUATION_PLACEHOLDER {
+        return None;
+    }
+    Some(t.chars().take(PROMPT_PREVIEW_MAX).collect())
+}
+
 /// True when `text` is nothing but tool wrapper blocks: a turn a tool wrote
 /// for itself, not something a person or a model said.
 pub fn is_bookkeeping(text: &str) -> bool {

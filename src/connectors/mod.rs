@@ -9,6 +9,54 @@ pub(crate) mod claude_code;
 pub(crate) mod codex_cli;
 pub(crate) mod opencode;
 
+/// How long a read waits for a tool that is writing its database.
+pub(crate) const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Open another tool's SQLite database for reading only: never for writing,
+/// never with `immutable=1`, and waiting up to `BUSY_TIMEOUT` when the tool
+/// holds a write lock instead of failing at once.
+pub(crate) fn open_read_only(path: &std::path::Path) -> rusqlite::Result<rusqlite::Connection> {
+    let conn = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    Ok(conn)
+}
+
+/// How far back from the end of a JSONL file a scan looks for the last event.
+const TAIL_BYTES: u64 = 64 * 1024;
+
+/// The JSON records in the last `TAIL_BYTES` of a JSONL file, newest first.
+/// Lets a scan read a session's last event time without reading its body.
+/// The first line in the window may be cut and is skipped; a file with no
+/// complete record there gives an empty list.
+pub(crate) fn tail_records(path: &std::path::Path) -> Vec<serde_json::Value> {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let start = len.saturating_sub(TAIL_BYTES);
+    if f.seek(SeekFrom::Start(start)).is_err() {
+        return Vec::new();
+    }
+    let mut buf = Vec::new();
+    if f.read_to_end(&mut buf).is_err() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let mut lines: Vec<&str> = text.lines().collect();
+    if start > 0 && !lines.is_empty() {
+        lines.remove(0);
+    }
+    lines
+        .into_iter()
+        .rev()
+        .filter_map(|l| serde_json::from_str(l.trim()).ok())
+        .collect()
+}
+
 pub fn all() -> Registry {
     let connectors: Vec<Box<dyn Connector>> = vec![
         Box::new(antigravity::AntigravityConnector::new()),

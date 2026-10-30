@@ -54,11 +54,11 @@ const NO_PROJECT: &str = "outside-of-project";
 const APP_DATA_DIR: &str = "antigravity-cli";
 
 /// Step type for a user turn, as read back by the connector.
-const STEP_USER: i64 = 14;
+pub(crate) const STEP_USER: i64 = 14;
 /// Step type for a model turn.
-const STEP_MODEL: i64 = 15;
+pub(crate) const STEP_MODEL: i64 = 15;
 /// `status` value meaning the step completed; the connector skips anything else.
-const STATUS_DONE: i64 = 3;
+pub(crate) const STATUS_DONE: i64 = 3;
 
 #[derive(Debug)]
 pub enum WriteError {
@@ -203,7 +203,7 @@ fn encode_step_metadata(secs: i64, nanos: u32) -> Vec<u8> {
 }
 
 /// Encode one conversational turn into the payload shape the connector reads.
-fn encode_step(step_type: i64, text: &str, secs: i64, nanos: u32) -> Vec<u8> {
+pub(crate) fn encode_step(step_type: i64, text: &str, secs: i64, nanos: u32) -> Vec<u8> {
     let mut out = Vec::new();
     put_varint_field(&mut out, 1, step_type as u64);
     put_varint_field(&mut out, 4, STATUS_DONE as u64);
